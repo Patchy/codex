@@ -39,11 +39,14 @@
             inherit system;
             overlays = [ rust-overlay.overlays.default ];
           };
+          # Use the exact toolchain pinned in rust-toolchain.toml instead of
+          # "latest stable" from the locked overlay, which drifts stale.
+          rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./codex-rs/rust-toolchain.toml;
           codex-rs = pkgs.callPackage ./codex-rs {
             inherit version;
             rustPlatform = pkgs.makeRustPlatform {
-              cargo = pkgs.rust-bin.stable.latest.minimal;
-              rustc = pkgs.rust-bin.stable.latest.minimal;
+              cargo = rustToolchain;
+              rustc = rustToolchain;
             };
           };
         in
