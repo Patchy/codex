@@ -248,9 +248,18 @@ impl ChatWidget {
         {
             use codex_app_server_protocol::SubAgentActivityKind;
             match kind {
+                // Under v2, Started is the only spawn signal; register the
+                // agent here. Nickname/role arrive via ThreadStarted metadata
+                // and may lag the first activity, so re-read on every event.
                 SubAgentActivityKind::Started | SubAgentActivityKind::Interacted => {
-                    self.subagent_panel_registry
-                        .note_activity(thread_id, format!("working in `{agent_path}`"));
+                    let metadata = self.collab_agent_metadata(thread_id);
+                    self.subagent_panel_registry.upsert_activity(
+                        thread_id,
+                        agent_path,
+                        metadata.agent_nickname,
+                        metadata.agent_role,
+                        format!("working in `{agent_path}`"),
+                    );
                 }
                 SubAgentActivityKind::Interrupted => {
                     self.subagent_panel_registry.update_status(

@@ -965,6 +965,15 @@ impl ChatWidget {
             .unwrap_or_default()
     }
 
+    /// Forwards subagent-thread turn liveness into the live panel. Under v2
+    /// this is the only signal that an agent finished working; the app layer
+    /// calls this alongside `agent_navigation.mark_running`/`mark_stopped`.
+    pub(crate) fn on_subagent_thread_liveness(&mut self, thread_id: ThreadId, running: bool) {
+        self.subagent_panel_registry
+            .set_thread_running(thread_id, running);
+        self.refresh_subagent_panel();
+    }
+
     fn restore_retry_status_header_if_present(&mut self) {
         if let Some(header) = self.status_state.take_retry_status_header() {
             self.set_status_header(header);

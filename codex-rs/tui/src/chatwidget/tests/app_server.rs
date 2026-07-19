@@ -1498,3 +1498,52 @@ async fn subagent_panel_ignores_replayed_history() {
     );
     drain_insert_history(&mut rx);
 }
+
+#[tokio::test]
+async fn subagent_panel_mounts_from_v2_activity_and_thread_liveness() {
+    use codex_app_server_protocol::SubAgentActivityKind;
+
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    let agent_thread_id = ThreadId::new();
+    chat.set_collab_agent_metadata(
+        agent_thread_id,
+        Some("Scout".to_string()),
+        Some("explorer".to_string()),
+    );
+
+    // Canonical v2 spawn: only a SubAgentActivity{Started} item fires.
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
+            item: AppServerThreadItem::SubAgentActivity {
+                id: "activity-1".to_string(),
+                kind: SubAgentActivityKind::Started,
+                agent_thread_id: agent_thread_id.to_string(),
+                agent_path: "explore/auth".to_string(),
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+
+    let panel = subagent_panel_text(&chat).expect("panel should mount from v2 Started activity");
+    assert!(panel.contains("Scout"), "missing nickname: {panel:?}");
+    assert!(
+        panel.contains("explore/auth"),
+        "missing activity path preview: {panel:?}"
+    );
+
+    // v2 has no completion tool item; thread liveness is the only signal.
+    chat.on_subagent_thread_liveness(agent_thread_id, /*running*/ false);
+    assert!(
+        chat.subagent_panel.is_none(),
+        "panel should unmount when the agent thread's turn stops"
+    );
+
+    // A follow-up message restarts the agent's turn: the panel returns.
+    chat.on_subagent_thread_liveness(agent_thread_id, /*running*/ true);
+    let panel = subagent_panel_text(&chat).expect("panel should remount when agent runs again");
+    assert!(panel.contains("running"), "agent should be running: {panel:?}");
+    drain_insert_history(&mut rx);
+}

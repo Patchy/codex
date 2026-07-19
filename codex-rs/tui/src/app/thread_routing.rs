@@ -953,8 +953,12 @@ impl App {
         };
         if matches!(notification, ServerNotification::TurnStarted(_)) {
             self.agent_navigation.mark_running(thread_id);
+            self.chat_widget
+                .on_subagent_thread_liveness(thread_id, /*running*/ true);
         } else if turn_stopped {
             self.agent_navigation.mark_stopped(thread_id);
+            self.chat_widget
+                .on_subagent_thread_liveness(thread_id, /*running*/ false);
         }
         let notification_status_change = SideParentStatusChange::for_notification(&notification);
 

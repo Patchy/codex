@@ -182,6 +182,50 @@ impl SubagentPanelRegistry {
         }
     }
 
+    /// Registers-or-updates an agent from a v2 `SubAgentActivity` item, which
+    /// is the only spawn signal the canonical v2 path emits (no
+    /// `CollabAgentToolCall{SpawnAgent}` fires under `multi_agent_v2`).
+    pub(crate) fn upsert_activity(
+        &mut self,
+        thread_id: ThreadId,
+        agent_path: &str,
+        nickname: Option<String>,
+        role: Option<String>,
+        preview: String,
+    ) {
+        let ordinal = self.ordinal_for(thread_id);
+        let display_name = nickname
+            .filter(|nickname| !nickname.trim().is_empty())
+            .unwrap_or_else(|| agent_path.to_string());
+        let info = self.agents.entry(thread_id).or_insert_with(|| {
+            self.order.push(thread_id);
+            SubagentInfo::new(ordinal, display_name.clone(), role.clone(), agent_path)
+        });
+        info.name = display_name;
+        if role.is_some() {
+            info.role = role;
+        }
+        info.note_activity(preview);
+    }
+
+    /// Applies thread-level liveness (TurnStarted/TurnCompleted/ThreadClosed)
+    /// to a tracked agent. Under v2 this is the only completion signal: no
+    /// tool item ever reports a v2 agent finishing.
+    pub(crate) fn set_thread_running(&mut self, thread_id: ThreadId, running: bool) {
+        if let Some(info) = self.agents.get_mut(&thread_id) {
+            let status = if running {
+                PanelAgentStatus::Running
+            } else {
+                PanelAgentStatus::Completed(None)
+            };
+            // A wait/close result may carry a richer terminal status
+            // (errored, interrupted, message); never downgrade those.
+            if info.status.is_running() || running {
+                info.update_status(status);
+            }
+        }
+    }
+
     pub(crate) fn close(&mut self, thread_id: ThreadId) {
         self.agents.remove(&thread_id);
         self.order.retain(|candidate| *candidate != thread_id);

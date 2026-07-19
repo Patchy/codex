@@ -42,6 +42,8 @@ use crate::exec_events::McpToolCallStatus as ExecMcpToolCallStatus;
 use crate::exec_events::PatchApplyStatus as ExecPatchApplyStatus;
 use crate::exec_events::PatchChangeKind as ExecPatchChangeKind;
 use crate::exec_events::ReasoningItem;
+use crate::exec_events::SubAgentActivityItem;
+use crate::exec_events::SubAgentActivityKind;
 use crate::exec_events::ThreadErrorEvent;
 use crate::exec_events::ThreadEvent;
 use crate::exec_events::ThreadItem as ExecThreadItem;
@@ -292,6 +294,29 @@ impl EventProcessorWithJsonOutput {
                         CollabAgentToolCallStatus::Completed => CollabToolCallStatus::Completed,
                         CollabAgentToolCallStatus::Failed => CollabToolCallStatus::Failed,
                     },
+                }),
+            }),
+            ThreadItem::SubAgentActivity {
+                kind,
+                agent_thread_id,
+                agent_path,
+                ..
+            } => Some(ExecThreadItem {
+                id: make_id(),
+                details: ThreadItemDetails::SubAgentActivity(SubAgentActivityItem {
+                    kind: match kind {
+                        codex_app_server_protocol::SubAgentActivityKind::Started => {
+                            SubAgentActivityKind::Started
+                        }
+                        codex_app_server_protocol::SubAgentActivityKind::Interacted => {
+                            SubAgentActivityKind::Interacted
+                        }
+                        codex_app_server_protocol::SubAgentActivityKind::Interrupted => {
+                            SubAgentActivityKind::Interrupted
+                        }
+                    },
+                    agent_thread_id,
+                    agent_path,
                 }),
             }),
             ThreadItem::WebSearch(item) => Some(ExecThreadItem {
