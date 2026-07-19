@@ -176,12 +176,6 @@ impl SubagentPanelRegistry {
         }
     }
 
-    pub(crate) fn note_activity(&mut self, thread_id: ThreadId, preview: String) {
-        if let Some(info) = self.agents.get_mut(&thread_id) {
-            info.note_activity(preview);
-        }
-    }
-
     /// Registers-or-updates an agent from a v2 `SubAgentActivity` item, which
     /// is the only spawn signal the canonical v2 path emits (no
     /// `CollabAgentToolCall{SpawnAgent}` fires under `multi_agent_v2`).
