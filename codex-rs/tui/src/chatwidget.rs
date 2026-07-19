@@ -589,6 +589,9 @@ pub(crate) struct ChatWidget {
     running_commands: HashMap<String, RunningCommand>,
     collab_agent_metadata: HashMap<ThreadId, AgentMetadata>,
     pending_collab_spawn_requests: HashMap<String, multi_agents::SpawnRequestSummary>,
+    // Live subagent panel pinned above the composer; rebuilt from collab events.
+    subagent_panel_registry: crate::subagent_panel::SubagentPanelRegistry,
+    subagent_panel: Option<crate::subagent_panel::SubagentStatusCell>,
     suppressed_exec_calls: HashSet<String>,
     skills_all: Vec<ProtocolSkillMetadata>,
     skills_initial_state: Option<HashMap<AbsolutePathBuf, bool>>,
@@ -1870,6 +1873,11 @@ impl ChatWidget {
                 .and_then(|cell| cell.transcript_animation_tick())
                 .or_else(|| {
                     hook_cell.and_then(super::history_cell::HistoryCell::transcript_animation_tick)
+                })
+                .or_else(|| {
+                    self.subagent_panel
+                        .as_ref()
+                        .and_then(super::history_cell::HistoryCell::transcript_animation_tick)
                 }),
         })
     }

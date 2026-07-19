@@ -107,6 +107,10 @@ impl ChatWidget {
             }),
             transcript: TranscriptState::new(active_cell),
             raw_output_mode: config.tui_raw_output_mode,
+            subagent_panel_registry: crate::subagent_panel::SubagentPanelRegistry::new(
+                crate::motion::MotionMode::from_animations_enabled(config.animations),
+            ),
+            subagent_panel: None,
             config,
             effective_service_tier,
             skills_all: Vec::new(),

@@ -1370,3 +1370,131 @@ async fn live_app_server_thread_closed_requests_immediate_exit() {
 
     assert_matches!(rx.try_recv(), Ok(AppEvent::Exit(ExitMode::Immediate)));
 }
+
+fn collab_spawn_item(
+    sender: &ThreadId,
+    receiver: Option<&ThreadId>,
+    status: AppServerCollabAgentToolCallStatus,
+    agent_status: Option<AppServerCollabAgentStatus>,
+) -> AppServerThreadItem {
+    let receiver_thread_ids = receiver
+        .map(|thread_id| vec![thread_id.to_string()])
+        .unwrap_or_default();
+    let agents_states = match (receiver, agent_status) {
+        (Some(thread_id), Some(status)) => HashMap::from([(
+            thread_id.to_string(),
+            AppServerCollabAgentState {
+                status,
+                message: None,
+            },
+        )]),
+        _ => HashMap::new(),
+    };
+    AppServerThreadItem::CollabAgentToolCall {
+        id: "call-spawn".to_string(),
+        tool: AppServerCollabAgentTool::SpawnAgent,
+        status,
+        sender_thread_id: sender.to_string(),
+        receiver_thread_ids,
+        prompt: Some("Survey the auth module".to_string()),
+        model: None,
+        reasoning_effort: None,
+        agents_states,
+    }
+}
+
+fn subagent_panel_text(chat: &ChatWidget) -> Option<String> {
+    use crate::history_cell::HistoryCell as _;
+    chat.subagent_panel
+        .as_ref()
+        .map(|panel| lines_to_single_string(&panel.display_lines(120)))
+}
+
+#[tokio::test]
+async fn subagent_panel_mounts_on_spawn_and_unmounts_on_completion() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    let sender_thread_id = ThreadId::new();
+    let spawned_thread_id = ThreadId::new();
+    chat.set_collab_agent_metadata(
+        spawned_thread_id,
+        Some("Robie".to_string()),
+        Some("explorer".to_string()),
+    );
+
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
+            item: collab_spawn_item(
+                &sender_thread_id,
+                Some(&spawned_thread_id),
+                AppServerCollabAgentToolCallStatus::Completed,
+                Some(AppServerCollabAgentStatus::Running),
+            ),
+        }),
+        /*replay_kind*/ None,
+    );
+
+    let panel = subagent_panel_text(&chat).expect("panel should mount after spawn");
+    assert!(panel.contains("Subagents"), "missing header: {panel:?}");
+    assert!(panel.contains("Robie"), "missing agent name: {panel:?}");
+    assert!(panel.contains("running"), "missing status: {panel:?}");
+
+    // Wait resolves the agent as completed: the panel should unmount.
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
+            item: AppServerThreadItem::CollabAgentToolCall {
+                id: "call-wait".to_string(),
+                tool: AppServerCollabAgentTool::Wait,
+                status: AppServerCollabAgentToolCallStatus::Completed,
+                sender_thread_id: sender_thread_id.to_string(),
+                receiver_thread_ids: vec![spawned_thread_id.to_string()],
+                prompt: None,
+                model: None,
+                reasoning_effort: None,
+                agents_states: HashMap::from([(
+                    spawned_thread_id.to_string(),
+                    AppServerCollabAgentState {
+                        status: AppServerCollabAgentStatus::Completed,
+                        message: Some("done".to_string()),
+                    },
+                )]),
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+
+    assert!(
+        chat.subagent_panel.is_none(),
+        "panel should unmount once no agents are running"
+    );
+    drain_insert_history(&mut rx);
+}
+
+#[tokio::test]
+async fn subagent_panel_ignores_replayed_history() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    let sender_thread_id = ThreadId::new();
+    let spawned_thread_id = ThreadId::new();
+
+    chat.replay_thread_item(
+        collab_spawn_item(
+            &sender_thread_id,
+            Some(&spawned_thread_id),
+            AppServerCollabAgentToolCallStatus::Completed,
+            Some(AppServerCollabAgentStatus::Running),
+        ),
+        "turn-1".to_string(),
+        ReplayKind::ThreadSnapshot,
+    );
+
+    assert!(
+        chat.subagent_panel.is_none(),
+        "replayed spawn must not mount the live panel"
+    );
+    drain_insert_history(&mut rx);
+}

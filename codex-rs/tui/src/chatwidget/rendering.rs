@@ -46,6 +46,16 @@ impl ChatWidget {
                 })),
             );
         }
+        if let Some(panel) = &self.subagent_panel {
+            flex.push(
+                /*flex*/ 0,
+                RenderableItem::Owned(Box::new(TranscriptAreaRenderable {
+                    child: panel,
+                    top: 1,
+                    right: active_cell_right_reserve,
+                })),
+            );
+        }
         flex.push(
             /*flex*/ 0,
             RenderableItem::Owned(Box::new(BottomPaneComposerReserveRenderable {

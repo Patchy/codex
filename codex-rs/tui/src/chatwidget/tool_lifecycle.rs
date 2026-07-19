@@ -114,7 +114,7 @@ impl ChatWidget {
         self.request_redraw();
     }
 
-    pub(super) fn on_collab_agent_tool_call(&mut self, item: ThreadItem) {
+    pub(super) fn on_collab_agent_tool_call(&mut self, item: ThreadItem, update_panel: bool) {
         let ThreadItem::CollabAgentToolCall {
             id, tool, status, ..
         } = &item
@@ -143,11 +143,123 @@ impl ChatWidget {
         ) {
             self.on_collab_event(cell);
         }
+
+        if update_panel {
+            self.update_subagent_panel_from_tool_call(&item);
+        }
     }
 
-    pub(super) fn on_sub_agent_activity(&mut self, item: ThreadItem) {
+    /// Applies a completed collab tool call to the live subagent panel.
+    fn update_subagent_panel_from_tool_call(&mut self, item: &ThreadItem) {
+        use crate::subagent_panel::PanelAgentStatus;
+
+        let ThreadItem::CollabAgentToolCall {
+            tool,
+            status,
+            receiver_thread_ids,
+            prompt,
+            agents_states,
+            ..
+        } = item
+        else {
+            return;
+        };
+        // Receiver thread ids and per-agent states are only reliable once the
+        // tool call resolves; the InProgress notification precedes them.
+        if matches!(status, CollabAgentToolCallStatus::InProgress) {
+            return;
+        }
+
+        let first_receiver = receiver_thread_ids
+            .first()
+            .and_then(|thread_id| ThreadId::from_string(thread_id).ok());
+
+        match tool {
+            CollabAgentTool::SpawnAgent => {
+                if let Some(receiver_thread_id) = first_receiver {
+                    let metadata = self.collab_agent_metadata(receiver_thread_id);
+                    let status = agents_states
+                        .get(&receiver_thread_id.to_string())
+                        .map(PanelAgentStatus::from_collab_state)
+                        .unwrap_or(PanelAgentStatus::PendingInit);
+                    self.subagent_panel_registry.on_spawn(
+                        receiver_thread_id,
+                        metadata.agent_nickname,
+                        metadata.agent_role,
+                        prompt.as_deref().unwrap_or_default(),
+                        status,
+                    );
+                    self.refresh_subagent_panel();
+                }
+            }
+            CollabAgentTool::SendInput | CollabAgentTool::ResumeAgent => {
+                if let Some(receiver_thread_id) = first_receiver {
+                    let status = agents_states
+                        .get(&receiver_thread_id.to_string())
+                        .map(PanelAgentStatus::from_collab_state)
+                        .unwrap_or_else(|| {
+                            PanelAgentStatus::Errored("Agent interaction failed".into())
+                        });
+                    self.subagent_panel_registry
+                        .update_status(receiver_thread_id, status);
+                    self.refresh_subagent_panel();
+                }
+            }
+            CollabAgentTool::Wait => {
+                for receiver_thread_id in receiver_thread_ids {
+                    if let Ok(thread_id) = ThreadId::from_string(receiver_thread_id)
+                        && let Some(status) = agents_states
+                            .get(receiver_thread_id)
+                            .map(PanelAgentStatus::from_collab_state)
+                    {
+                        self.subagent_panel_registry
+                            .update_status(thread_id, status);
+                    }
+                }
+                self.refresh_subagent_panel();
+            }
+            CollabAgentTool::CloseAgent => {
+                if let Some(receiver_thread_id) = first_receiver {
+                    self.subagent_panel_registry.close(receiver_thread_id);
+                    self.refresh_subagent_panel();
+                }
+            }
+        }
+    }
+
+    pub(super) fn refresh_subagent_panel(&mut self) {
+        self.subagent_panel = self.subagent_panel_registry.rebuild_panel();
+        self.request_redraw();
+    }
+
+    pub(super) fn on_sub_agent_activity(&mut self, item: ThreadItem, update_panel: bool) {
         if let Some(cell) = multi_agents::sub_agent_activity_history_cell(&item) {
             self.on_collab_event(cell);
+        }
+
+        if update_panel
+            && let ThreadItem::SubAgentActivity {
+                kind,
+                agent_thread_id,
+                agent_path,
+                ..
+            } = &item
+            && let Ok(thread_id) = ThreadId::from_string(agent_thread_id)
+        {
+            use codex_app_server_protocol::SubAgentActivityKind;
+            match kind {
+                SubAgentActivityKind::Started | SubAgentActivityKind::Interacted => {
+                    self.subagent_panel_registry
+                        .note_activity(thread_id, format!("working in `{agent_path}`"));
+                }
+                SubAgentActivityKind::Interrupted => {
+                    self.subagent_panel_registry.update_status(
+                        thread_id,
+                        crate::subagent_panel::PanelAgentStatus::Interrupted,
+                    );
+                }
+            }
+            self.refresh_subagent_panel();
         }
     }
 
