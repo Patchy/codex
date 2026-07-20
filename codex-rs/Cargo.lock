@@ -2969,6 +2969,7 @@ dependencies = [
  "starlark",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
@@ -4113,7 +4114,6 @@ dependencies = [
  "codex-config",
  "codex-connectors",
  "codex-core-plugins",
- "codex-core-skills",
  "codex-exec-server",
  "codex-features",
  "codex-feedback",
@@ -4156,6 +4156,7 @@ dependencies = [
  "diffy",
  "dirs",
  "dunce",
+ "futures",
  "image",
  "insta",
  "itertools 0.14.0",
@@ -4184,6 +4185,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+ "tokio-tungstenite",
  "tokio-util",
  "toml 0.9.11+spec-1.1.0",
  "tracing",
@@ -4402,8 +4404,6 @@ dependencies = [
 name = "codex-utils-sandbox-summary"
 version = "0.0.0"
 dependencies = [
- "codex-core",
- "codex-model-provider-info",
  "codex-protocol",
  "codex-utils-absolute-path",
  "pretty_assertions",
@@ -8908,7 +8908,6 @@ dependencies = [
  "os_info",
  "pretty_assertions",
  "rmcp",
- "serde",
  "serde_json",
  "shlex",
  "tokio",
