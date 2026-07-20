@@ -122,10 +122,6 @@ pub enum ThreadItemDetails {
     /// Represents a call to a collab tool. The item starts when the collab tool is
     /// invoked and completes when the collab tool reports success or failure.
     CollabToolCall(CollabToolCallItem),
-    /// Reports sub-agent lifecycle activity (multi-agent v2): an agent thread
-    /// started, was interacted with, or was interrupted. Emitted as a
-    /// completed event only.
-    SubAgentActivity(SubAgentActivityItem),
     /// Captures a web search request. It starts when the search is kicked off
     /// and completes when results are returned to the agent.
     WebSearch(WebSearchItem),
@@ -249,23 +245,6 @@ pub enum CollabAgentStatus {
 pub struct CollabAgentState {
     pub status: CollabAgentStatus,
     pub message: Option<String>,
-}
-
-/// Sub-agent lifecycle activity kinds (multi-agent v2).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
-#[serde(rename_all = "snake_case")]
-pub enum SubAgentActivityKind {
-    Started,
-    Interacted,
-    Interrupted,
-}
-
-/// Sub-agent lifecycle activity (multi-agent v2).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
-pub struct SubAgentActivityItem {
-    pub kind: SubAgentActivityKind,
-    pub agent_thread_id: String,
-    pub agent_path: String,
 }
 
 /// A call to a collab tool.

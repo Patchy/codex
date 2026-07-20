@@ -1,7 +1,6 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use codex_app_server_protocol::CollabAgentToolCallStatus;
 use codex_app_server_protocol::CommandExecutionStatus;
 use codex_app_server_protocol::McpToolCallStatus;
 use codex_app_server_protocol::PatchApplyStatus;
@@ -90,16 +89,6 @@ impl EventProcessorWithHumanOutput {
             }
             ThreadItem::CollabAgentToolCall { tool, .. } => {
                 eprintln!("{} {:?}", "collab:".style(self.bold), tool);
-            }
-            ThreadItem::SubAgentActivity {
-                kind, agent_path, ..
-            } => {
-                eprintln!(
-                    "{} {} {:?}",
-                    "agent:".style(self.bold),
-                    agent_path.style(self.cyan),
-                    kind,
-                );
             }
             _ => {}
         }
@@ -212,47 +201,6 @@ impl EventProcessorWithHumanOutput {
             }
             ThreadItem::ContextCompaction { .. } => {
                 eprintln!("{}", "context compacted".style(self.dimmed));
-            }
-            ThreadItem::CollabAgentToolCall {
-                tool,
-                status,
-                receiver_thread_ids,
-                agents_states,
-                ..
-            } => {
-                let status_text = match status {
-                    CollabAgentToolCallStatus::Completed => "completed".style(self.green),
-                    CollabAgentToolCallStatus::Failed => "failed".style(self.red),
-                    CollabAgentToolCallStatus::InProgress => "in_progress".style(self.dimmed),
-                };
-                eprintln!(
-                    "{} {:?} ({status_text}) {} agent(s)",
-                    "collab:".style(self.bold),
-                    tool,
-                    receiver_thread_ids.len(),
-                );
-                for (thread_id, state) in &agents_states {
-                    let message = state
-                        .message
-                        .as_deref()
-                        .map(|message| format!(" — {message}"))
-                        .unwrap_or_default();
-                    eprintln!(
-                        "  {} {:?}{message}",
-                        thread_id.style(self.dimmed),
-                        state.status,
-                    );
-                }
-            }
-            ThreadItem::SubAgentActivity {
-                kind, agent_path, ..
-            } => {
-                eprintln!(
-                    "{} {} {:?}",
-                    "agent:".style(self.bold),
-                    agent_path.style(self.cyan),
-                    kind,
-                );
             }
             _ => {}
         }
