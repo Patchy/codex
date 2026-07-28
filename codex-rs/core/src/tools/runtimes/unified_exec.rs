@@ -7,7 +7,9 @@ the process manager to spawn PTYs once an ExecRequest is prepared.
 use crate::command_canonicalization::canonicalize_command_for_approval;
 use crate::exec::ExecCapturePolicy;
 use crate::exec::ExecExpiration;
+use crate::guardian::GUARDIAN_REVIEW_TIMEOUT;
 use crate::guardian::GuardianNetworkAccessTrigger;
+use crate::guardian::routes_approval_to_guardian;
 use crate::sandboxing::ExecOptions;
 use crate::sandboxing::ExecServerEnvConfig;
 use crate::sandboxing::SandboxPermissions;
@@ -54,8 +56,12 @@ use codex_utils_path_uri::PathUri;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::io;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
+
+// Allow 5s for Guardian cleanup and 5s for controller processing after review.
+const REMOTE_NETWORK_POLICY_DECISION_MARGIN: Duration = Duration::from_secs(10);
 
 /// Request payload used by the unified-exec runtime after approvals and
 /// sandbox preferences have been resolved for the current turn.
@@ -209,6 +215,7 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
                             .cloned(),
                         req.additional_permissions.clone(),
                         available_decisions,
+                        /*plugin_attribution_override*/ None,
                     )
                     .await
             })
@@ -301,6 +308,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
         ctx: &ToolCtx,
     ) -> Result<UnifiedExecProcess, ToolError> {
         let base_command = &req.command;
+        let windows_sandbox_proxy_settings_mode = ctx.session.windows_sandbox_proxy_settings_mode;
         let session_shell = ctx.session.user_shell();
         let shell = req
             .turn_environment
@@ -330,9 +338,26 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
         let env = exec_env_for_sandbox_permissions(&req.env, launch_sandbox_permissions);
         let (env, managed_network_context, network_proxy_launch) = match managed_network {
             Some(network) if environment_is_remote => {
-                let launch = network.remote_launch_config().await.map_err(|err| {
+                let mut launch = network.remote_launch_config().await.map_err(|err| {
                     ToolError::Codex(CodexErr::Io(io::Error::other(err.to_string())))
                 })?;
+                if routes_approval_to_guardian(&ctx.turn)
+                    && network.remote_policy_decider().is_some()
+                {
+                    let timeout = ctx
+                        .session
+                        .hooks()
+                        .max_permission_request_timeout()
+                        .saturating_add(GUARDIAN_REVIEW_TIMEOUT)
+                        .saturating_add(REMOTE_NETWORK_POLICY_DECISION_MARGIN);
+                    launch.policy_decision_timeout_ms =
+                        Some(u64::try_from(timeout.as_millis()).map_err(|_| {
+                            ToolError::Rejected(
+                                "remote network policy decision timeout exceeds protocol limit"
+                                    .to_string(),
+                            )
+                        })?);
+                }
                 if !launch.proxy.enabled {
                     (env, None, None)
                 } else {
@@ -463,6 +488,8 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
                         .open_session_with_prepared_exec_env(
                             req.process_id,
                             &prepared.exec_request,
+                            windows_sandbox_proxy_settings_mode,
+                            /*network_policy_decider*/ None,
                             req.tty,
                             prepared.spawn_lifecycle,
                             req.turn_environment.environment.as_ref(),
@@ -509,6 +536,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
                 network_proxy_launch,
                 /*environment_id*/ Some(&req.turn_environment.environment_id),
                 req.exec_server_env_config.clone(),
+                windows_sandbox_proxy_settings_mode,
                 req.tty,
                 Box::new(NoopSpawnLifecycle),
                 req.turn_environment.environment.as_ref(),

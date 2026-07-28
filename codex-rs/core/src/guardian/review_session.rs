@@ -43,13 +43,14 @@ use crate::config::NetworkProxySpec;
 use crate::config::Permissions;
 use crate::context::ContextualUserFragment;
 use crate::context::GuardianFollowupReviewReminder;
+use crate::session::GitEnrichmentPolicy;
 use crate::session::SessionIo;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use codex_config::types::McpServerConfig;
 use codex_features::Feature;
 use codex_model_provider_info::ModelProviderInfo;
-use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 
 use super::GUARDIAN_REVIEWER_NAME;
 use super::GuardianApprovalRequest;
@@ -167,7 +168,7 @@ struct GuardianReviewSessionReuseKey {
     base_instructions: Option<String>,
     user_instructions: Option<UserInstructions>,
     compact_prompt: Option<String>,
-    cwd: AbsolutePathBuf,
+    cwd: PathUri,
     mcp_servers: Constrained<HashMap<String, McpServerConfig>>,
     codex_linux_sandbox_exe: Option<PathBuf>,
     main_execve_wrapper_exe: Option<PathBuf>,
@@ -195,7 +196,7 @@ impl GuardianReviewSessionReuseKey {
             base_instructions: spawn_config.base_instructions.clone(),
             user_instructions,
             compact_prompt: spawn_config.compact_prompt.clone(),
-            cwd: spawn_config.cwd.clone(),
+            cwd: PathUri::from_abs_path(&spawn_config.cwd),
             mcp_servers: spawn_config.mcp_servers.clone(),
             codex_linux_sandbox_exe: spawn_config.codex_linux_sandbox_exe.clone(),
             main_execve_wrapper_exe: spawn_config.main_execve_wrapper_exe.clone(),
@@ -678,6 +679,8 @@ async fn spawn_guardian_review_session(
         cancel_token.clone(),
         SubAgentSource::Other(GUARDIAN_REVIEWER_NAME.to_string()),
         initial_history,
+        GitEnrichmentPolicy::Skip,
+        codex_sandboxing::WindowsSandboxProxySettingsMode::Preserve,
     ))
     .await?;
 
@@ -1050,7 +1053,6 @@ pub(crate) fn build_guardian_review_session_config(
         )?);
     }
     for feature in [
-        Feature::SpawnCsv,
         Feature::Collab,
         Feature::MultiAgentV2,
         Feature::CodexHooks,
@@ -1254,6 +1256,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawned_guardian_session_preserves_windows_sandbox_proxy_settings() {
+        let params = test_review_params().await;
+        let manager = GuardianReviewSessionManager::default();
+        manager
+            .initialize(params.parent_session, params.parent_turn)
+            .await
+            .expect("initialize Guardian session");
+        let mode = manager
+            .state
+            .lock()
+            .await
+            .trunk
+            .as_ref()
+            .expect("Guardian session")
+            .session
+            .windows_sandbox_proxy_settings_mode;
+
+        assert_eq!(
+            mode,
+            codex_sandboxing::WindowsSandboxProxySettingsMode::Preserve
+        );
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn guardian_review_session_config_change_invalidates_cached_session() {
         let parent_config = crate::config::test_config().await;
         let cached_spawn_config = build_guardian_review_session_config(
@@ -1285,6 +1312,10 @@ mod tests {
             /*user_instructions*/ None,
         );
 
+        assert_eq!(
+            cached_reuse_key.cwd,
+            PathUri::from_abs_path(&cached_spawn_config.cwd)
+        );
         assert_ne!(cached_reuse_key, next_reuse_key);
         assert_eq!(
             cached_reuse_key,
@@ -1422,6 +1453,7 @@ mod tests {
                 policy_template: Some(catalog_template.to_string()),
             }),
             permissions: None,
+            token_budget: None,
         };
 
         let guardian_config = build_guardian_review_session_config(
@@ -1454,6 +1486,7 @@ mod tests {
                 policy_template: None,
             }),
             permissions: None,
+            token_budget: None,
         };
 
         let guardian_config = build_guardian_review_session_config(
@@ -1494,6 +1527,7 @@ mod tests {
                 policy_template: Some(String::new()),
             }),
             permissions: None,
+            token_budget: None,
         };
 
         let guardian_config = build_guardian_review_session_config(

@@ -47,11 +47,13 @@ members = [
     "file-system",
     "exec-server-protocol",
     "exec-server",
+    "exec-server/tests/support",
     "execpolicy",
     "ext/agent",
     "ext/connectors",
     "ext/extension-api",
     "ext/goal",
+    "ext/git-attribution",
     "ext/guardian",
     "ext/image-generation",
     "ext/items",
@@ -180,10 +182,12 @@ codex-exec = { path = "exec" }
 codex-file-system = { path = "file-system" }
 codex-exec-server-protocol = { path = "exec-server-protocol" }
 codex-exec-server = { path = "exec-server" }
+codex-exec-server-test-support = { path = "exec-server/tests/support" }
 codex-execpolicy = { path = "execpolicy" }
 codex-extension-api = { path = "ext/extension-api" }
 codex-extension-items = { path = "ext/items" }
 codex-goal-extension = { path = "ext/goal" }
+codex-git-attribution = { path = "ext/git-attribution" }
 codex-guardian = { path = "ext/guardian" }
 codex-image-generation-extension = { path = "ext/image-generation" }
 codex-external-agent-migration = { path = "external-agent-migration" }
@@ -299,7 +303,6 @@ constant_time_eq = "0.3.1"
 crossbeam-channel = "0.5.15"
 crypto_box = { version = "0.9.1", features = ["seal"] }
 crossterm = "0.28.1"
-csv = "1.3.1"
 ctor = "0.6.3"
 deno_core_icudata = "0.77.0"
 derive_more = "2"
@@ -398,6 +401,13 @@ scopeguard = "1.2.0"
 sha2 = "0.10"
 shlex = "1.3.0"
 similar = "2.7.0"
+symphonia = { version = "0.6.0", default-features = false, features = [
+    "isomp4",
+    "mkv",
+    "mp3",
+    "ogg",
+    "wav",
+] }
 socket2 = "0.6.1"
 sqlx = { version = "0.9.0", default-features = false, features = [
     "chrono",
@@ -552,7 +562,7 @@ opt-level = 0
 [patch.crates-io]
 # Uncomment to debug local changes.
 # ratatui = { path = "../../ratatui" }
-crossterm = { git = "https://github.com/nornagon/crossterm", rev = "87db8bfa6dc99427fd3b071681b07fc31c6ce995" }
+crossterm = { git = "https://github.com/openai-oss-forks/crossterm", rev = "87db8bfa6dc99427fd3b071681b07fc31c6ce995" }
 ratatui = { git = "https://github.com/nornagon/ratatui", rev = "9b2ad1298408c45918ee9f8241a6f95498cdbed2" }
 tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" }
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }

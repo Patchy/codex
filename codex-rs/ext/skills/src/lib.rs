@@ -5,11 +5,13 @@ mod extension;
 mod fragments;
 pub mod provider;
 mod render;
+mod render_observability;
 mod selection;
 mod shadow_selection_experiment;
 mod sources;
 mod state;
 mod tools;
+mod warnings;
 mod world_state;
 
 pub use config::SkillsExtensionConfig;

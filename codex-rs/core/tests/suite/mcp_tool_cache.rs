@@ -2,7 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use codex_config::Constrained;
 use codex_core::NewThread;
+use codex_core::StartThreadOptions;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::RemoveOptions;
 use codex_protocol::models::PermissionProfile;
@@ -106,6 +108,11 @@ async fn regular_mcp_definition_cache_preserves_live_session_state() -> anyhow::
     let fixture = test_codex()
         .with_model_info_override("gpt-5.4", |model| model.supports_search_tool = false)
         .with_config(move |config| {
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::Never);
+            config
+                .permissions
+                .set_permission_profile(PermissionProfile::Disabled)
+                .expect("test config should allow disabled permissions");
             let app_only_cwd_marker_file = config.cwd.join("cwd-app-only");
             let barrier_file = config.cwd.join("allow-initialize");
             let pid_file = config.cwd.join("mcp.pid");
@@ -183,7 +190,7 @@ async fn regular_mcp_definition_cache_preserves_live_session_state() -> anyhow::
         ..
     } = fixture
         .thread_manager
-        .start_thread(fixture.config.clone())
+        .start_thread(StartThreadOptions::new(fixture.config.clone()))
         .await?;
     let second_pid = wait_for_new_pid(fs.as_ref(), &pid_file, Some(&first_pid)).await?;
     let second_process = process_label(&second_pid);

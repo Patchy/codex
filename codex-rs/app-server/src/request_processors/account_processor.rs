@@ -225,19 +225,33 @@ impl AccountRequestProcessor {
             .await
         {
             Ok(config) => {
+                Self::spawn_effective_plugins_changed_task(
+                    Arc::clone(thread_manager),
+                    config_manager.clone(),
+                );
+                let plugins_config = config.plugins_config_input();
                 let refresh_thread_manager = Arc::clone(thread_manager);
                 let refresh_config_manager = config_manager.clone();
+                let on_effective_plugins_changed: Arc<
+                    dyn Fn(codex_core_plugins::EffectivePluginsChange) + Send + Sync,
+                > = Arc::new(move |_change| {
+                    Self::spawn_effective_plugins_changed_task(
+                        Arc::clone(&refresh_thread_manager),
+                        refresh_config_manager.clone(),
+                    );
+                });
+                thread_manager
+                    .plugins_manager()
+                    .maybe_start_curated_repo_sync_for_config(
+                        &plugins_config,
+                        Some(Arc::clone(&on_effective_plugins_changed)),
+                    );
                 thread_manager
                     .plugins_manager()
                     .maybe_start_remote_plugin_caches_refresh(
-                        &config.plugins_config_input(),
+                        &plugins_config,
                         auth,
-                        Some(Arc::new(move |_change| {
-                            Self::spawn_effective_plugins_changed_task(
-                                Arc::clone(&refresh_thread_manager),
-                                refresh_config_manager.clone(),
-                            );
-                        })),
+                        Some(on_effective_plugins_changed),
                     );
             }
             Err(err) => {
@@ -255,10 +269,9 @@ impl AccountRequestProcessor {
         tokio::spawn(async move {
             thread_manager.plugins_manager().clear_cache();
             thread_manager.skills_service().clear_cache();
-            if thread_manager.list_thread_ids().await.is_empty() {
-                return;
-            }
-            crate::mcp_refresh::queue_best_effort_refresh(&thread_manager, &config_manager).await;
+            crate::mcp_refresh::reload_mcp_config_best_effort(&thread_manager, &config_manager)
+                .await;
+            thread_manager.invalidate_mcp_runtimes().await;
         });
     }
 
@@ -538,7 +551,7 @@ impl AccountRequestProcessor {
         let outgoing_clone = self.outgoing.clone();
         let config_manager = self.config_manager.clone();
         let thread_manager = Arc::clone(&self.thread_manager);
-        let chatgpt_base_url = self.config.chatgpt_base_url.clone();
+        let config = Arc::clone(&self.config);
         let active_login = self.active_login.clone();
         let auth_url = server.auth_url.clone();
         tokio::spawn(async move {
@@ -560,7 +573,7 @@ impl AccountRequestProcessor {
                 &outgoing_clone,
                 config_manager,
                 thread_manager,
-                chatgpt_base_url,
+                config,
                 login_id,
                 success,
                 error_msg,
@@ -617,7 +630,7 @@ impl AccountRequestProcessor {
         let outgoing_clone = self.outgoing.clone();
         let config_manager = self.config_manager.clone();
         let thread_manager = Arc::clone(&self.thread_manager);
-        let chatgpt_base_url = self.config.chatgpt_base_url.clone();
+        let config = Arc::clone(&self.config);
         let active_login = self.active_login.clone();
         tokio::spawn(async move {
             let (success, error_msg) = tokio::select! {
@@ -636,7 +649,7 @@ impl AccountRequestProcessor {
                 &outgoing_clone,
                 config_manager,
                 thread_manager,
-                chatgpt_base_url,
+                config,
                 login_id,
                 success,
                 error_msg,
@@ -751,6 +764,7 @@ impl AccountRequestProcessor {
         self.config_manager.replace_cloud_config_bundle_loader(
             self.auth_manager.clone(),
             self.config.chatgpt_base_url.clone(),
+            self.config.http_client_factory(),
         );
         self.config_manager
             .sync_default_client_residency_requirement()
@@ -789,7 +803,7 @@ impl AccountRequestProcessor {
         outgoing: &OutgoingMessageSender,
         config_manager: ConfigManager,
         thread_manager: Arc<ThreadManager>,
-        chatgpt_base_url: String,
+        config: Arc<Config>,
         login_id: Uuid,
         success: bool,
         error_msg: Option<String>,
@@ -806,8 +820,11 @@ impl AccountRequestProcessor {
         if success {
             let auth_manager = thread_manager.auth_manager();
             auth_manager.reload().await;
-            config_manager
-                .replace_cloud_config_bundle_loader(auth_manager.clone(), chatgpt_base_url);
+            config_manager.replace_cloud_config_bundle_loader(
+                auth_manager.clone(),
+                config.chatgpt_base_url.clone(),
+                config.http_client_factory(),
+            );
             config_manager
                 .sync_default_client_residency_requirement()
                 .await;
@@ -1028,8 +1045,11 @@ impl AccountRequestProcessor {
             ));
         }
 
-        let client = BackendClient::from_auth(self.config.chatgpt_base_url.clone(), &auth)
-            .map_err(|err| internal_error(format!("failed to construct backend client: {err}")))?;
+        let client = BackendClient::from_auth(
+            self.config.chatgpt_base_url.clone(),
+            &auth,
+            self.config.http_client_factory(),
+        );
 
         let (response, detailed_rate_limit_reset_credits) = tokio::join!(
             client.get_rate_limits_with_reset_credits(),
@@ -1098,8 +1118,11 @@ impl AccountRequestProcessor {
             ));
         }
 
-        let client = BackendClient::from_auth(self.config.chatgpt_base_url.clone(), &auth)
-            .map_err(|err| internal_error(format!("failed to construct backend client: {err}")))?;
+        let client = BackendClient::from_auth(
+            self.config.chatgpt_base_url.clone(),
+            &auth,
+            self.config.http_client_factory(),
+        );
         let profile = tokio::time::timeout(
             ACCOUNT_TOKEN_USAGE_FETCH_TIMEOUT,
             client.get_token_usage_profile(),
@@ -1125,8 +1148,11 @@ impl AccountRequestProcessor {
             ));
         }
 
-        let client = BackendClient::from_auth(self.config.chatgpt_base_url.clone(), &auth)
-            .map_err(|err| internal_error(format!("failed to construct backend client: {err}")))?;
+        let client = BackendClient::from_auth(
+            self.config.chatgpt_base_url.clone(),
+            &auth,
+            self.config.http_client_factory(),
+        );
         let messages = tokio::time::timeout(
             ACCOUNT_WORKSPACE_MESSAGES_FETCH_TIMEOUT,
             client.list_workspace_messages(),
@@ -1213,8 +1239,11 @@ impl AccountRequestProcessor {
             ));
         }
 
-        let client = BackendClient::from_auth(self.config.chatgpt_base_url.clone(), &auth)
-            .map_err(|err| internal_error(format!("failed to construct backend client: {err}")))?;
+        let client = BackendClient::from_auth(
+            self.config.chatgpt_base_url.clone(),
+            &auth,
+            self.config.http_client_factory(),
+        );
 
         match client
             .send_add_credits_nudge_email(Self::backend_credit_type(params.credit_type))

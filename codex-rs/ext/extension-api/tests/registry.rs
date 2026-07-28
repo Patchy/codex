@@ -10,7 +10,9 @@ use codex_extension_api::ContextualUserFragment;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionEventSink;
 use codex_extension_api::ExtensionFuture;
+use codex_extension_api::ExtensionMetrics;
 use codex_extension_api::ExtensionRegistryBuilder;
+use codex_extension_api::ExtensionWarning;
 use codex_extension_api::PromptFragment;
 use codex_extension_api::PromptSlot;
 use codex_extension_api::SkillInvocationContributor;
@@ -60,6 +62,7 @@ impl TurnInputContributor for AllContributors {
     fn contribute<'a>(
         &'a self,
         input: TurnInputContext,
+        _extension_metrics: Option<Arc<dyn ExtensionMetrics>>,
         _session_store: &'a ExtensionData,
         _thread_store: &'a ExtensionData,
         _turn_store: &'a ExtensionData,
@@ -314,7 +317,10 @@ async fn approval_review_returns_first_claim_and_short_circuits() {
     for (name, decision) in [
         ("first", None),
         ("second", Some(ReviewDecision::Approved)),
-        ("third", Some(ReviewDecision::Denied)),
+        (
+            "third",
+            Some(ReviewDecision::denied("rejected by extension")),
+        ),
     ] {
         builder.approval_review_contributor(Arc::new(RecordingApprovalContributor {
             name,
@@ -367,6 +373,13 @@ impl ExtensionEventSink for RecordingEventSink {
             .expect("recording event sink lock should not be poisoned")
             .push((event.id, warning.message));
     }
+
+    fn emit_warning(&self, warning: ExtensionWarning) {
+        self.events
+            .lock()
+            .expect("recording event sink lock should not be poisoned")
+            .push((warning.thread_id, warning.message));
+    }
 }
 
 #[test]
@@ -381,6 +394,11 @@ fn custom_event_sink_survives_registry_build() {
     registry
         .event_sink()
         .emit(warning_event("registry", "after"));
+    registry.event_sink().emit_warning(ExtensionWarning {
+        thread_id: "thread".to_string(),
+        turn_id: Some("turn".to_string()),
+        message: "warning".to_string(),
+    });
 
     assert_eq!(
         sink.events
@@ -390,6 +408,7 @@ fn custom_event_sink_survives_registry_build() {
         [
             ("builder".to_string(), "before".to_string()),
             ("registry".to_string(), "after".to_string()),
+            ("thread".to_string(), "warning".to_string()),
         ]
     );
 }

@@ -255,6 +255,7 @@ mod tests {
                 text: format!("{USER_MESSAGE_BEGIN} actual user request"),
                 text_elements: Vec::new(),
             }])),
+            started_at_ms: Some(0),
             completed_at_ms: 0,
         }));
 
@@ -284,6 +285,27 @@ mod tests {
 
         assert_eq!(metadata.first_user_message.as_deref(), Some("[Image]"));
         assert_eq!(metadata.preview.as_deref(), Some("[Image]"));
+        assert_eq!(metadata.title, "");
+    }
+
+    #[test]
+    fn event_msg_audio_only_user_message_sets_audio_placeholder_preview() {
+        let mut metadata = metadata_for_test();
+        let item = RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            client_id: None,
+            message: String::new(),
+            images: None,
+            local_images: vec![],
+            audio: Some(vec!["https://example.com/audio.mp3".to_string()]),
+            local_audio: vec![],
+            text_elements: vec![],
+            ..Default::default()
+        }));
+
+        apply_rollout_item(&mut metadata, &item, "test-provider");
+
+        assert_eq!(metadata.first_user_message.as_deref(), Some("[Audio]"));
+        assert_eq!(metadata.preview.as_deref(), Some("[Audio]"));
         assert_eq!(metadata.title, "");
     }
 
@@ -673,6 +695,7 @@ mod tests {
             tokens_used: 1,
             first_user_message: None,
             archived_at: None,
+            is_pinned: false,
             git_sha: None,
             git_branch: None,
             git_origin_url: None,
