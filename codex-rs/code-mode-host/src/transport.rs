@@ -1,13 +1,17 @@
+use std::collections::HashMap;
 use std::io;
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 
 use anyhow::Context;
 use anyhow::Result;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::ConnectInfo;
+use axum::extract::Path;
 use axum::extract::State;
 use axum::extract::ws::Message;
 use axum::extract::ws::WebSocket;
@@ -21,6 +25,9 @@ use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::routing::any;
 use axum::routing::get;
+use axum::serve::Listener;
+use axum::serve::ListenerExt;
+use axum::serve::TapIo;
 use codex_code_mode_protocol::host::ClientToHost;
 use codex_code_mode_protocol::host::EncodedFrame;
 use codex_code_mode_protocol::host::FramedReader;
@@ -34,15 +41,20 @@ use futures::stream::SplitStream;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::net::TcpListener;
+use tokio::net::TcpStream;
+use tokio::sync::oneshot;
 use tracing::info;
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::HostLimits;
+use crate::MAX_IN_FLIGHT_REQUESTS;
 
 /// The default transport retains the standalone host's original stdio behavior.
 pub const DEFAULT_LISTEN_URL: &str = "stdio";
 
 const MAX_WEBSOCKET_FRAME_BYTES: usize = MAX_FRAME_BYTES + std::mem::size_of::<u32>();
+const MAX_PENDING_BULK_CONNECTIONS: usize = MAX_IN_FLIGHT_REQUESTS;
 
 type BoxedReader = Box<dyn AsyncRead + Send + Unpin>;
 type BoxedWriter = Box<dyn AsyncWrite + Send + Unpin>;
@@ -66,6 +78,64 @@ pub(crate) enum ConnectionWriter {
 #[derive(Clone)]
 struct WebSocketListenerState {
     limits: Arc<HostLimits>,
+    bulk_connections: BulkConnectionRegistry,
+}
+
+pub(crate) struct BulkConnection {
+    pub(crate) reader: ConnectionReader,
+    pub(crate) writer: ConnectionWriter,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct BulkConnectionRegistry {
+    pending: Arc<Mutex<HashMap<Uuid, oneshot::Sender<BulkConnection>>>>,
+}
+
+pub(crate) struct BulkConnectionRegistration {
+    registry: BulkConnectionRegistry,
+    token: Uuid,
+    receiver: oneshot::Receiver<BulkConnection>,
+}
+
+impl BulkConnectionRegistry {
+    pub(crate) fn reserve(&self) -> Option<BulkConnectionRegistration> {
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        if pending.len() >= MAX_PENDING_BULK_CONNECTIONS {
+            return None;
+        }
+
+        let token = Uuid::new_v4();
+        let (sender, receiver) = oneshot::channel();
+        pending.insert(token, sender);
+        Some(BulkConnectionRegistration {
+            registry: self.clone(),
+            token,
+            receiver,
+        })
+    }
+
+    pub(crate) fn remove(&self, token: Uuid) -> Option<oneshot::Sender<BulkConnection>> {
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&token)
+    }
+}
+
+impl BulkConnectionRegistration {
+    pub(crate) fn token(&self) -> Uuid {
+        self.token
+    }
+
+    pub(crate) async fn receive(&mut self) -> Result<BulkConnection, oneshot::error::RecvError> {
+        (&mut self.receiver).await
+    }
+}
+
+impl Drop for BulkConnectionRegistration {
+    fn drop(&mut self) {
+        self.registry.remove(self.token);
+    }
 }
 
 impl ConnectionReader {
@@ -156,15 +226,28 @@ fn parse_listen_url(listen_url: &str) -> Result<ListenTransport> {
     );
 }
 
-async fn run_websocket_listener(bind_address: SocketAddr) -> Result<()> {
+async fn bind_websocket_listener(
+    bind_address: SocketAddr,
+) -> Result<TapIo<TcpListener, impl FnMut(&mut TcpStream) + Send + 'static>> {
     let listener = TcpListener::bind(bind_address)
         .await
         .with_context(|| format!("failed to bind code-mode host websocket to {bind_address}"))?;
+
+    Ok(listener.tap_io(|stream| {
+        if let Err(error) = stream.set_nodelay(/*nodelay*/ true) {
+            warn!(%error, "failed to enable TCP_NODELAY for code-mode host connection");
+        }
+    }))
+}
+
+async fn run_websocket_listener(bind_address: SocketAddr) -> Result<()> {
+    let listener = bind_websocket_listener(bind_address).await?;
     let local_addr = listener
         .local_addr()
         .context("failed to read code-mode host websocket listen address")?;
     let state = WebSocketListenerState {
         limits: Arc::new(HostLimits::new()),
+        bulk_connections: BulkConnectionRegistry::default(),
     };
     info!("codex-code-mode-host listening on ws://{local_addr}");
     println!("ws://{local_addr}");
@@ -174,6 +257,7 @@ async fn run_websocket_listener(bind_address: SocketAddr) -> Result<()> {
 
     let router = Router::new()
         .route("/", any(websocket_upgrade_handler))
+        .route("/bulk/{token}", any(bulk_websocket_upgrade_handler))
         .route("/readyz", get(readiness_handler))
         .layer(middleware::from_fn(reject_requests_with_origin_header))
         .with_state(state);
@@ -220,12 +304,45 @@ async fn websocket_upgrade_handler(
                 ConnectionReader::WebSocket(reader),
                 ConnectionWriter::WebSocket(writer),
                 state.limits,
+                Some(state.bulk_connections),
             )
             .await
             {
-                warn!(%peer_addr, "code-mode host websocket connection failed: {err:#}");
+                warn!(%peer_addr, "code-mode host session failed: {err:#}");
             }
         })
+}
+
+async fn bulk_websocket_upgrade_handler(
+    websocket: WebSocketUpgrade,
+    Path(token): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    State(state): State<WebSocketListenerState>,
+) -> Response {
+    let Ok(token) = Uuid::parse_str(&token) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(pending) = state.bulk_connections.remove(token) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    websocket
+        .max_frame_size(MAX_WEBSOCKET_FRAME_BYTES)
+        .max_message_size(MAX_WEBSOCKET_FRAME_BYTES)
+        .on_upgrade(move |stream| async move {
+            info!(%peer_addr, "code-mode host bulk websocket client connected");
+            let (writer, reader) = stream.split();
+            if pending
+                .send(BulkConnection {
+                    reader: ConnectionReader::WebSocket(reader),
+                    writer: ConnectionWriter::WebSocket(writer),
+                })
+                .is_err()
+            {
+                warn!(%peer_addr, "code-mode host bulk websocket pairing expired");
+            }
+        })
+        .into_response()
 }
 
 #[cfg(test)]

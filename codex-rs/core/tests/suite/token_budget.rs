@@ -2,7 +2,9 @@ use anyhow::Result;
 use codex_config::config_toml::ConfigLockfileToml;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
+use codex_core::config::Config;
 use codex_core::config::TokenBudgetConfig;
+use codex_extension_api::ExtensionRegistryBuilder;
 use codex_features::Feature;
 use codex_features::FeatureToml;
 use codex_features::TokenBudgetConfigToml;
@@ -22,6 +24,8 @@ use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
+use codex_skills_extension::SkillsExtensionConfig;
+use codex_skills_extension::install;
 use core_test_support::PathBufExt;
 use core_test_support::assert_regex_match;
 use core_test_support::context_snapshot;
@@ -70,7 +74,7 @@ fn model_token_budget_config() -> ModelTokenBudgetConfig {
 }
 
 fn token_budget_contexts(request: &ResponsesRequest) -> Vec<String> {
-    let context_window_prefix = format!("{CONTEXT_WINDOW_OPEN_TAG}\nThread id: ");
+    let context_window_prefix = format!("{CONTEXT_WINDOW_OPEN_TAG}\n");
     request
         .message_input_texts("developer")
         .into_iter()
@@ -78,13 +82,10 @@ fn token_budget_contexts(request: &ResponsesRequest) -> Vec<String> {
         .collect()
 }
 
-fn token_budget_window_ids(
-    text: &str,
-    thread_id: codex_protocol::ThreadId,
-) -> (String, Option<String>, String) {
+fn token_budget_window_ids(text: &str, agent_name: &str) -> (String, Option<String>, String) {
     let captures = assert_regex_match(
         &format!(
-            r"^{CONTEXT_WINDOW_OPEN_TAG}\nThread id: {thread_id}\nFirst context window id: ([0-9a-f-]{{36}})\nCurrent context window id: ([0-9a-f-]{{36}})(?:\nPrevious context window id: ([0-9a-f-]{{36}}))?\n{CONTEXT_WINDOW_CLOSE_TAG}$"
+            r"^{CONTEXT_WINDOW_OPEN_TAG}\nAgent name: {agent_name}\nFirst context window id: ([0-9a-f-]{{36}})\nCurrent context window id: ([0-9a-f-]{{36}})(?:\nPrevious context window id: ([0-9a-f-]{{36}}))?\n{CONTEXT_WINDOW_CLOSE_TAG}$"
         ),
         text,
     );
@@ -219,11 +220,10 @@ async fn token_budget_context_is_only_emitted_with_full_context() -> Result<()> 
     let requests = responses.requests();
     assert_eq!(requests.len(), 2);
 
-    let thread_id = test.session_configured.thread_id;
     let initial_token_budget = token_budget_contexts(&requests[0]);
     assert_eq!(initial_token_budget.len(), 1);
     let (first_window_id, previous_window_id, window_id) =
-        token_budget_window_ids(&initial_token_budget[0], thread_id);
+        token_budget_window_ids(&initial_token_budget[0], "/root");
     assert_eq!(previous_window_id, None);
     assert_eq!(first_window_id, window_id);
     assert_eq!(
@@ -236,7 +236,7 @@ async fn token_budget_context_is_only_emitted_with_full_context() -> Result<()> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn token_budget_guidance_follows_context_window() -> Result<()> {
+async fn token_budget_guidance_precedes_standalone_context_window() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -271,12 +271,15 @@ async fn token_budget_guidance_follows_context_window() -> Result<()> {
         .iter()
         .position(|text| text.starts_with(CONTEXT_WINDOW_OPEN_TAG))
         .expect("context-window metadata should be present");
-    assert_eq!(
-        developer_texts.get(context_window_index + 1),
-        Some(&format!(
-            "{CONTEXT_WINDOW_GUIDANCE_OPEN_TAG}\n{guidance_message}\n{CONTEXT_WINDOW_GUIDANCE_CLOSE_TAG}"
-        ))
-    );
+    let guidance_index = developer_texts
+        .iter()
+        .position(|text| {
+            text == &format!(
+                "{CONTEXT_WINDOW_GUIDANCE_OPEN_TAG}\n{guidance_message}\n{CONTEXT_WINDOW_GUIDANCE_CLOSE_TAG}"
+            )
+        })
+        .expect("context-window guidance should be present");
+    assert!(guidance_index < context_window_index);
 
     Ok(())
 }
@@ -290,6 +293,13 @@ async fn token_budget_uses_model_message_defaults() -> Result<()> {
     let model_defaults = model_token_budget_config();
     let expected_guidance = model_defaults.guidance_message.clone();
     let test = test_codex()
+        .with_pre_build_hook(|home| {
+            std::fs::write(
+                home.join("config.toml"),
+                "[features.token_budget]\nenabled = true\n",
+            )
+            .expect("write token-budget configuration");
+        })
         .with_model_info_override("gpt-5.2", move |model_info| {
             model_info
                 .model_messages
@@ -310,7 +320,14 @@ async fn token_budget_uses_model_message_defaults() -> Result<()> {
     test.submit_turn("inspect model-owned context guidance")
         .await?;
 
-    let developer_texts = response.single_request().message_input_texts("developer");
+    let request = response.single_request();
+    let token_budget_context = token_budget_contexts(&request);
+    assert_eq!(token_budget_context.len(), 1);
+    assert!(
+        token_budget_context[0]
+            .starts_with(&format!("{CONTEXT_WINDOW_OPEN_TAG}\nAgent name: /root\n"))
+    );
+    let developer_texts = request.message_input_texts("developer");
     assert!(developer_texts.iter().any(|text| {
         text == &format!(
             "{CONTEXT_WINDOW_GUIDANCE_OPEN_TAG}\n{expected_guidance}\n{CONTEXT_WINDOW_GUIDANCE_CLOSE_TAG}"
@@ -453,18 +470,34 @@ async fn token_budget_model_defaults_survive_config_lock_replay() -> Result<()> 
         })
         .build_with_auto_env(&server)
         .await?;
+    core_test_support::submit_thread_settings(
+        &replay.codex,
+        ThreadSettingsOverrides {
+            model: Some("gpt-5.4".to_string()),
+            ..Default::default()
+        },
+    )
+    .await?;
     replay
-        .submit_turn("inspect guidance after lock replay")
+        .submit_text_turn("inspect guidance after lock replay and model switch")
         .await?;
 
     let requests = responses.requests();
     assert_eq!(requests.len(), 2);
-    for request in requests {
+    for request in &requests {
         assert!(
             request.body_contains_text("Use the model-owned context-window guidance."),
             "exporting and replaying a config lock must preserve model-owned guidance"
         );
     }
+    assert_eq!(requests[1].body_json()["model"], "gpt-5.4");
+    assert!(
+        requests[1]
+            .message_input_texts("developer")
+            .iter()
+            .any(|text| text.contains("<model_switch>")),
+        "replaying model-owned instructions must not override the new model's template"
+    );
 
     Ok(())
 }
@@ -689,6 +722,7 @@ async fn token_budget_context_injects_plain_thread_hint_text() -> Result<()> {
                     enabled: true,
                     required: false,
                     supports_parallel_tool_calls: false,
+                    omit_tools_from: None,
                     disabled_reason: None,
                     startup_timeout_sec: Some(Duration::from_secs(10)),
                     tool_timeout_sec: None,
@@ -726,7 +760,7 @@ async fn token_budget_context_injects_plain_thread_hint_text() -> Result<()> {
     assert_eq!(token_budgets.len(), 1);
     let captures = assert_regex_match(
         &format!(
-            r"^{CONTEXT_WINDOW_OPEN_TAG}\nThread id: {thread_id}\nFirst context window id: ([0-9a-f-]{{36}})\nCurrent context window id: ([0-9a-f-]{{36}})\nmanual history hint for thread {thread_id}\nunstructured notes/thread_hint fixture result\n{CONTEXT_WINDOW_CLOSE_TAG}$"
+            r"^{CONTEXT_WINDOW_OPEN_TAG}\nAgent name: /root\nFirst context window id: ([0-9a-f-]{{36}})\nCurrent context window id: ([0-9a-f-]{{36}})\nmanual history hint for thread {thread_id}\nunstructured notes/thread_hint fixture result\n{CONTEXT_WINDOW_CLOSE_TAG}$"
         ),
         &token_budgets[0],
     );
@@ -910,11 +944,10 @@ async fn get_context_remaining_returns_token_budget_remaining_fragment() -> Resu
         "get_context_remaining should be exposed when token budget is enabled"
     );
 
-    let thread_id = test.session_configured.thread_id;
     let remaining_context = "You have 6500 tokens left in this context window.".to_string();
     let token_budgets = token_budget_contexts(&requests[1]);
     assert_eq!(token_budgets.len(), 1);
-    token_budget_window_ids(&token_budgets[0], thread_id);
+    token_budget_window_ids(&token_budgets[0], "/root");
     assert_eq!(
         requests[2].function_call_output_content_and_success(call_id),
         Some((Some(remaining_context), None))
@@ -1094,18 +1127,17 @@ async fn token_budget_context_uses_new_window_after_compaction() -> Result<()> {
         "token budget compaction should not call server-side compaction"
     );
 
-    let thread_id = test.session_configured.thread_id;
     let initial_token_budget = token_budget_contexts(&requests[0]);
     assert_eq!(initial_token_budget.len(), 1);
     let (initial_first_window_id, initial_previous_window_id, initial_window_id) =
-        token_budget_window_ids(&initial_token_budget[0], thread_id);
+        token_budget_window_ids(&initial_token_budget[0], "/root");
     let post_compaction_token_budget = token_budget_contexts(&requests[1]);
     assert_eq!(post_compaction_token_budget.len(), 1);
     let (
         post_compaction_first_window_id,
         post_compaction_previous_window_id,
         post_compaction_window_id,
-    ) = token_budget_window_ids(&post_compaction_token_budget[0], thread_id);
+    ) = token_budget_window_ids(&post_compaction_token_budget[0], "/root");
     assert_eq!(initial_previous_window_id, None);
     assert_eq!(initial_first_window_id, initial_window_id);
     assert_eq!(post_compaction_first_window_id, initial_first_window_id);
@@ -1259,15 +1291,14 @@ async fn token_budget_mid_turn_auto_compaction_resets_before_active_follow_up() 
         "fresh token-budget windows should drop active tool output with the prior history"
     );
 
-    let thread_id = test.session_configured.thread_id;
     let initial_token_budget = token_budget_contexts(&requests[0]);
     assert_eq!(initial_token_budget.len(), 1);
     let (initial_first_window_id, _, initial_window_id) =
-        token_budget_window_ids(&initial_token_budget[0], thread_id);
+        token_budget_window_ids(&initial_token_budget[0], "/root");
     let follow_up_token_budget = token_budget_contexts(&requests[1]);
     assert_eq!(follow_up_token_budget.len(), 1);
     let (follow_up_first_window_id, follow_up_previous_window_id, follow_up_window_id) =
-        token_budget_window_ids(&follow_up_token_budget[0], thread_id);
+        token_budget_window_ids(&follow_up_token_budget[0], "/root");
     assert_eq!(follow_up_first_window_id, initial_first_window_id);
     assert_eq!(
         follow_up_previous_window_id.as_deref(),
@@ -1359,16 +1390,15 @@ async fn token_budget_auto_compact_fallback_uses_buffer_until_new_context() -> R
         fallback_request.function_call_output_text(trigger_call_id),
         Some("You have 0 tokens left in this context window.".to_string())
     );
-    let thread_id = test.session_configured.thread_id;
     let initial_context = token_budget_contexts(&requests[0]);
     assert_eq!(token_budget_contexts(fallback_request), initial_context);
     assert_eq!(token_budget_contexts(&requests[2]), initial_context);
     assert!(requests[2].body_contains_text(AUTO_COMPACT_FALLBACK_PROMPT));
     assert!(requests[2].body_contains_text(fallback_call_id));
-    let (_, _, initial_window_id) = token_budget_window_ids(&initial_context[0], thread_id);
+    let (_, _, initial_window_id) = token_budget_window_ids(&initial_context[0], "/root");
     let follow_up_context = token_budget_contexts(&requests[3]);
     let (_, previous_window_id, follow_up_window_id) =
-        token_budget_window_ids(&follow_up_context[0], thread_id);
+        token_budget_window_ids(&follow_up_context[0], "/root");
     assert_eq!(
         previous_window_id.as_deref(),
         Some(initial_window_id.as_str())
@@ -1483,7 +1513,15 @@ async fn new_context_tool_skips_auto_compact_fallback() -> Result<()> {
         ],
     )
     .await;
+    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+    install(&mut extensions, |config: &Config| SkillsExtensionConfig {
+        include_instructions: config.include_skill_instructions,
+        bundled_skills_enabled: config.bundled_skills_enabled(),
+        orchestrator_skills_enabled: config.orchestrator_skills_enabled,
+        shadow_selection_enabled: config.features.enabled(Feature::SkillSearch),
+    });
     let test = test_codex()
+        .with_extensions(Arc::new(extensions.build()))
         .with_config(|config| {
             config.model_context_window = Some(10_000);
             config.token_budget = Some(TokenBudgetConfig {
@@ -1510,15 +1548,14 @@ async fn new_context_tool_skips_auto_compact_fallback() -> Result<()> {
             .any(|name| name == "new_context"),
         "new_context should be exposed when token budget is enabled"
     );
-    let thread_id = test.session_configured.thread_id;
     let initial_token_budget = token_budget_contexts(&requests[0]);
     assert_eq!(initial_token_budget.len(), 1);
     let (initial_first_window_id, _, initial_window_id) =
-        token_budget_window_ids(&initial_token_budget[0], thread_id);
+        token_budget_window_ids(&initial_token_budget[0], "/root");
     let new_window_token_budget = token_budget_contexts(&requests[2]);
     assert_eq!(new_window_token_budget.len(), 1);
     let (new_first_window_id, new_previous_window_id, new_window_id) =
-        token_budget_window_ids(&new_window_token_budget[0], thread_id);
+        token_budget_window_ids(&new_window_token_budget[0], "/root");
     assert_eq!(new_first_window_id, initial_first_window_id);
     assert_eq!(
         new_previous_window_id.as_deref(),
@@ -1539,7 +1576,6 @@ async fn new_context_tool_skips_auto_compact_fallback() -> Result<()> {
         &ContextSnapshotOptions::default(),
     );
     let snapshot = snapshot
-        .replace(&thread_id.to_string(), "<THREAD_ID>")
         .replace(&new_first_window_id, "<FIRST_WINDOW_ID>")
         .replace(&new_window_id, "<WINDOW_ID>");
     insta::assert_snapshot!(

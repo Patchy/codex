@@ -55,11 +55,16 @@ pub fn default_filter() -> Targets {
         .with_default(LevelFilter::TRACE)
         .with_target("hyper_util", LevelFilter::WARN)
         .with_target("log", LevelFilter::OFF)
+        .with_target("codex_rmcp_client", LevelFilter::INFO)
         .with_target("codex_otel.log_only", LevelFilter::OFF)
         .with_target("codex_otel.trace_safe", LevelFilter::OFF)
-        .with_target("rmcp::service", LevelFilter::INFO)
+        .with_target("rmcp", LevelFilter::INFO)
         .with_target("codex_api::responses_websocket_timing", LevelFilter::OFF)
         .with_target("codex_core::post_sampling_token_estimate", LevelFilter::OFF)
+        // Full model request bodies and streamed response payloads overwhelm the
+        // SQLite log database, but remain available to explicit TRACE subscribers.
+        .with_target("codex_http_client::transport", LevelFilter::DEBUG)
+        .with_target("codex_api::sse", LevelFilter::DEBUG)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -1,9 +1,11 @@
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use crate::function_tool::FunctionCallError;
 use crate::mcp_tool_call::handle_mcp_tool_call;
 use crate::original_image_detail::can_request_original_image_detail;
+use crate::session::session::Session;
 use crate::tools::context::McpToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -22,22 +24,60 @@ use codex_tools::ToolName;
 use codex_tools::ToolSearchInfo;
 use codex_tools::ToolSearchSourceInfo;
 use codex_tools::ToolSpec;
+use codex_tools::agent_plugin_mcp_tool_to_responses_api_tool;
 use codex_tools::mcp_tool_to_responses_api_tool;
+use codex_utils_string::take_bytes_at_char_boundary;
+use futures::future::BoxFuture;
 use serde_json::Map;
 use serde_json::Value;
 
 const LEGACY_MCP_TOOL_NAME_PREFIX: &str = "mcp__";
 const MCP_TOOL_NAME_DELIMITER: &str = "__";
+const MAX_AGENT_PLUGIN_MCP_NAMESPACE_DESCRIPTION_BYTES: usize = 1_000;
+const MAX_MCP_NAMESPACE_DESCRIPTION_BYTES: usize = 512 * 1024;
 
 pub struct McpHandler {
     tool_info: ToolInfo,
-    spec: ToolSpec,
+    spec: Arc<ToolSpec>,
+    code_mode_tool_definitions: OnceLock<Vec<codex_code_mode::ToolDefinition>>,
 }
 
 impl McpHandler {
     pub fn new(tool_info: ToolInfo) -> Result<Self, serde_json::Error> {
-        let spec = create_tool_spec(&tool_info)?;
-        Ok(Self { tool_info, spec })
+        Self::with_agent_plugin(tool_info, /*agent_plugin*/ false)
+    }
+
+    pub fn new_agent_plugin(tool_info: ToolInfo) -> Result<Self, serde_json::Error> {
+        Self::with_agent_plugin(tool_info, /*agent_plugin*/ true)
+    }
+
+    fn with_agent_plugin(
+        mut tool_info: ToolInfo,
+        agent_plugin: bool,
+    ) -> Result<Self, serde_json::Error> {
+        if agent_plugin {
+            tool_info.namespace_description =
+                tool_info
+                    .namespace_description
+                    .as_deref()
+                    .map(|description| {
+                        take_bytes_at_char_boundary(
+                            description,
+                            MAX_AGENT_PLUGIN_MCP_NAMESPACE_DESCRIPTION_BYTES,
+                        )
+                        .to_string()
+                    });
+        }
+        let spec = Arc::new(create_tool_spec(&tool_info, agent_plugin)?);
+        Ok(Self {
+            tool_info,
+            spec,
+            code_mode_tool_definitions: OnceLock::new(),
+        })
+    }
+
+    pub(crate) fn model_spec_bytes(&self) -> Result<usize, serde_json::Error> {
+        serde_json::to_vec(&self.spec).map(|spec| spec.len())
     }
 
     fn hook_tool_name(&self) -> HookToolName {
@@ -70,7 +110,7 @@ impl ToolExecutor<ToolInvocation> for McpHandler {
     }
 
     fn spec(&self) -> ToolSpec {
-        self.spec.clone()
+        self.spec.as_ref().clone()
     }
 
     fn supports_parallel_tool_calls(&self) -> bool {
@@ -141,7 +181,6 @@ impl McpHandler {
         };
 
         let started = Instant::now();
-        // TODO(sayan): Use StepContext for MCP file arguments when MCP follows dynamic environments.
         let result = handle_mcp_tool_call(
             Arc::clone(&session),
             &step_context,
@@ -164,17 +203,45 @@ impl McpHandler {
 }
 
 impl CoreToolRuntime for McpHandler {
-    fn telemetry_tags<'a>(
-        &'a self,
-        _invocation: &'a ToolInvocation,
-    ) -> futures::future::BoxFuture<'a, ToolTelemetryTags> {
-        Box::pin(async {
-            let mut tags = vec![("mcp_server", self.tool_info.server_name.clone())];
-            if let Some(origin) = &self.tool_info.server_origin {
-                tags.push(("mcp_server_origin", origin.clone()));
-            }
-            tags
-        })
+    fn immutable_spec(&self) -> Option<&Arc<ToolSpec>> {
+        Some(&self.spec)
+    }
+
+    fn cached_code_mode_definitions(&self) -> Option<&[codex_code_mode::ToolDefinition]> {
+        Some(
+            self.code_mode_tool_definitions
+                .get_or_init(|| {
+                    let mut definitions = codex_tools::collect_code_mode_tool_definitions(
+                        std::iter::once(self.spec.as_ref()),
+                    );
+                    for definition in &mut definitions {
+                        definition.input_schema = None;
+                        definition.output_schema = None;
+                    }
+                    definitions
+                })
+                .as_slice(),
+        )
+    }
+
+    fn wait_until_ready<'a>(&'a self, session: &'a Arc<Session>) -> Option<BoxFuture<'a, ()>> {
+        Some(Box::pin(async move {
+            session
+                .wait_for_mcp_server(&self.tool_info.server_name)
+                .await;
+        }))
+    }
+
+    fn mcp_server_name(&self) -> Option<&str> {
+        Some(&self.tool_info.server_name)
+    }
+
+    fn telemetry_tags(&self, _invocation: &ToolInvocation) -> ToolTelemetryTags {
+        let mut tags = vec![("mcp_server", self.tool_info.server_name.clone())];
+        if let Some(origin) = &self.tool_info.server_origin {
+            tags.push(("mcp_server_origin", origin.clone()));
+        }
+        tags
     }
 
     fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
@@ -230,9 +297,16 @@ impl CoreToolRuntime for McpHandler {
     }
 }
 
-fn create_tool_spec(tool_info: &ToolInfo) -> Result<ToolSpec, serde_json::Error> {
+fn create_tool_spec(
+    tool_info: &ToolInfo,
+    agent_plugin: bool,
+) -> Result<ToolSpec, serde_json::Error> {
     let tool_name = tool_info.canonical_tool_name();
-    let tool = mcp_tool_to_responses_api_tool(&tool_name, &tool_info.tool)?;
+    let tool = if agent_plugin {
+        agent_plugin_mcp_tool_to_responses_api_tool(&tool_name, &tool_info.tool)?
+    } else {
+        mcp_tool_to_responses_api_tool(&tool_name, &tool_info.tool)?
+    };
     let description = tool_info
         .namespace_description
         .as_deref()
@@ -251,7 +325,8 @@ fn create_tool_spec(tool_info: &ToolInfo) -> Result<ToolSpec, serde_json::Error>
 
     Ok(ToolSpec::Namespace(ResponsesApiNamespace {
         name: tool_info.callable_namespace.clone(),
-        description,
+        description: take_bytes_at_char_boundary(&description, MAX_MCP_NAMESPACE_DESCRIPTION_BYTES)
+            .to_string(),
         tools: vec![ResponsesApiNamespaceTool::Function(tool)],
     }))
 }
@@ -490,6 +565,32 @@ mod tests {
                 }),
             })
         );
+    }
+
+    #[test]
+    fn mcp_code_mode_definitions_are_cached_lazily() {
+        let handler = McpHandler::new(tool_info("filesystem", "mcp__filesystem", "read_file"))
+            .expect("MCP tool spec should build");
+
+        assert!(handler.code_mode_tool_definitions.get().is_none());
+        assert!(Arc::ptr_eq(
+            handler
+                .immutable_spec()
+                .expect("MCP spec should be immutable"),
+            &handler.spec,
+        ));
+
+        let first = handler
+            .cached_code_mode_definitions()
+            .expect("MCP definitions should be cached");
+        assert_eq!(first.len(), 1);
+        assert!(first[0].input_schema.is_none());
+        assert!(first[0].output_schema.is_none());
+
+        let second = handler
+            .cached_code_mode_definitions()
+            .expect("MCP definitions should be cached");
+        assert!(std::ptr::eq(first, second));
     }
 
     #[test]

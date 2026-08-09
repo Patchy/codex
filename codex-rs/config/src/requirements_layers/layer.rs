@@ -36,6 +36,19 @@ impl RequirementsLayerEntry {
         self.base_dir = Some(base_dir);
         self
     }
+
+    pub(crate) fn into_raw_parts(
+        self,
+    ) -> Result<(RequirementSource, TomlValue, Option<AbsolutePathBuf>), RequirementsCompositionError>
+    {
+        let Self {
+            source,
+            toml,
+            base_dir,
+        } = self;
+        let toml = parse_layer_toml(&toml, &source)?;
+        Ok((source, toml, base_dir))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -65,8 +78,18 @@ impl ComposableRequirementsLayer {
             let _guard = base_dir
                 .as_ref()
                 .map(|base_dir| AbsolutePathBufGuard::new(base_dir.as_path()));
-            let regular_toml = parse_layer_toml(&toml, &source)?;
-            let requirements = parse_layer_requirements(&toml, &source)?;
+            let mut regular_toml = parse_layer_toml(&toml, &source)?;
+
+            // These fields can only be set locally; ignore them before validating cloud policy.
+            if matches!(source, RequirementSource::EnterpriseManaged { .. }) {
+                remove_top_level_field(&mut regular_toml, "allowed_login_methods");
+                remove_top_level_field(&mut regular_toml, "allowed_chatgpt_workspaces");
+            }
+
+            let requirements = parse_layer_requirements(
+                &RequirementsLayerToml::Value(regular_toml.clone()),
+                &source,
+            )?;
             (regular_toml, requirements)
         };
 
@@ -88,6 +111,7 @@ impl ComposableRequirementsLayer {
                 rules: requirements.rules,
                 hooks: requirements.hooks,
                 permissions: requirements.permissions,
+                auto_review: requirements.auto_review,
             },
         })
     }
@@ -98,6 +122,7 @@ pub(super) struct DomainMergedRequirementsFields {
     pub(super) rules: Option<RequirementsExecPolicyToml>,
     pub(super) hooks: Option<ManagedHooksRequirementsToml>,
     pub(super) permissions: Option<crate::config_requirements::PermissionsRequirementsToml>,
+    pub(super) auto_review: Option<crate::config_requirements::AutoReviewRequirementsToml>,
 }
 
 fn parse_layer_toml(
@@ -195,6 +220,7 @@ fn strip_special_fields(layer_toml: &mut TomlValue) {
     remove_top_level_field(layer_toml, "rules");
     remove_top_level_field(layer_toml, "hooks");
     remove_nested_field_and_prune_empty(layer_toml, &["permissions", "filesystem", "deny_read"]);
+    remove_nested_field_and_prune_empty(layer_toml, &["auto_review", "required_on_models"]);
 }
 
 fn remove_top_level_field(value: &mut TomlValue, key: &str) -> Option<TomlValue> {

@@ -1,10 +1,21 @@
 use core_test_support::test_codex::local_selections;
 use std::fs;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use anyhow::Result;
 use codex_config::types::Personality;
+use codex_core::config::Config;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
+use codex_extension_api::ContextualUserFragment;
+use codex_extension_api::ExtensionData;
+use codex_extension_api::ExtensionFuture;
+use codex_extension_api::ExtensionMetrics;
+use codex_extension_api::ExtensionRegistry;
+use codex_extension_api::ExtensionRegistryBuilder;
+use codex_extension_api::TurnInputContext;
+use codex_extension_api::TurnInputContributor;
+use codex_extension_api::TurnInputEnvironment;
 use codex_features::Feature;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
@@ -13,6 +24,8 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_protocol::user_input::UserInput;
+use codex_skills_extension::SkillsExtensionConfig;
+use codex_skills_extension::install;
 use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
 use core_test_support::context_snapshot;
@@ -30,9 +43,42 @@ use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
+use pretty_assertions::assert_eq;
 use serde_json::json;
 
 const PRETURN_CONTEXT_DIFF_CWD: &str = "PRETURN_CONTEXT_DIFF_CWD";
+
+struct RecordingTurnInputContributor(Arc<Mutex<Vec<TurnInputEnvironment>>>);
+
+impl TurnInputContributor for RecordingTurnInputContributor {
+    fn contribute<'a>(
+        &'a self,
+        input: TurnInputContext,
+        _extension_metrics: Option<Arc<dyn ExtensionMetrics>>,
+        _session_store: &'a ExtensionData,
+        _thread_store: &'a ExtensionData,
+        _turn_store: &'a ExtensionData,
+    ) -> ExtensionFuture<'a, Vec<Box<dyn ContextualUserFragment + Send>>> {
+        Box::pin(async move {
+            self.0
+                .lock()
+                .expect("recorded environments lock")
+                .extend(input.environments);
+            Vec::new()
+        })
+    }
+}
+
+fn skills_extensions() -> Arc<ExtensionRegistry<Config>> {
+    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+    install(&mut extensions, |config: &Config| SkillsExtensionConfig {
+        include_instructions: config.include_skill_instructions,
+        bundled_skills_enabled: config.bundled_skills_enabled(),
+        orchestrator_skills_enabled: config.orchestrator_skills_enabled,
+        shadow_selection_enabled: config.features.enabled(Feature::SkillSearch),
+    });
+    Arc::new(extensions.build())
+}
 
 fn context_snapshot_options() -> ContextSnapshotOptions {
     ContextSnapshotOptions::default()
@@ -80,6 +126,61 @@ fn format_environment_context_subagents_snapshot(subagents: &[&str]) -> String {
         }],
     })];
     context_snapshot::format_response_items_snapshot(items.as_slice(), &context_snapshot_options())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_input_contributors_receive_foreign_environment_cwds() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let recorded_environments = Arc::new(Mutex::new(Vec::new()));
+    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+    extensions.turn_input_contributor(Arc::new(RecordingTurnInputContributor(Arc::clone(
+        &recorded_environments,
+    ))));
+    let mut builder = test_codex()
+        .with_extensions(Arc::new(extensions.build()))
+        .with_config(|config| config.project_doc_max_bytes = 0);
+    let test = builder.build_with_auto_env(&server).await?;
+    let mut selection = test.executor_environment().selection().clone();
+    let environment_id = selection.environment_id.clone();
+    let cwd = PathUri::parse(if cfg!(windows) {
+        "file:///workspace"
+    } else {
+        "file:///C:/workspace"
+    })?;
+    assert!(cwd.to_abs_path().is_err());
+    selection.cwd = cwd.clone();
+    selection.workspace_roots = Vec::new();
+
+    test.submit_turn_with_environments("inspect the foreign environment", Some(vec![selection]))
+        .await?;
+
+    let _request = response_mock.single_request();
+    let recorded_environments = recorded_environments
+        .lock()
+        .expect("recorded environments lock")
+        .iter()
+        .map(|environment| {
+            (
+                environment.environment_id.clone(),
+                environment.cwd.clone(),
+                environment.is_primary,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(recorded_environments, vec![(environment_id, cwd, true)]);
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -162,13 +263,16 @@ async fn snapshot_model_visible_layout_turn_overrides() -> Result<()> {
     )
     .await;
 
-    let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
-        config
-            .features
-            .enable(Feature::Personality)
-            .expect("test config should allow feature update");
-        config.personality = Some(Personality::Pragmatic);
-    });
+    let mut builder = test_codex()
+        .with_extensions(skills_extensions())
+        .with_model("gpt-5.4")
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::Personality)
+                .expect("test config should allow feature update");
+            config.personality = Some(Personality::Pragmatic);
+        });
     let test = builder.build(&server).await?;
     let preturn_context_diff_cwd = test.cwd_path().join(PRETURN_CONTEXT_DIFF_CWD);
     fs::create_dir_all(&preturn_context_diff_cwd)?;
@@ -282,7 +386,9 @@ async fn snapshot_model_visible_layout_cwd_change_refreshes_agents() -> Result<(
     )
     .await;
 
-    let mut builder = test_codex().with_model("gpt-5.4");
+    let mut builder = test_codex()
+        .with_extensions(skills_extensions())
+        .with_model("gpt-5.4");
     let test = builder.build(&server).await?;
     let cwd_one = test.cwd_path().join("agents_one");
     let cwd_two = test.cwd_path().join("agents_two");
@@ -396,17 +502,13 @@ async fn snapshot_model_visible_layout_resume_with_personality_change() -> Resul
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut initial_builder = test_codex().with_config(|config| {
-        config.model = Some("gpt-5.2".to_string());
-    });
+    let mut initial_builder = test_codex()
+        .with_extensions(skills_extensions())
+        .with_config(|config| {
+            config.model = Some("gpt-5.2".to_string());
+        });
     let initial = initial_builder.build(&server).await?;
     let codex = Arc::clone(&initial.codex);
-    let home = initial.home.clone();
-    let rollout_path = initial
-        .session_configured
-        .rollout_path
-        .clone()
-        .expect("rollout path");
 
     let initial_mock = mount_sse_once(
         &server,
@@ -442,15 +544,17 @@ async fn snapshot_model_visible_layout_resume_with_personality_change() -> Resul
     )
     .await;
 
-    let mut resume_builder = test_codex().with_config(|config| {
-        config.model = Some("gpt-5.4".to_string());
-        config
-            .features
-            .enable(Feature::Personality)
-            .expect("test config should allow feature update");
-        config.personality = Some(Personality::Pragmatic);
-    });
-    let resumed = resume_builder.resume(&server, home, rollout_path).await?;
+    let mut resume_builder = test_codex()
+        .with_extensions(skills_extensions())
+        .with_config(|config| {
+            config.model = Some("gpt-5.4".to_string());
+            config
+                .features
+                .enable(Feature::Personality)
+                .expect("test config should allow feature update");
+            config.personality = Some(Personality::Pragmatic);
+        });
+    let resumed = resume_builder.restart(&server, &initial).await?;
     let resume_override_cwd = resumed.cwd_path().join(PRETURN_CONTEXT_DIFF_CWD);
     fs::create_dir_all(&resume_override_cwd)?;
     let resume_override_cwd = resume_override_cwd.abs();
@@ -511,17 +615,13 @@ async fn snapshot_model_visible_layout_resume_override_matches_rollout_model() -
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut initial_builder = test_codex().with_config(|config| {
-        config.model = Some("gpt-5.2".to_string());
-    });
+    let mut initial_builder = test_codex()
+        .with_extensions(skills_extensions())
+        .with_config(|config| {
+            config.model = Some("gpt-5.2".to_string());
+        });
     let initial = initial_builder.build(&server).await?;
     let codex = Arc::clone(&initial.codex);
-    let home = initial.home.clone();
-    let rollout_path = initial
-        .session_configured
-        .rollout_path
-        .clone()
-        .expect("rollout path");
 
     let initial_mock = mount_sse_once(
         &server,
@@ -557,10 +657,12 @@ async fn snapshot_model_visible_layout_resume_override_matches_rollout_model() -
     )
     .await;
 
-    let mut resume_builder = test_codex().with_config(|config| {
-        config.model = Some("gpt-5.4".to_string());
-    });
-    let resumed = resume_builder.resume(&server, home, rollout_path).await?;
+    let mut resume_builder = test_codex()
+        .with_extensions(skills_extensions())
+        .with_config(|config| {
+            config.model = Some("gpt-5.4".to_string());
+        });
+    let resumed = resume_builder.restart(&server, &initial).await?;
     let resume_override_cwd = resumed.cwd_path().join(PRETURN_CONTEXT_DIFF_CWD);
     fs::create_dir_all(&resume_override_cwd)?;
     let resume_override_cwd = resume_override_cwd.abs();

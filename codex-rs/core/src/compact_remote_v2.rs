@@ -13,6 +13,9 @@ use crate::compact_model_fallback::record_model_fallback;
 use crate::compact_model_fallback::should_retry_with_current_model;
 use crate::compact_remote::process_compacted_history;
 use crate::compact_remote::should_keep_compacted_history_item;
+use crate::compact_remote_history::HistoryItemGroup;
+use crate::compact_remote_history::history_item_groups;
+use crate::context_manager::estimate_item_token_count;
 use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
 use crate::hook_runtime::run_post_compact_hooks;
@@ -20,6 +23,7 @@ use crate::hook_runtime::run_pre_compact_hooks;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::responses_retry::ResponsesStreamRequest;
+use crate::responses_retry::ResponsesStreamRetryState;
 use crate::responses_retry::handle_retryable_response_stream_error;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
@@ -33,6 +37,7 @@ use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
+use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
@@ -54,6 +59,7 @@ use attempt::run_remote_compact_v2_attempt;
 // Mirror the current /responses/compact retained-message default while the
 // server-side path remains the reference implementation.
 const RETAINED_MESSAGE_TOKEN_BUDGET: usize = 64_000;
+const MAX_RETAINED_AGENT_MESSAGE_TOKENS: i64 = 10_000;
 // Compact attempts can run much longer than normal turns, so keep the per-transport
 // retry budget smaller than the general Responses stream retry budget.
 const MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES: u64 = 2;
@@ -339,7 +345,7 @@ async fn run_remote_compaction_request_v2(
         .info()
         .stream_max_retries()
         .min(MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES);
-    let mut retries = 0;
+    let mut retry_state = ResponsesStreamRetryState::default();
     loop {
         let result = match client_session
             .stream(
@@ -363,7 +369,7 @@ async fn run_remote_compaction_request_v2(
             Err(err) if !err.is_retryable() => return Err(err),
             Err(err) => {
                 handle_retryable_response_stream_error(
-                    &mut retries,
+                    &mut retry_state,
                     max_retries,
                     err,
                     client_session,
@@ -440,10 +446,10 @@ fn build_v2_compacted_history(
     prompt_input: &[ResponseItem],
     compaction_output: ResponseItem,
 ) -> (Vec<ResponseItem>, usize) {
-    let retained = prompt_input
-        .iter()
-        .filter(|item| is_retained_for_remote_compaction_v2(item))
-        .filter(|item| should_keep_compacted_history_item(item))
+    let retained = history_item_groups(prompt_input)
+        .filter(|group| is_retained_for_remote_compaction_v2(group.source))
+        .filter(|group| should_keep_compacted_history_item(group.source))
+        .flat_map(HistoryItemGroup::into_items)
         .cloned()
         .collect::<Vec<_>>();
     let mut retained =
@@ -457,6 +463,16 @@ fn build_v2_compacted_history(
 }
 
 fn is_retained_for_remote_compaction_v2(item: &ResponseItem) -> bool {
+    if let ResponseItem::AgentMessage { content, .. } = item {
+        let is_completion = matches!(
+            content.first(),
+            Some(AgentMessageInputContent::InputText { text })
+                if text.starts_with("Message Type: FINAL_ANSWER\n")
+        );
+        return !is_completion
+            && estimate_item_token_count(item) <= MAX_RETAINED_AGENT_MESSAGE_TOKENS;
+    }
+
     let ResponseItem::Message { role, .. } = item else {
         return false;
     };
@@ -481,18 +497,37 @@ fn truncate_retained_messages_for_remote_compaction(
 ) -> Vec<ResponseItem> {
     let mut remaining = max_tokens;
     let mut truncated_reversed = Vec::with_capacity(items.len());
-    for item in items.into_iter().rev() {
+    for group in history_item_groups(items)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
         if remaining == 0 {
             continue;
         }
 
-        let token_count = message_text_token_count(&item).max(1);
+        let notice_tokens = group
+            .attached_notice
+            .as_ref()
+            .map_or(0, |notice| message_text_token_count(notice).max(1));
+        let token_count = message_text_token_count(&group.source)
+            .max(1)
+            .saturating_add(notice_tokens);
         if token_count <= remaining {
-            truncated_reversed.push(item);
+            if let Some(notice) = group.attached_notice {
+                truncated_reversed.push(notice);
+            }
+            truncated_reversed.push(group.source);
             remaining = remaining.saturating_sub(token_count);
-        } else if let Some(truncated_item) =
-            truncate_message_text_to_token_budget(item, /*max_tokens*/ remaining)
+        } else if remaining > notice_tokens
+            && let Some(truncated_item) = truncate_message_text_to_token_budget(
+                group.source,
+                /*max_tokens*/ remaining - notice_tokens,
+            )
         {
+            if let Some(notice) = group.attached_notice {
+                truncated_reversed.push(notice);
+            }
             truncated_reversed.push(truncated_item);
             remaining = 0;
         }
@@ -503,7 +538,7 @@ fn truncate_retained_messages_for_remote_compaction(
 
 fn message_text_token_count(item: &ResponseItem) -> usize {
     let ResponseItem::Message { content, .. } = item else {
-        return 0;
+        return usize::try_from(estimate_item_token_count(item)).unwrap_or(usize::MAX);
     };
 
     content
@@ -529,7 +564,7 @@ fn truncate_message_text_to_token_budget(
         internal_chat_message_metadata_passthrough: metadata,
     } = item
     else {
-        return Some(item);
+        return None;
     };
 
     let mut remaining = max_tokens;
@@ -620,6 +655,7 @@ mod tests {
                 namespace: None,
                 arguments: "{}".to_string(),
                 call_id: "call_1".to_string(),
+                encrypted_function_args: None,
                 internal_chat_message_metadata_passthrough: None,
             },
             ResponseItem::Compaction {
@@ -838,6 +874,7 @@ mod tests {
                     output_tokens: 42,
                     reasoning_output_tokens: 5,
                     total_tokens: 123_498,
+                    codex_rollout_budget_units: None,
                 }),
                 end_turn: Some(true),
             }),
@@ -858,6 +895,7 @@ mod tests {
                 output_tokens: 42,
                 reasoning_output_tokens: 5,
                 total_tokens: 123_498,
+                codex_rollout_budget_units: None,
             })
         );
     }

@@ -1,6 +1,7 @@
 mod app_mcp_routing;
 mod command_migration;
 mod discoverable;
+mod error_subtype;
 mod http_client_selector;
 pub mod installed_marketplaces;
 pub mod loader;
@@ -19,6 +20,7 @@ pub mod remote_bundle;
 pub mod remote_legacy;
 mod remote_plugin_id_resolver;
 mod script_attribution;
+mod skill_snapshots;
 pub mod startup_sync;
 pub mod store;
 #[cfg(test)]

@@ -11,6 +11,7 @@ use tracing::debug;
 use tracing::warn;
 
 use codex_http_client::HttpClientFactory;
+use codex_protocol::shell_environment::scrub_non_inheritable_env_vars;
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 use codex_websocket_client::WebSocketConnector;
 use codex_websocket_client::WebSocketTlsMode;
@@ -106,15 +107,26 @@ impl ExecServerClient {
             transport_params => (transport_params, None),
         };
 
-        if let Some(readiness) = deferred_readiness {
-            readiness
+        if let Some(mut readiness) = deferred_readiness {
+            let provisioning_result = readiness
+                .wait_for(Option::is_some)
                 .await
-                .unwrap_or_else(|_| {
-                    Err("environment registration ended before completion".to_string())
-                })
-                .map_err(|message| {
-                    ExecServerError::Disconnected(format!("environment unavailable: {message}"))
+                .map_err(|_| {
+                    ExecServerError::Disconnected(
+                        "environment unavailable: environment provisioning ended before completion"
+                            .to_string(),
+                    )
+                })?
+                .clone()
+                .ok_or_else(|| {
+                    ExecServerError::Disconnected(
+                        "environment unavailable: provisioning remained pending after completion"
+                            .to_string(),
+                    )
                 })?;
+            provisioning_result.map_err(|message| {
+                ExecServerError::Disconnected(format!("environment unavailable: {message}"))
+            })?;
         }
 
         let (websocket_url, connect_timeout, initialize_timeout) = match transport_params {
@@ -430,6 +442,7 @@ fn stdio_command_process(stdio_command: &StdioExecServerCommand) -> Command {
     let mut command = Command::new(&stdio_command.program);
     command.args(&stdio_command.args);
     command.envs(&stdio_command.env);
+    scrub_non_inheritable_env_vars(command.as_std_mut());
     if let Some(cwd) = &stdio_command.cwd {
         command.current_dir(cwd);
     }

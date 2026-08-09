@@ -23,8 +23,8 @@ pub(crate) use codex_network_proxy::is_managed_proxy_env_var;
 pub(crate) use codex_network_proxy::strip_managed_proxy_env;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::shell_environment::is_non_inheritable_env_var;
 use codex_sandboxing::SandboxCommand;
-use codex_sandboxing::SandboxType;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use std::collections::HashMap;
@@ -179,11 +179,11 @@ pub(crate) fn apply_zsh_fork_path_prepend(
 pub(crate) fn disable_powershell_profile_for_elevated_windows_sandbox(
     command: &[String],
     shell_type: Option<&ShellType>,
-    sandbox: SandboxType,
+    sandbox_requested: bool,
     windows_sandbox_level: WindowsSandboxLevel,
 ) -> Vec<String> {
     if shell_type != Some(&ShellType::PowerShell)
-        || sandbox != SandboxType::WindowsRestrictedToken
+        || !sandbox_requested
         || windows_sandbox_level != WindowsSandboxLevel::Elevated
         || command.is_empty()
     {
@@ -305,6 +305,7 @@ fn build_override_exports(
         .keys()
         .map(String::as_str)
         .chain(restore_even_when_absent.iter().copied())
+        .filter(|key| !is_non_inheritable_env_var(key))
         .filter(|key| is_valid_shell_variable_name(key))
         .collect::<Vec<_>>();
     keys.sort_unstable();
@@ -428,7 +429,7 @@ mod disable_powershell_profile_tests {
         let rewritten = disable_powershell_profile_for_elevated_windows_sandbox(
             &command,
             Some(&ShellType::PowerShell),
-            SandboxType::WindowsRestrictedToken,
+            /*sandbox_requested*/ true,
             WindowsSandboxLevel::Elevated,
         );
 
@@ -454,7 +455,7 @@ mod disable_powershell_profile_tests {
         let rewritten = disable_powershell_profile_for_elevated_windows_sandbox(
             &command,
             Some(&ShellType::PowerShell),
-            SandboxType::WindowsRestrictedToken,
+            /*sandbox_requested*/ true,
             WindowsSandboxLevel::Elevated,
         );
 
@@ -481,7 +482,7 @@ mod disable_powershell_profile_tests {
         let rewritten = disable_powershell_profile_for_elevated_windows_sandbox(
             &command,
             Some(&ShellType::PowerShell),
-            SandboxType::WindowsRestrictedToken,
+            /*sandbox_requested*/ true,
             WindowsSandboxLevel::Elevated,
         );
 
@@ -499,7 +500,7 @@ mod disable_powershell_profile_tests {
         let rewritten = disable_powershell_profile_for_elevated_windows_sandbox(
             &command,
             Some(&ShellType::PowerShell),
-            SandboxType::WindowsRestrictedToken,
+            /*sandbox_requested*/ true,
             WindowsSandboxLevel::RestrictedToken,
         );
 
@@ -517,7 +518,7 @@ mod disable_powershell_profile_tests {
         let rewritten = disable_powershell_profile_for_elevated_windows_sandbox(
             &command,
             Some(&ShellType::PowerShell),
-            SandboxType::None,
+            /*sandbox_requested*/ false,
             WindowsSandboxLevel::Elevated,
         );
 
@@ -535,7 +536,7 @@ mod disable_powershell_profile_tests {
         let rewritten = disable_powershell_profile_for_elevated_windows_sandbox(
             &command,
             Some(&ShellType::Bash),
-            SandboxType::WindowsRestrictedToken,
+            /*sandbox_requested*/ true,
             WindowsSandboxLevel::Elevated,
         );
 

@@ -7,6 +7,7 @@ mod client_transport;
 mod connection;
 mod environment;
 mod environment_bootstrap;
+mod environment_config;
 mod environment_provider;
 mod environment_registry;
 mod environment_toml;
@@ -38,6 +39,10 @@ mod trace_context;
 mod websocket_pong_watchdog;
 
 use codex_exec_server_protocol as protocol;
+
+/// Process-local opt-in for tying a remote executor to its parent's stdin pipe.
+pub const CODEX_EXEC_SERVER_EXIT_ON_STDIN_CLOSE_ENV_VAR: &str =
+    "CODEX_EXEC_SERVER_EXIT_ON_STDIN_CLOSE";
 
 pub use arg0_exec_helper::CODEX_ARG0_EXEC_HELPER_ARG1;
 pub use arg0_exec_helper::main as run_arg0_exec_helper_main;
@@ -77,7 +82,6 @@ pub use environment::CODEX_EXEC_SERVER_NOISE_CHATGPT_ACCOUNT_ID_ENV_VAR;
 pub use environment::CODEX_EXEC_SERVER_NOISE_ENVIRONMENT_ID_ENV_VAR;
 pub use environment::CODEX_EXEC_SERVER_NOISE_REGISTRY_URL_ENV_VAR;
 pub use environment::CODEX_EXEC_SERVER_URL_ENV_VAR;
-pub use environment::DeferredEnvironmentRegistration;
 pub use environment::Environment;
 pub use environment::EnvironmentConnectionState;
 pub use environment::EnvironmentManager;
@@ -120,6 +124,10 @@ pub use protocol::CapabilityTextFile;
 pub use protocol::DiscoveredPluginFiles;
 pub use protocol::DiscoveredSkillFiles;
 pub use protocol::EnvironmentCapabilities;
+pub use protocol::EnvironmentConfigLayer;
+pub use protocol::EnvironmentConfigLayerStack;
+pub use protocol::EnvironmentConfigReadParams;
+pub use protocol::EnvironmentConfigReadResponse;
 pub use protocol::EnvironmentInfo;
 pub use protocol::EnvironmentStatus;
 pub use protocol::EnvironmentStatusKind;
@@ -181,11 +189,14 @@ pub use protocol::WriteResponse;
 pub use protocol::WriteStatus;
 pub use remote::RemoteEnvironmentConfig;
 pub use remote::run_remote_environment;
+pub use remote::run_remote_environment_until_shutdown;
 pub use resolved_capability::ResolvedSelectedCapabilityRoot;
 pub use resolved_capability::SelectedCapabilityRootsStatus;
 pub use runtime_paths::ExecServerRuntimePaths;
+pub use server::ConcurrentRequestLimit;
 pub use server::DEFAULT_LISTEN_URL;
 pub use server::ExecServerListenUrlParseError;
+pub use server::RequestDispatchMode;
 pub use server::run_main;
 pub use server::run_main_with_telemetry;
 pub use telemetry::ExecServerTelemetry;

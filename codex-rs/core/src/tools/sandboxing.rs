@@ -1,20 +1,21 @@
 //! Shared approvals and sandboxing traits used by tool runtimes.
 //!
 //! Consolidates the approval flow primitives (`ApprovalDecision`, `ApprovalStore`,
-//! `ApprovalCtx`, `Approvable`) together with the sandbox orchestration traits
+//! `Approvable`) together with the sandbox orchestration traits
 //! and helpers (`Sandboxable`, `ToolRuntime`, `SandboxAttempt`, etc.).
 
 use crate::sandboxing::ExecOptions;
 use crate::sandboxing::SandboxPermissions;
 use crate::session::session::Session;
-use crate::session::turn_context::TurnContext;
+use crate::session::step_context::StepContext;
+use crate::session::turn_context::TurnEnvironment;
 use crate::state::SessionServices;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::network_approval::NetworkApprovalSpec;
 use codex_file_system::FileSystemSandboxContext;
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::approvals::ExecPolicyAmendment;
-use codex_protocol::approvals::NetworkApprovalContext;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::error::CodexErr;
 use codex_protocol::permissions::FileSystemSandboxKind;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
@@ -27,13 +28,11 @@ use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
 use codex_sandboxing::policy_transforms::effective_permission_profile;
 use codex_tools::ToolName;
+use codex_utils_path_uri::PathConvention;
 use codex_utils_path_uri::PathUri;
 use futures::Future;
-use futures::future::BoxFuture;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::fmt::Debug;
-use std::hash::Hash;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -116,13 +115,10 @@ where
     decision
 }
 
-#[derive(Clone)]
-pub(crate) struct ApprovalCtx<'a> {
-    pub session: &'a Arc<Session>,
-    pub turn: &'a Arc<TurnContext>,
-    pub call_id: &'a str,
-    pub retry_reason: Option<String>,
-    pub network_approval_context: Option<NetworkApprovalContext>,
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ApprovalRequestReasons {
+    pub(crate) approval: Option<String>,
+    pub(crate) retry: Option<String>,
 }
 
 pub(crate) use super::approvals::ApprovalAction;
@@ -310,17 +306,6 @@ pub(crate) fn managed_network_for_sandbox_permissions(
 }
 
 pub(crate) trait Approvable<Req> {
-    type ApprovalKey: Hash + Eq + Clone + Debug + Serialize;
-
-    // In most cases (shell, unified_exec), a request will have a single approval key.
-    //
-    // However, apply_patch needs session "Allow, don't ask again" semantics that
-    // apply to multiple atomic targets (e.g., apply_patch approves per file path). Returning
-    // a list of keys lets the runtime treat the request as approved-for-session only if
-    // *all* keys are already approved, while still caching approvals per-key so future
-    // requests touching a subset can be auto-approved.
-    fn approval_keys(&self, req: &Req) -> Vec<Self::ApprovalKey>;
-
     /// Return per-request sandbox permissions for first-attempt sandbox
     /// selection. Most tools use the ambient sandbox policy unchanged.
     fn sandbox_permissions(&self, _req: &Req) -> SandboxPermissions {
@@ -341,12 +326,6 @@ pub(crate) trait Approvable<Req> {
         None
     }
 
-    /// Return hook input for approval-time policy hooks when this runtime wants
-    /// hook evaluation to run before guardian or user approval.
-    fn permission_request_payload(&self, _req: &Req) -> Option<PermissionRequestPayload> {
-        None
-    }
-
     /// Decide we can request an approval for no-sandbox execution.
     fn wants_no_sandbox_approval(&self, policy: AskForApproval) -> bool {
         match policy {
@@ -357,13 +336,7 @@ pub(crate) trait Approvable<Req> {
         }
     }
 
-    fn start_approval_async<'a>(
-        &'a mut self,
-        req: &'a Req,
-        ctx: ApprovalCtx<'a>,
-    ) -> BoxFuture<'a, ReviewDecision>;
-
-    fn approval_action(&self, req: &Req, ctx: &ApprovalCtx<'_>) -> std::io::Result<ApprovalAction>;
+    fn approval_action(&self, req: &Req, call_id: &str) -> std::io::Result<ApprovalAction>;
 }
 
 pub(crate) trait Sandboxable {
@@ -375,7 +348,7 @@ pub(crate) trait Sandboxable {
 
 pub(crate) struct ToolCtx {
     pub session: Arc<Session>,
-    pub turn: Arc<TurnContext>,
+    pub step_context: Arc<StepContext>,
     pub call_id: String,
     pub tool_name: ToolName,
 }
@@ -387,7 +360,11 @@ pub(crate) enum ToolError {
 }
 
 pub(crate) trait ToolRuntime<Req, Out>: Approvable<Req> + Sandboxable {
-    fn workspace_roots<'a>(&self, req: &'a Req) -> &'a [PathUri];
+    fn turn_environment<'a>(&self, req: &'a Req) -> &'a TurnEnvironment;
+
+    fn uses_executor_managed_process_sandbox(&self, _req: &Req) -> bool {
+        false
+    }
 
     fn network_approval_spec(&self, _req: &Req, _ctx: &ToolCtx) -> Option<NetworkApprovalSpec> {
         None
@@ -501,11 +478,24 @@ impl<'a> SandboxAttempt<'a> {
             crate::sandboxing::ExecRequest::from_sandbox_exec_request(request, options, Vec::new());
         exec_request.exec_server_managed_network = managed_network;
         if self.sandbox_requested {
+            // This level comes from the orchestrator's config, so `Disabled` means Windows
+            // sandboxing is irrelevant on a non-Windows host. A Windows executor would instead
+            // treat it as unable to enforce the requested sandbox. Select its baseline restricted
+            // token backend while preserving explicitly configured levels and same-OS behavior.
+            let windows_sandbox_level = if self.windows_sandbox_level
+                == WindowsSandboxLevel::Disabled
+                && self.sandbox_cwd.infer_path_convention() == Some(PathConvention::Windows)
+                && PathConvention::native() != PathConvention::Windows
+            {
+                WindowsSandboxLevel::RestrictedToken
+            } else {
+                self.windows_sandbox_level
+            };
             exec_request.exec_server_sandbox = Some(FileSystemSandboxContext {
                 permissions: exec_server_permissions.into(),
                 cwd: Some(exec_request.windows_sandbox_policy_cwd.clone()),
                 workspace_roots: self.workspace_roots.to_vec(),
-                windows_sandbox_level: self.windows_sandbox_level,
+                windows_sandbox_level,
                 windows_sandbox_private_desktop: self.windows_sandbox_private_desktop,
                 windows_sandbox_proxy_settings_mode: None,
                 use_legacy_landlock: self.use_legacy_landlock,

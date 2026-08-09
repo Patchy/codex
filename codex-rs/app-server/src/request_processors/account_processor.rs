@@ -4,6 +4,8 @@ use super::*;
 use crate::auth_mode::auth_mode_to_api;
 use crate::external_auth::ExternalAuthBridge;
 use chrono::DateTime;
+use codex_app_server_protocol::DesktopOnboardingEntrypoint;
+use codex_login::LoginOnboardingEntrypoint;
 use codex_model_provider::is_supported_amazon_bedrock_region;
 
 mod rate_limit_resets;
@@ -345,10 +347,10 @@ impl AccountRequestProcessor {
             return Err(self.external_auth_active_error());
         }
 
-        if matches!(
-            self.config.forced_login_method,
-            Some(ForcedLoginMethod::Chatgpt)
-        ) {
+        if !self
+            .auth_manager
+            .is_login_method_allowed(ForcedLoginMethod::Api)
+        {
             return Err(invalid_request(
                 "API key login is disabled. Use ChatGPT login instead.",
             ));
@@ -370,6 +372,7 @@ impl AccountRequestProcessor {
         ) {
             Ok(()) => {
                 self.auth_manager.reload().await;
+                self.config_manager.clear_cloud_config_bundle_loader();
                 Ok(())
             }
             Err(err) => Err(internal_error(format!("failed to save api key: {err}"))),
@@ -400,10 +403,10 @@ impl AccountRequestProcessor {
             if self.auth_manager.is_external_chatgpt_auth_active() {
                 return Err(self.external_auth_active_error());
             }
-            if matches!(
-                self.config.forced_login_method,
-                Some(ForcedLoginMethod::Chatgpt)
-            ) {
+            if !self
+                .auth_manager
+                .is_login_method_allowed(ForcedLoginMethod::Api)
+            {
                 return Err(invalid_request(
                     "Amazon Bedrock login is disabled. Use ChatGPT login instead.",
                 ));
@@ -437,6 +440,7 @@ impl AccountRequestProcessor {
             )
             .map_err(|err| internal_error(format!("failed to save Amazon Bedrock auth: {err}")))?;
             self.auth_manager.reload().await;
+            self.config_manager.clear_cloud_config_bundle_loader();
             Ok(LoginAccountResponse::AmazonBedrock {})
         }
         .await;
@@ -461,7 +465,10 @@ impl AccountRequestProcessor {
             return Err(self.external_auth_active_error());
         }
 
-        if matches!(config.forced_login_method, Some(ForcedLoginMethod::Api)) {
+        if !self
+            .auth_manager
+            .is_login_method_allowed(ForcedLoginMethod::Chatgpt)
+        {
             return Err(invalid_request(
                 "ChatGPT login is disabled. Use API key login instead.",
             ));
@@ -474,7 +481,7 @@ impl AccountRequestProcessor {
             ..LoginServerOptions::new(
                 config.codex_home.to_path_buf(),
                 oauth_client_id(),
-                config.forced_chatgpt_workspace_id.clone(),
+                self.auth_manager.effective_chatgpt_workspaces(),
                 config.cli_auth_credentials_store_mode,
                 config.auth_keyring_backend_kind(),
                 config.auth_route_config(),
@@ -555,17 +562,25 @@ impl AccountRequestProcessor {
         let active_login = self.active_login.clone();
         let auth_url = server.auth_url.clone();
         tokio::spawn(async move {
-            let (success, error_msg) = match tokio::time::timeout(
+            let (success, error_msg, onboarding_entrypoint) = match tokio::time::timeout(
                 LOGIN_CHATGPT_TIMEOUT,
-                server.block_until_done(),
+                server.block_until_done_with_callback_result(),
             )
             .await
             {
-                Ok(Ok(())) => (true, None),
-                Ok(Err(err)) => (false, Some(format!("Login server error: {err}"))),
+                Ok(Ok(result)) => (
+                    true,
+                    None,
+                    result
+                        .onboarding_entrypoint
+                        .map(|LoginOnboardingEntrypoint::LifeSciences| {
+                            DesktopOnboardingEntrypoint::LifeSciences
+                        }),
+                ),
+                Ok(Err(err)) => (false, Some(format!("Login server error: {err}")), None),
                 Err(_elapsed) => {
                     shutdown_handle.shutdown();
-                    (false, Some("Login timed out".to_string()))
+                    (false, Some("Login timed out".to_string()), None)
                 }
             };
 
@@ -574,9 +589,12 @@ impl AccountRequestProcessor {
                 config_manager,
                 thread_manager,
                 config,
-                login_id,
-                success,
-                error_msg,
+                AccountLoginCompletedNotification {
+                    login_id: Some(login_id.to_string()),
+                    success,
+                    error: error_msg,
+                    onboarding_entrypoint,
+                },
             )
             .await;
 
@@ -650,9 +668,12 @@ impl AccountRequestProcessor {
                 config_manager,
                 thread_manager,
                 config,
-                login_id,
-                success,
-                error_msg,
+                AccountLoginCompletedNotification {
+                    login_id: Some(login_id.to_string()),
+                    success,
+                    error: error_msg,
+                    onboarding_entrypoint: None,
+                },
             )
             .await;
 
@@ -723,10 +744,10 @@ impl AccountRequestProcessor {
         chatgpt_account_id: String,
         chatgpt_plan_type: Option<String>,
     ) -> Result<LoginAccountResponse, JSONRPCErrorError> {
-        if matches!(
-            self.config.forced_login_method,
-            Some(ForcedLoginMethod::Api)
-        ) {
+        if !self
+            .auth_manager
+            .is_login_method_allowed(ForcedLoginMethod::Chatgpt)
+        {
             return Err(invalid_request(
                 "External ChatGPT auth is disabled. Use API key login instead.",
             ));
@@ -740,7 +761,7 @@ impl AccountRequestProcessor {
             }
         }
 
-        if let Some(expected_workspaces) = self.config.forced_chatgpt_workspace_id.as_deref()
+        if let Some(expected_workspaces) = self.auth_manager.effective_chatgpt_workspaces()
             && !expected_workspaces.contains(&chatgpt_account_id)
         {
             return Err(invalid_request(format!(
@@ -785,6 +806,7 @@ impl AccountRequestProcessor {
             login_id: login_id.map(|id| id.to_string()),
             success: true,
             error: None,
+            onboarding_entrypoint: None,
         };
         self.outgoing
             .send_server_notification(ServerNotification::AccountLoginCompleted(
@@ -804,15 +826,9 @@ impl AccountRequestProcessor {
         config_manager: ConfigManager,
         thread_manager: Arc<ThreadManager>,
         config: Arc<Config>,
-        login_id: Uuid,
-        success: bool,
-        error_msg: Option<String>,
+        payload_v2: AccountLoginCompletedNotification,
     ) {
-        let payload_v2 = AccountLoginCompletedNotification {
-            login_id: Some(login_id.to_string()),
-            success,
-            error: error_msg,
-        };
+        let success = payload_v2.success;
         outgoing
             .send_server_notification(ServerNotification::AccountLoginCompleted(payload_v2))
             .await;
@@ -875,6 +891,8 @@ impl AccountRequestProcessor {
                 return Err(internal_error(format!("logout failed: {err}")));
             }
         }
+
+        self.config_manager.clear_cloud_config_bundle_loader();
 
         if managed_bedrock_auth {
             clear_user_model_provider_if_bedrock(&self.config_manager).await?;

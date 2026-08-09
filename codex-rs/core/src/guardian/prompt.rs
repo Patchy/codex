@@ -11,12 +11,15 @@ use serde_json::Value;
 use crate::compact::content_items_to_text;
 use crate::event_mapping::is_contextual_user_message_content;
 use crate::session::session::Session;
-use crate::session::turn_context::TurnContext;
+use crate::session::turn_context::TurnEnvironment;
+use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_bytes_for_tokens;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::approx_tokens_from_byte_count;
+use codex_utils_output_truncation::truncate_text;
 
 use super::AUTO_REVIEW_DENIED_ACTION_APPROVAL_DEVELOPER_PREFIX;
+use super::ApprovalRequestReasons;
 use super::GUARDIAN_MAX_MESSAGE_ENTRY_TOKENS;
 use super::GUARDIAN_MAX_MESSAGE_TRANSCRIPT_TOKENS;
 use super::GUARDIAN_MAX_TOOL_ENTRY_TOKENS;
@@ -24,8 +27,11 @@ use super::GUARDIAN_MAX_TOOL_TRANSCRIPT_TOKENS;
 use super::GUARDIAN_RECENT_ENTRY_LIMIT;
 use super::GuardianApprovalRequest;
 use super::GuardianAssessment;
+use super::GuardianReviewContext;
 use super::TRUNCATION_TAG;
 use super::approval_request::format_guardian_action_pretty;
+
+const GUARDIAN_MAX_APPROVAL_REASON_TOKENS: usize = 512;
 
 /// Transcript entry retained for guardian review after filtering.
 #[derive(Debug, PartialEq, Eq)]
@@ -97,8 +103,11 @@ pub(crate) async fn build_guardian_prompt_items(
 ) -> serde_json::Result<GuardianPromptItems> {
     build_guardian_prompt_items_with_parent_turn(
         session,
-        /*parent_turn*/ None,
-        retry_reason,
+        /*parent_context*/ None,
+        ApprovalRequestReasons {
+            approval: None,
+            retry: retry_reason,
+        },
         request,
         mode,
     )
@@ -107,8 +116,8 @@ pub(crate) async fn build_guardian_prompt_items(
 
 pub(crate) async fn build_guardian_prompt_items_with_parent_turn(
     session: &Session,
-    parent_turn: Option<&TurnContext>,
-    retry_reason: Option<String>,
+    parent_context: Option<&GuardianReviewContext>,
+    reasons: ApprovalRequestReasons,
     request: GuardianApprovalRequest,
     mode: GuardianPromptMode,
 ) -> serde_json::Result<GuardianPromptItems> {
@@ -192,7 +201,7 @@ pub(crate) async fn build_guardian_prompt_items_with_parent_turn(
     if let Some(note) = omission_note {
         push_text(format!("\n{note}\n"));
     }
-    if let Some(denied_reads_context) = parent_turn.and_then(parent_turn_denied_reads_context) {
+    if let Some(denied_reads_context) = parent_context.and_then(parent_turn_denied_reads_context) {
         push_text("\n>>> PARENT TURN PERMISSION CONTEXT START\n".to_string());
         push_text(denied_reads_context);
         push_text(">>> PARENT TURN PERMISSION CONTEXT END\n".to_string());
@@ -221,7 +230,11 @@ pub(crate) async fn build_guardian_prompt_items_with_parent_turn(
         _ => {
             push_text(headings.action_intro.to_string());
             push_text(">>> APPROVAL REQUEST START\n".to_string());
-            if let Some(reason) = retry_reason {
+            if let Some(reason) = reasons.retry.or(reasons.approval) {
+                let reason = truncate_text(
+                    &reason,
+                    TruncationPolicy::Tokens(GUARDIAN_MAX_APPROVAL_REASON_TOKENS),
+                );
                 push_text("Retry reason:\n".to_string());
                 push_text(format!("{reason}\n\n"));
             }
@@ -241,18 +254,25 @@ pub(crate) async fn build_guardian_prompt_items_with_parent_turn(
     })
 }
 
-fn parent_turn_denied_reads_context(turn: &TurnContext) -> Option<String> {
+fn parent_turn_denied_reads_context(context: &GuardianReviewContext) -> Option<String> {
+    let turn = context.turn();
+    let environment = context.environments().primary();
     #[allow(deprecated)]
-    let cwd = &turn.cwd;
-    let file_system_policy = turn.permission_profile.file_system_sandbox_policy();
+    let cwd = environment
+        .and_then(|environment| environment.cwd().to_abs_path().ok())
+        .unwrap_or_else(|| turn.cwd.clone());
+    let permission_profile = environment
+        .map(TurnEnvironment::permission_profile_with_workspace_roots)
+        .unwrap_or_else(|| turn.permission_profile());
+    let file_system_policy = permission_profile.file_system_sandbox_policy();
     let mut entries = file_system_policy
-        .get_unreadable_roots_with_cwd(cwd)
+        .get_unreadable_roots_with_cwd(&cwd)
         .into_iter()
         .map(|root| format!("- path `{}`", root.to_string_lossy()))
         .collect::<Vec<_>>();
     entries.extend(
         file_system_policy
-            .get_unreadable_globs_with_cwd(cwd)
+            .get_unreadable_globs_with_cwd(&cwd)
             .into_iter()
             .map(|glob| format!("- glob `{glob}`")),
     );

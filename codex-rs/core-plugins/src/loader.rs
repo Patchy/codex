@@ -1,12 +1,12 @@
 use crate::app_mcp_routing::apply_app_mcp_routing_policy;
 use crate::app_mcp_routing::apps_route_available;
-use crate::command_migration::migrated_command_skills_root;
 use crate::is_openai_curated_marketplace_name;
 use crate::manifest::PluginManifest;
+use crate::manifest::PluginManifestFormat;
 use crate::manifest::PluginManifestHooks;
 use crate::manifest::PluginManifestMcpServers;
 use crate::manifest::PluginManifestPaths;
-use crate::manifest::load_plugin_manifest;
+use crate::manifest::load_plugin_manifest_with_format;
 use crate::marketplace::MarketplacePluginSource;
 use crate::marketplace::find_marketplace_plugin;
 use crate::marketplace::list_marketplaces_with_home;
@@ -22,17 +22,15 @@ use crate::store::plugin_version_for_source;
 use crate::store::plugin_version_for_source_with_fallback_manifest;
 use codex_config::ConfigLayerStack;
 use codex_config::HooksFile;
+use codex_config::SkillConfigRules;
+use codex_config::skill_config_rules_from_stack;
 use codex_config::types::McpServerConfig;
+use codex_config::types::McpServerTransportConfig;
 use codex_config::types::PluginConfig;
 use codex_config::types::PluginMcpServerConfig;
 use codex_connectors::parse_plugin_app_config;
 use codex_connectors::parse_plugin_app_config_value;
-use codex_core_skills::PluginSkillSnapshots;
-use codex_core_skills::config_rules::resolve_disabled_skill_paths;
-use codex_core_skills::config_rules::skill_config_rules_from_stack;
-use codex_core_skills::loader::SkillRoot;
-use codex_core_skills::loader::load_skills_from_roots;
-use codex_exec_server::LOCAL_FS;
+use codex_mcp::parse_agent_plugin_mcp_config;
 use codex_mcp::parse_plugin_mcp_config;
 use codex_plugin::AppDeclaration;
 use codex_plugin::LoadedPlugin;
@@ -43,22 +41,23 @@ use codex_plugin::PluginIdError;
 use codex_plugin::app_connector_ids_from_declarations;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::protocol::Product;
-use codex_protocol::protocol::SkillScope;
-use codex_skills::SkillConfigRules;
 use codex_skills::SkillMetadata;
+use codex_skills::SkillRootLoadRequest;
+use codex_skills::SkillRootLoader;
+use codex_skills::SkillRootSnapshots;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_plugins::PluginIdentity;
+use codex_utils_plugins::PluginSkillRoot;
 use codex_utils_plugins::SkillDiscoveryMode;
 use codex_utils_plugins::find_plugin_manifest_path;
+use codex_utils_plugins::migrated_command_skills_root;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
 use tempfile::TempDir;
-use tokio::sync::Semaphore;
 use tracing::instrument;
 use tracing::warn;
 
@@ -88,9 +87,9 @@ enum PluginLoadScope<'a> {
     AllCapabilities {
         restriction_product: Option<Product>,
         skill_config_rules: &'a SkillConfigRules,
-        plugin_skill_snapshots: Option<&'a PluginSkillSnapshots>,
+        plugin_skill_snapshots: Option<&'a SkillRootSnapshots<PluginSkillRoot>>,
         remote_plugin_id_resolver: &'a RemotePluginIdResolver,
-        root_scan_slots: Arc<Semaphore>,
+        skill_root_loader: &'a dyn SkillRootLoader<PluginSkillRoot>,
     },
     HooksOnly,
 }
@@ -131,10 +130,10 @@ pub(crate) async fn load_plugins_from_layer_stack(
     config_layer_stack: &ConfigLayerStack,
     remote_installed_plugins_snapshot: RemoteInstalledPluginsSnapshot,
     store: &PluginStore,
-    plugin_skill_snapshots: Option<&PluginSkillSnapshots>,
+    plugin_skill_snapshots: Option<&SkillRootSnapshots<PluginSkillRoot>>,
     restriction_product: Option<Product>,
     remote_global_catalog_active: bool,
-    root_scan_slots: Arc<Semaphore>,
+    skill_root_loader: &dyn SkillRootLoader<PluginSkillRoot>,
 ) -> Vec<LoadedPlugin<McpServerConfig>> {
     let skill_config_rules = skill_config_rules_from_stack(config_layer_stack);
     let RemoteInstalledPluginsSnapshot {
@@ -151,7 +150,7 @@ pub(crate) async fn load_plugins_from_layer_stack(
             skill_config_rules: &skill_config_rules,
             plugin_skill_snapshots,
             remote_plugin_id_resolver: &remote_plugin_id_resolver,
-            root_scan_slots,
+            skill_root_loader,
         },
     )
     .await
@@ -239,7 +238,9 @@ fn merge_configured_plugins_with_remote_installed(
             Ok(plugin_id) => plugin_id.marketplace_name != crate::OPENAI_CURATED_MARKETPLACE_NAME,
             Err(_) => true,
         });
-        configured_plugins.extend(extra_plugins);
+        for (plugin_key, plugin_config) in extra_plugins {
+            merge_remote_plugin_config(&mut configured_plugins, plugin_key, plugin_config);
+        }
         return configured_plugins;
     }
 
@@ -273,7 +274,7 @@ fn merge_configured_plugins_with_remote_installed(
             continue;
         }
 
-        configured_plugins.insert(plugin_key, plugin_config);
+        merge_remote_plugin_config(&mut configured_plugins, plugin_key, plugin_config);
     }
 
     configured_plugins
@@ -299,6 +300,19 @@ pub(crate) fn plugin_is_eligible_for_target_marketplace(
                 && plugin_id.marketplace_name != REMOTE_GLOBAL_MARKETPLACE_NAME
         }
     }
+}
+
+fn merge_remote_plugin_config(
+    configured_plugins: &mut HashMap<String, PluginConfig>,
+    plugin_key: String,
+    mut remote_plugin_config: PluginConfig,
+) {
+    if let Some(configured_plugin) = configured_plugins.get(&plugin_key) {
+        remote_plugin_config
+            .mcp_servers
+            .clone_from(&configured_plugin.mcp_servers);
+    }
+    configured_plugins.insert(plugin_key, remote_plugin_config);
 }
 
 fn installed_plugin_name_for_marketplace(
@@ -816,6 +830,7 @@ async fn load_plugin(
         root,
         enabled: plugin.enabled,
         skill_roots: Vec::new(),
+        skill_discovery_mode: SkillDiscoveryMode::Recursive,
         disabled_skill_paths: HashSet::new(),
         has_enabled_skills: false,
         mcp_servers: HashMap::new(),
@@ -858,12 +873,19 @@ async fn load_plugin(
         return loaded_plugin;
     }
 
-    let Some(manifest) = load_plugin_manifest(plugin_root.as_path()) else {
+    let Some(loaded_manifest) = load_plugin_manifest_with_format(plugin_root.as_path()) else {
         loaded_plugin.error = Some("missing or invalid plugin.json".to_string());
         return loaded_plugin;
     };
+    loaded_plugin.skill_discovery_mode = match loaded_manifest.format {
+        PluginManifestFormat::Legacy => SkillDiscoveryMode::Recursive,
+        PluginManifestFormat::AgentPlugin => SkillDiscoveryMode::DirectChildren,
+    };
+    let manifest = loaded_manifest.manifest;
 
     let manifest_paths = &manifest.paths;
+    let plugin_data_root = store.plugin_data_root(&loaded_plugin_id);
+    let mcp_plugin_data_root = store.mcp_data_root(&loaded_plugin_id, loaded_manifest.format);
     loaded_plugin.plugin_namespace = Some(manifest.name.clone());
     match scope {
         PluginLoadScope::AllCapabilities {
@@ -871,44 +893,55 @@ async fn load_plugin(
             skill_config_rules,
             plugin_skill_snapshots,
             remote_plugin_id_resolver: _,
-            root_scan_slots,
+            skill_root_loader,
         } => {
             loaded_plugin.manifest_name = Some(manifest.display_name().to_string());
             loaded_plugin.manifest_description = manifest.description.clone();
-            loaded_plugin.skill_roots = plugin_skill_roots(&plugin_root, manifest_paths);
+            loaded_plugin.skill_roots =
+                plugin_skill_roots(&plugin_root, manifest_paths, loaded_manifest.format);
             let plugin_identity = PluginIdentity {
                 plugin_id: loaded_plugin_id.as_key(),
                 remote_plugin_id: loaded_plugin.remote_plugin_id.clone(),
             };
-            let resolved_skills = load_plugin_skills_with_identity(
+            let resolved_skills = load_plugin_skill_inventory(
                 &plugin_root,
                 &plugin_identity,
                 &manifest,
+                loaded_manifest.format,
                 *restriction_product,
-                skill_config_rules,
                 *plugin_skill_snapshots,
-                Arc::clone(root_scan_slots),
+                *skill_root_loader,
             )
-            .await;
+            .await
+            .resolve(skill_config_rules);
             let has_enabled_skills = resolved_skills.has_enabled_skills();
             loaded_plugin.disabled_skill_paths = resolved_skills.disabled_skill_paths;
             loaded_plugin.has_enabled_skills = has_enabled_skills;
-            loaded_plugin.mcp_servers = load_plugin_mcp_servers_from_manifest(
+            loaded_plugin.mcp_servers = load_plugin_mcp_servers_from_manifest_with_format(
                 plugin_root.as_path(),
                 manifest_paths,
                 Some(&plugin.mcp_servers),
+                Some(mcp_plugin_data_root.as_path()),
+                loaded_manifest.format,
             )
             .await;
-            loaded_plugin.apps = load_plugin_apps(plugin_root.as_path()).await;
+            if loaded_manifest.format == PluginManifestFormat::Legacy {
+                loaded_plugin.apps = load_plugin_apps(plugin_root.as_path()).await;
+            }
         }
         PluginLoadScope::HooksOnly => {}
     }
-    let (hook_sources, hook_load_warnings) = load_plugin_hooks(
-        &plugin_root,
-        &loaded_plugin_id,
-        &store.plugin_data_root(&loaded_plugin_id),
-        manifest_paths,
-    );
+    let (hook_sources, hook_load_warnings) =
+        if loaded_manifest.format == PluginManifestFormat::AgentPlugin {
+            (Vec::new(), Vec::new())
+        } else {
+            load_plugin_hooks(
+                &plugin_root,
+                &loaded_plugin_id,
+                &plugin_data_root,
+                manifest_paths,
+            )
+        };
     loaded_plugin.hook_sources = hook_sources;
     loaded_plugin.hook_load_warnings = hook_load_warnings;
     loaded_plugin
@@ -942,12 +975,20 @@ impl PluginSkillInventory {
     pub(crate) fn has_enabled_skills(&self, skill_config_rules: &SkillConfigRules) -> bool {
         contains_enabled_skill(
             &self.skills,
-            &resolve_disabled_skill_paths(&self.skills, skill_config_rules),
+            &skill_config_rules.resolve_disabled_paths(
+                self.skills
+                    .iter()
+                    .map(|skill| (skill.name.as_str(), &skill.path_to_skills_md)),
+            ),
         )
     }
 
-    fn resolve(self, skill_config_rules: &SkillConfigRules) -> ResolvedPluginSkills {
-        let disabled_skill_paths = resolve_disabled_skill_paths(&self.skills, skill_config_rules);
+    pub(crate) fn resolve(self, skill_config_rules: &SkillConfigRules) -> ResolvedPluginSkills {
+        let disabled_skill_paths = skill_config_rules.resolve_disabled_paths(
+            self.skills
+                .iter()
+                .map(|skill| (skill.name.as_str(), &skill.path_to_skills_md)),
+        );
         ResolvedPluginSkills {
             skills: self.skills,
             disabled_skill_paths,
@@ -978,120 +1019,58 @@ fn contains_enabled_skill(
         .any(|skill| !disabled_skill_paths.contains(&skill.path_to_skills_md))
 }
 
-pub async fn load_plugin_skills(
-    plugin_root: &AbsolutePathBuf,
-    plugin_id: &PluginId,
-    manifest: &PluginManifest,
-    restriction_product: Option<Product>,
-    skill_config_rules: &SkillConfigRules,
-    plugin_skill_snapshots: Option<&PluginSkillSnapshots>,
-    root_scan_slots: Arc<Semaphore>,
-) -> ResolvedPluginSkills {
-    let plugin_identity = PluginIdentity {
-        plugin_id: plugin_id.as_key(),
-        remote_plugin_id: None,
-    };
-    load_plugin_skills_with_identity(
-        plugin_root,
-        &plugin_identity,
-        manifest,
-        restriction_product,
-        skill_config_rules,
-        plugin_skill_snapshots,
-        root_scan_slots,
-    )
-    .await
-}
-
-pub(crate) async fn load_plugin_skills_with_identity(
-    plugin_root: &AbsolutePathBuf,
-    plugin_identity: &PluginIdentity,
-    manifest: &PluginManifest,
-    restriction_product: Option<Product>,
-    skill_config_rules: &SkillConfigRules,
-    plugin_skill_snapshots: Option<&PluginSkillSnapshots>,
-    root_scan_slots: Arc<Semaphore>,
-) -> ResolvedPluginSkills {
-    load_plugin_skill_inventory(
-        plugin_root,
-        plugin_identity,
-        manifest,
-        restriction_product,
-        plugin_skill_snapshots,
-        root_scan_slots,
-    )
-    .await
-    .resolve(skill_config_rules)
-}
-
 pub(crate) async fn load_plugin_skill_inventory(
     plugin_root: &AbsolutePathBuf,
     plugin_identity: &PluginIdentity,
     manifest: &PluginManifest,
+    manifest_format: PluginManifestFormat,
     restriction_product: Option<Product>,
-    plugin_skill_snapshots: Option<&PluginSkillSnapshots>,
-    root_scan_slots: Arc<Semaphore>,
+    plugin_skill_snapshots: Option<&SkillRootSnapshots<PluginSkillRoot>>,
+    skill_root_loader: &dyn SkillRootLoader<PluginSkillRoot>,
 ) -> PluginSkillInventory {
-    let roots = plugin_skill_roots(plugin_root, &manifest.paths)
+    let discovery_mode = match manifest_format {
+        PluginManifestFormat::Legacy => SkillDiscoveryMode::Recursive,
+        PluginManifestFormat::AgentPlugin => SkillDiscoveryMode::DirectChildren,
+    };
+    let roots = plugin_skill_roots(plugin_root, &manifest.paths, manifest_format)
         .into_iter()
-        .map(|path| SkillRoot {
+        .map(|path| PluginSkillRoot {
             path,
-            scope: SkillScope::User,
-            file_system: Arc::clone(&LOCAL_FS),
-            plugin_identity: Some(plugin_identity.clone()),
-            plugin_namespace: Some(manifest.name.clone()),
-            plugin_root: Some(plugin_root.clone()),
-            discovery_mode: SkillDiscoveryMode::Recursive,
+            plugin_identity: plugin_identity.clone(),
+            plugin_namespace: manifest.name.clone(),
+            plugin_root: plugin_root.clone(),
+            discovery_mode,
         })
-        .collect::<Vec<_>>();
-    let outcome = load_skills_from_roots(roots, plugin_skill_snapshots, root_scan_slots).await;
-    let had_errors = !outcome.errors.is_empty();
-    let migrated_command_skills = migrated_command_skills_root(plugin_root);
-    let migrated_command_skills = fs::canonicalize(migrated_command_skills.as_path())
-        .ok()
-        .and_then(|path| AbsolutePathBuf::from_absolute_path_checked(path).ok())
-        .unwrap_or(migrated_command_skills);
-    let skills = outcome
-        .skills
-        .into_iter()
-        .filter(|skill| skill.matches_product_restriction_for_product(restriction_product))
-        .collect::<Vec<_>>();
-    let native_skill_names = skills
-        .iter()
-        .filter(|skill| {
-            !skill
-                .path_to_skills_md
-                .as_path()
-                .starts_with(migrated_command_skills.as_path())
+        .collect();
+    let outcome = skill_root_loader
+        .load_roots(SkillRootLoadRequest {
+            roots,
+            restriction_product,
+            snapshots: plugin_skill_snapshots.cloned(),
         })
-        .map(|skill| skill.name.clone())
-        .collect::<HashSet<_>>();
-    let skills = skills
-        .into_iter()
-        .filter(|skill| {
-            !skill
-                .path_to_skills_md
-                .as_path()
-                .starts_with(migrated_command_skills.as_path())
-                || !native_skill_names.contains(&skill.name)
-        })
-        .collect::<Vec<_>>();
+        .await;
 
-    PluginSkillInventory { skills, had_errors }
+    PluginSkillInventory {
+        skills: outcome.skills,
+        had_errors: !outcome.errors.is_empty(),
+    }
 }
 
 fn plugin_skill_roots(
     plugin_root: &AbsolutePathBuf,
     manifest_paths: &PluginManifestPaths,
+    manifest_format: PluginManifestFormat,
 ) -> Vec<AbsolutePathBuf> {
     let mut paths = if manifest_paths.skills.is_empty() {
         default_skill_roots(plugin_root)
     } else {
         manifest_paths.skills.clone()
     };
-    let migrated_command_skills = migrated_command_skills_root(plugin_root);
-    if migrated_command_skills.is_dir() {
-        paths.push(migrated_command_skills);
+    if manifest_format == PluginManifestFormat::Legacy {
+        let migrated_command_skills = migrated_command_skills_root(plugin_root);
+        if migrated_command_skills.is_dir() {
+            paths.push(migrated_command_skills);
+        }
     }
     paths.sort_unstable();
     paths.dedup();
@@ -1131,8 +1110,11 @@ fn default_mcp_config_paths(plugin_root: &Path) -> Vec<AbsolutePathBuf> {
 }
 
 pub async fn load_plugin_apps(plugin_root: &Path) -> Vec<AppDeclaration> {
-    if let Some(manifest) = load_plugin_manifest(plugin_root) {
-        return load_plugin_apps_from_manifest(plugin_root, &manifest.paths).await;
+    if let Some(loaded_manifest) = load_plugin_manifest_with_format(plugin_root) {
+        if loaded_manifest.format == PluginManifestFormat::AgentPlugin {
+            return Vec::new();
+        }
+        return load_plugin_apps_from_manifest(plugin_root, &loaded_manifest.manifest.paths).await;
     }
     load_apps_from_paths(plugin_root, default_app_config_paths(plugin_root)).await
 }
@@ -1329,15 +1311,42 @@ async fn load_apps_from_paths(
 pub async fn plugin_capability_summary_from_root(
     plugin_id: &PluginId,
     plugin_root: &AbsolutePathBuf,
+    skill_root_loader: &dyn SkillRootLoader<PluginSkillRoot>,
 ) -> Option<PluginCapabilitySummary> {
-    let manifest = load_plugin_manifest(plugin_root.as_path())?;
+    let loaded_manifest = load_plugin_manifest_with_format(plugin_root.as_path())?;
+    let manifest_format = loaded_manifest.format;
+    let manifest = loaded_manifest.manifest;
+    let plugin_identity = PluginIdentity {
+        plugin_id: plugin_id.as_key(),
+        remote_plugin_id: None,
+    };
 
     let manifest_paths = &manifest.paths;
-    let has_skills = !plugin_skill_roots(plugin_root, manifest_paths).is_empty();
-    let mut mcp_server_names = load_plugin_mcp_servers_from_manifest(
+    let has_skills = match manifest_format {
+        PluginManifestFormat::Legacy => {
+            !plugin_skill_roots(plugin_root, manifest_paths, manifest_format).is_empty()
+        }
+        PluginManifestFormat::AgentPlugin => {
+            !load_plugin_skill_inventory(
+                plugin_root,
+                &plugin_identity,
+                &manifest,
+                manifest_format,
+                /*restriction_product*/ None,
+                /*plugin_skill_snapshots*/ None,
+                skill_root_loader,
+            )
+            .await
+            .skills
+            .is_empty()
+        }
+    };
+    let mut mcp_server_names = load_plugin_mcp_servers_from_manifest_with_format(
         plugin_root.as_path(),
         manifest_paths,
         /*plugin_policy*/ None,
+        /*plugin_data_root*/ None,
+        manifest_format,
     )
     .await
     .into_keys()
@@ -1345,16 +1354,17 @@ pub async fn plugin_capability_summary_from_root(
     mcp_server_names.sort_unstable();
     mcp_server_names.dedup();
 
-    let app_declarations = load_apps_from_paths(
-        plugin_root.as_path(),
-        plugin_app_config_paths(plugin_root.as_path(), manifest_paths),
-    )
-    .await;
+    let app_declarations = if manifest_format == PluginManifestFormat::AgentPlugin {
+        Vec::new()
+    } else {
+        load_plugin_apps_from_manifest(plugin_root.as_path(), manifest_paths).await
+    };
     let app_connector_ids = app_connector_ids_from_declarations(&app_declarations);
 
     Some(PluginCapabilitySummary {
         config_name: plugin_id.as_key(),
         display_name: plugin_id.plugin_name.clone(),
+        plugin_namespace: Some(manifest.name.clone()),
         description: None,
         has_skills,
         mcp_server_names,
@@ -1362,11 +1372,37 @@ pub async fn plugin_capability_summary_from_root(
     })
 }
 
+/// Loads plugin MCP servers without applying user-specific policy overrides.
 pub async fn load_plugin_mcp_servers(
     plugin_root: &Path,
     auth_mode: Option<AuthMode>,
 ) -> HashMap<String, McpServerConfig> {
-    let mut mcp_servers = load_declared_plugin_mcp_servers(plugin_root).await;
+    load_plugin_mcp_servers_with_policy(plugin_root, auth_mode, /*plugin_policy*/ None).await
+}
+
+/// Loads plugin MCP servers with the effective user policy for an installed plugin.
+pub async fn load_configured_plugin_mcp_servers(
+    plugin_root: &Path,
+    auth_mode: Option<AuthMode>,
+    plugin_id: &PluginId,
+    config_layer_stack: &ConfigLayerStack,
+    codex_home: &Path,
+) -> HashMap<String, McpServerConfig> {
+    let configured_plugins = configured_plugins_from_stack(config_layer_stack, codex_home);
+    let plugin_id = plugin_id.as_key();
+    let plugin_policy = configured_plugins
+        .get(&plugin_id)
+        .map(|plugin| &plugin.mcp_servers);
+
+    load_plugin_mcp_servers_with_policy(plugin_root, auth_mode, plugin_policy).await
+}
+
+async fn load_plugin_mcp_servers_with_policy(
+    plugin_root: &Path,
+    auth_mode: Option<AuthMode>,
+    plugin_policy: Option<&HashMap<String, PluginMcpServerConfig>>,
+) -> HashMap<String, McpServerConfig> {
+    let mut mcp_servers = load_declared_plugin_mcp_servers(plugin_root, plugin_policy).await;
     if !apps_route_available(auth_mode) || mcp_servers.is_empty() {
         return mcp_servers;
     }
@@ -1381,19 +1417,30 @@ pub async fn load_plugin_mcp_servers(
     mcp_servers
 }
 
-async fn load_declared_plugin_mcp_servers(plugin_root: &Path) -> HashMap<String, McpServerConfig> {
-    let Some(manifest) = load_plugin_manifest(plugin_root) else {
+async fn load_declared_plugin_mcp_servers(
+    plugin_root: &Path,
+    plugin_policy: Option<&HashMap<String, PluginMcpServerConfig>>,
+) -> HashMap<String, McpServerConfig> {
+    let Some(loaded_manifest) = load_plugin_manifest_with_format(plugin_root) else {
         return HashMap::new();
     };
 
-    load_plugin_mcp_servers_from_manifest(plugin_root, &manifest.paths, /*plugin_policy*/ None)
-        .await
+    load_plugin_mcp_servers_from_manifest_with_format(
+        plugin_root,
+        &loaded_manifest.manifest.paths,
+        plugin_policy,
+        /*plugin_data_root*/ None,
+        loaded_manifest.format,
+    )
+    .await
 }
 
-pub(crate) async fn load_plugin_mcp_servers_from_manifest(
+pub(crate) async fn load_plugin_mcp_servers_from_manifest_with_format(
     plugin_root: &Path,
     manifest_paths: &PluginManifestPaths,
     plugin_policy: Option<&HashMap<String, PluginMcpServerConfig>>,
+    plugin_data_root: Option<&Path>,
+    manifest_format: PluginManifestFormat,
 ) -> HashMap<String, McpServerConfig> {
     let mut mcp_servers = HashMap::new();
     match &manifest_paths.mcp_servers {
@@ -1414,7 +1461,13 @@ pub(crate) async fn load_plugin_mcp_servers_from_manifest(
         }
         Some(PluginManifestMcpServers::Path(_)) | None => {
             for mcp_config_path in plugin_mcp_config_paths(plugin_root, manifest_paths) {
-                let plugin_mcp = load_mcp_servers_from_file(plugin_root, &mcp_config_path).await;
+                let plugin_mcp = load_mcp_servers_from_file(
+                    plugin_root,
+                    plugin_data_root,
+                    manifest_format,
+                    &mcp_config_path,
+                )
+                .await;
                 for (name, mut config) in plugin_mcp.mcp_servers {
                     if let Some(policy) = plugin_policy.and_then(|policy| policy.get(&name)) {
                         apply_plugin_mcp_server_policy(&mut config, policy);
@@ -1437,12 +1490,74 @@ pub(crate) async fn load_plugin_mcp_servers_from_manifest(
 
 async fn load_mcp_servers_from_file(
     plugin_root: &Path,
+    plugin_data_root: Option<&Path>,
+    manifest_format: PluginManifestFormat,
     mcp_config_path: &AbsolutePathBuf,
 ) -> PluginMcpDiscovery {
+    let is_agent_plugin_mcp = manifest_format == PluginManifestFormat::AgentPlugin;
+    if is_agent_plugin_mcp {
+        match tokio::fs::symlink_metadata(mcp_config_path.as_path()).await {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                warn!(
+                    path = %mcp_config_path.display(),
+                    "Agent Plugins MCP config is not a regular file; disabling MCP"
+                );
+                return PluginMcpDiscovery::default();
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return PluginMcpDiscovery::default();
+            }
+            Err(err) => {
+                warn!(
+                    path = %mcp_config_path.display(),
+                    "failed to inspect Agent Plugins MCP config; disabling MCP: {err}"
+                );
+                return PluginMcpDiscovery::default();
+            }
+        }
+        let resolved_root = match tokio::fs::canonicalize(plugin_root).await {
+            Ok(path) => path,
+            Err(err) => {
+                warn!(
+                    plugin = %plugin_root.display(),
+                    "failed to resolve Agent Plugins root; disabling MCP: {err}"
+                );
+                return PluginMcpDiscovery::default();
+            }
+        };
+        let resolved_config = match tokio::fs::canonicalize(mcp_config_path.as_path()).await {
+            Ok(path) => path,
+            Err(err) => {
+                warn!(
+                    path = %mcp_config_path.display(),
+                    "failed to resolve Agent Plugins MCP config; disabling MCP: {err}"
+                );
+                return PluginMcpDiscovery::default();
+            }
+        };
+        if !resolved_config.starts_with(&resolved_root) {
+            warn!(
+                plugin = %plugin_root.display(),
+                path = %mcp_config_path.display(),
+                "Agent Plugins MCP config resolves outside the plugin root; disabling MCP"
+            );
+            return PluginMcpDiscovery::default();
+        }
+    }
     let Ok(contents) = tokio::fs::read_to_string(mcp_config_path.as_path()).await else {
         return PluginMcpDiscovery::default();
     };
-    let parsed = match parse_plugin_mcp_config(plugin_root, &contents) {
+    let fallback_data_root = plugin_root.join(".plugin-data");
+    let mut parsed = match if is_agent_plugin_mcp {
+        parse_agent_plugin_mcp_config(
+            plugin_root,
+            plugin_data_root.unwrap_or(&fallback_data_root),
+            &contents,
+        )
+    } else {
+        parse_plugin_mcp_config(plugin_root, &contents)
+    } {
         Ok(parsed) => parsed,
         Err(err) => {
             warn!(
@@ -1452,6 +1567,23 @@ async fn load_mcp_servers_from_file(
             return PluginMcpDiscovery::default();
         }
     };
+    if is_agent_plugin_mcp
+        && let Some(plugin_data_root) = plugin_data_root
+        && parsed
+            .servers
+            .values()
+            .any(|server| matches!(&server.transport, McpServerTransportConfig::Stdio { .. }))
+        && let Err(err) = tokio::fs::create_dir_all(plugin_data_root).await
+    {
+        warn!(
+            plugin = %plugin_root.display(),
+            path = %plugin_data_root.display(),
+            "failed to create Agent Plugins data directory; disabling stdio MCP servers: {err}"
+        );
+        parsed.servers.retain(|_, server| {
+            !matches!(&server.transport, McpServerTransportConfig::Stdio { .. })
+        });
+    }
     for error in parsed.errors {
         warn!(
             plugin = %plugin_root.display(),
@@ -1632,7 +1764,9 @@ fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<(), String> {
 
 fn run_git_output(args: &[&str], cwd: Option<&Path>) -> Result<String, String> {
     let mut command = Command::new("git");
-    command.args(args);
+    command
+        .args(["-c", codex_git_utils::SAFE_BARE_REPOSITORY_CONFIG])
+        .args(args);
     command.env("GIT_TERMINAL_PROMPT", "0");
     if let Some(cwd) = cwd {
         command.current_dir(cwd);

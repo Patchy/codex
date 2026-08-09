@@ -6,9 +6,23 @@ use std::collections::BTreeMap;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct ToolRegistryConfigToml {
+    /// Fail the turn when multiple tools share the same effective name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_on_tool_collisions: Option<bool>,
+    /// Include authoritative tool information in per-turn request metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_metadata_includes_tool_info: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CodeModeConfigToml {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    /// Default yield timeout for code-mode exec calls, in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_exec_yield_time_ms: Option<u64>,
     /// Exact tool namespaces to omit from the code-mode nested tool surface.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub excluded_tool_namespaces: Option<Vec<String>>,
@@ -34,7 +48,7 @@ impl FeatureConfig for CodeModeConfigToml {
 pub struct CodeModeHostConfigToml {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
-    /// Fail instead of running embedded V8 when the standalone host is unavailable.
+    /// Keep code mode fail-closed when the standalone host is unavailable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disable_in_process_fallback: Option<bool>,
 }
@@ -95,6 +109,9 @@ pub struct MultiAgentV2ConfigToml {
     pub root_agent_usage_hint_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subagent_usage_hint_text: Option<String>,
+    /// Overrides inherited developer instructions for subagents without role-specific instructions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_developer_instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub multi_agent_mode_hint_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

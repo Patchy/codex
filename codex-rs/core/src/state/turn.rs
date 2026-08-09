@@ -7,7 +7,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
-use codex_extension_api::ExtensionData;
+use codex_diagnostics::GaugeGuard;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::request_permissions::RequestPermissionProfile;
@@ -19,11 +19,13 @@ use rmcp::model::RequestId;
 use tokio::sync::oneshot;
 
 use crate::agent::control::AgentExecutionGuard;
+use crate::codex_thread::TryStartTurnIfIdleRejectionReason;
 use crate::mcp_tool_call::McpToolApprovalMetadata;
 use crate::session::TurnInputQueue;
 use crate::session::turn_context::TurnContext;
 use crate::tasks::AnySessionTask;
 use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::protocol::McpInvocation;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::TokenUsage;
 
@@ -74,11 +76,13 @@ pub(crate) struct RunningTask {
     pub(crate) done: Arc<Notify>,
     pub(crate) kind: TaskKind,
     pub(crate) task: Arc<dyn AnySessionTask>,
+    pub(crate) input_persisted:
+        Option<oneshot::Sender<Result<(), TryStartTurnIfIdleRejectionReason>>>,
     pub(crate) cancellation_token: CancellationToken,
     pub(crate) handle: AbortOnDropHandle<()>,
     pub(crate) turn_context: Arc<TurnContext>,
-    pub(crate) turn_extension_data: Arc<ExtensionData>,
     pub(crate) _agent_execution_guard: Option<AgentExecutionGuard>,
+    pub(crate) _diagnostics_guard: GaugeGuard,
     // Timer recorded when the task drops to capture the full turn duration.
     pub(crate) _timer: Option<codex_otel::Timer>,
 }
@@ -90,7 +94,7 @@ pub(crate) struct TurnState {
     pending_request_permissions: HashMap<String, PendingRequestPermissions>,
     pending_user_input: HashMap<String, oneshot::Sender<RequestUserInputResponse>>,
     pending_elicitations: HashMap<(String, RequestId), oneshot::Sender<ElicitationResponse>>,
-    mcp_tool_approval_metadata: HashMap<String, McpToolApprovalMetadata>,
+    mcp_tool_approval_metadata: HashMap<String, (Option<McpInvocation>, McpToolApprovalMetadata)>,
     pending_dynamic_tools: HashMap<String, oneshot::Sender<DynamicToolResponse>>,
     pub(crate) pending_input: TurnInputQueue,
     mailbox_delivery_phase: MailboxDeliveryPhase,
@@ -185,15 +189,17 @@ impl TurnState {
     pub(crate) fn insert_mcp_tool_approval_metadata(
         &mut self,
         call_id: String,
+        invocation: Option<McpInvocation>,
         metadata: McpToolApprovalMetadata,
     ) {
-        self.mcp_tool_approval_metadata.insert(call_id, metadata);
+        self.mcp_tool_approval_metadata
+            .insert(call_id, (invocation, metadata));
     }
 
     pub(crate) fn mcp_tool_approval_metadata(
         &self,
         call_id: &str,
-    ) -> Option<McpToolApprovalMetadata> {
+    ) -> Option<(Option<McpInvocation>, McpToolApprovalMetadata)> {
         self.mcp_tool_approval_metadata.get(call_id).cloned()
     }
 

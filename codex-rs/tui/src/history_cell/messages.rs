@@ -395,9 +395,9 @@ impl AgentMarkdownCell {
             crate::inline_visualization::InlineVisualizationContext,
         >,
     ) -> Self {
-        let rendered_lines = (!markdown_source
-            .contains(crate::inline_visualization::DIRECTIVE_PREFIX))
-        .then(MarkdownRenderCache::default);
+        let rendered_lines =
+            (!crate::inline_visualization::contains_inline_visualization(&markdown_source))
+                .then(MarkdownRenderCache::default);
         Self {
             markdown_source,
             cwd: cwd.to_path_buf(),
@@ -553,7 +553,11 @@ pub(crate) fn new_reasoning_summary_block(
     cwd: &Path,
 ) -> Box<dyn HistoryCell> {
     let (header, content) = split_reasoning_summary_parts(&reasoning_parts);
-    let transcript_only = header.is_empty();
+    let title_only = content
+        .strip_prefix("**")
+        .and_then(|content| content.strip_suffix("**"))
+        .is_some_and(|content| !content.is_empty() && !content.contains("**"));
+    let transcript_only = header.is_empty() && !title_only;
     Box::new(ReasoningSummaryCell::new(
         header,
         content,

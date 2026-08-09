@@ -25,7 +25,7 @@ use crate::utils::invalid_data_error;
 use crate::utils::is_missing_or_empty_text_file;
 use codex_config::types::PluginConfig;
 use codex_core::config::ConfigBuilder;
-use codex_core_plugins::PluginsManager;
+use codex_core::plugins_manager_for_config;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
@@ -189,22 +189,33 @@ impl ExternalAgentConfigService {
             );
         }
 
-        let source_skills = repo_root.map_or_else(
-            || self.external_agent_home.join("skills"),
-            |repo_root| repo_root.join(self.source.config_dir()).join("skills"),
-        );
+        let source_skills = self
+            .source
+            .skills_dir_names(scope)
+            .iter()
+            .map(|directory| source_external_agent_dir.join(*directory))
+            .filter(|path| path.is_dir())
+            .collect::<Vec<_>>();
         let target_skills = repo_root.map_or_else(
             || self.home_target_skills_dir(),
             |repo_root| repo_root.join(".agents").join("skills"),
         );
-        let skill_names = missing_subdirectory_names(&source_skills, &target_skills)?;
+        let mut skill_names = Vec::new();
+        for source_skills_dir in &source_skills {
+            skill_names.extend(missing_subdirectory_names(
+                source_skills_dir,
+                &target_skills,
+            )?);
+        }
+        skill_names.sort();
+        skill_names.dedup();
         let skills_count = skill_names.len();
         if skills_count > 0 {
             items.push(ExternalAgentConfigMigrationItem {
                 item_type: ExternalAgentConfigMigrationItemType::Skills,
                 description: format!(
                     "Migrate skills from {} to {}",
-                    source_skills.display(),
+                    display_source_paths(&source_skills),
                     target_skills.display()
                 ),
                 cwd: cwd.clone(),
@@ -340,7 +351,7 @@ impl ExternalAgentConfigService {
                         .unwrap_or_default();
                     let configured_marketplace_plugins = configured_marketplace_plugins(
                         &config,
-                        &PluginsManager::new(self.codex_home.clone()),
+                        &plugins_manager_for_config(&config),
                     )?;
                     let source_root = repo_root.unwrap_or(self.external_agent_home.as_path());
                     if let Some(detected) =

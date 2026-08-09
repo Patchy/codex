@@ -1,19 +1,20 @@
 use super::AppSummary;
 use super::HookEventName;
+use super::HookExecutionMode;
 use super::HookHandlerType;
 use super::HookSource;
 use super::HookTrustStatus;
+use crate::JsonSchema;
+use crate::TS;
 use codex_protocol::protocol::SkillDependencies as CoreSkillDependencies;
 use codex_protocol::protocol::SkillInterface as CoreSkillInterface;
 use codex_protocol::protocol::SkillMetadata as CoreSkillMetadata;
 use codex_protocol::protocol::SkillScope as CoreSkillScope;
 use codex_protocol::protocol::SkillToolDependency as CoreSkillToolDependency;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use std::path::PathBuf;
-use ts_rs::TS;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -524,6 +525,8 @@ pub struct HookMetadata {
     pub key: String,
     pub event_name: HookEventName,
     pub handler_type: HookHandlerType,
+    #[serde(default)]
+    pub execution_mode: HookExecutionMode,
     pub matcher: Option<String>,
     pub command: Option<String>,
     pub timeout_sec: u64,
@@ -619,6 +622,17 @@ pub enum PluginAvailability {
     DisabledByAdmin,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export_to = "v2/", rename_all = "snake_case")]
+pub enum PluginDisabledReason {
+    DisabledByAdmin,
+    PlanNotEligible,
+    RequiredAppUnavailable,
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -637,6 +651,10 @@ pub struct PluginSummary {
     pub share_context: Option<PluginShareContext>,
     pub source: PluginSource,
     pub installed: bool,
+    /// Unix timestamp in seconds when the remote plugin was installed, when available.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub installed_at: Option<i64>,
     pub enabled: bool,
     pub install_policy: PluginInstallPolicy,
     pub install_policy_source: Option<PluginInstallPolicySource>,
@@ -646,6 +664,12 @@ pub struct PluginSummary {
     /// Availability state for installing and using the plugin.
     #[serde(default)]
     pub availability: PluginAvailability,
+    /// Why the remote plugin is unavailable, when provided by plugin-service.
+    #[serde(default)]
+    pub disabled_reason: Option<PluginDisabledReason>,
+    /// Raw plugin-service plan identifiers eligible to install the plugin.
+    #[serde(default)]
+    pub eligible_plan_types: Option<Vec<String>>,
     pub interface: Option<PluginInterface>,
     #[serde(default)]
     pub keywords: Vec<String>,

@@ -8,6 +8,8 @@ use wiremock::ResponseTemplate;
 use wiremock::matchers::header_exists;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
+use wiremock::matchers::query_param;
+use wiremock::matchers::query_param_is_missing;
 
 #[tokio::test]
 async fn remote_plugin_list_routes_the_complete_query_url() {
@@ -46,6 +48,84 @@ async fn remote_plugin_list_routes_the_complete_query_url() {
     );
 }
 
+#[tokio::test]
+async fn remote_installed_plugins_paginate_across_all_scopes_without_download_urls() {
+    let server = MockServer::start().await;
+    let installed_plugin = |scope: RemotePluginScope, id: &str, name: &str| {
+        let mut plugin = directory_plugin(id, name);
+        plugin.scope = scope;
+        if scope == RemotePluginScope::Workspace {
+            plugin.discoverability = Some(RemotePluginShareDiscoverability::Listed);
+        }
+        let mut plugin = serde_json::to_value(plugin).expect("serialize installed plugin");
+        plugin["enabled"] = serde_json::json!(true);
+        plugin
+    };
+    let global = installed_plugin(RemotePluginScope::Global, "plugin-global", "global-plugin");
+    let user = installed_plugin(RemotePluginScope::User, "plugin-user", "user-plugin");
+    let workspace = installed_plugin(
+        RemotePluginScope::Workspace,
+        "plugin-workspace",
+        "workspace-plugin",
+    );
+
+    Mock::given(method("GET"))
+        .and(path("/backend-api/ps/plugins/installed"))
+        .and(query_param_is_missing("scope"))
+        .and(query_param("limit", "200"))
+        .and(query_param_is_missing("includeDownloadUrls"))
+        .and(query_param_is_missing("pageToken"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "plugins": [user.clone(), workspace.clone()],
+            "pagination": {"next_page_token": "next page/+"},
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/backend-api/ps/plugins/installed"))
+        .and(query_param_is_missing("scope"))
+        .and(query_param("limit", "200"))
+        .and(query_param_is_missing("includeDownloadUrls"))
+        .and(query_param("pageToken", "next page/+"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "plugins": [global.clone()],
+            "pagination": {"next_page_token": null},
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (config, selected_urls) =
+        recording_remote_plugin_service_config(format!("{}/backend-api", server.uri()));
+    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+
+    let installed_plugins = fetch_remote_installed_plugins(&config, Some(&auth))
+        .await
+        .expect("all-scopes installed plugin request should succeed");
+    let expected_plugins = [user, global, workspace]
+        .into_iter()
+        .map(|plugin| {
+            let plugin = serde_json::from_value(plugin).expect("deserialize installed plugin");
+            remote_installed_plugin_to_cache_entry(&plugin).expect("valid installed plugin")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(installed_plugins, expected_plugins);
+    assert_eq!(
+        recorded_http_client_urls(&selected_urls),
+        vec![
+            format!(
+                "{}/backend-api/ps/plugins/installed?limit=200",
+                server.uri()
+            ),
+            format!(
+                "{}/backend-api/ps/plugins/installed?limit=200&pageToken=next+page%2F%2B",
+                server.uri()
+            ),
+        ]
+    );
+}
+
 #[test]
 fn cached_remote_plugin_catalog_scopes_returns_existing_scopes() {
     let codex_home = tempfile::tempdir().expect("create codex home");
@@ -78,6 +158,7 @@ fn build_remote_marketplace_preserves_directory_order_and_appends_installed_only
     ];
     let installed_plugins = vec![RemotePluginInstalledItem {
         plugin: directory_plugin("plugin-a", "alpha"),
+        installed_at: None,
         enabled: true,
         disabled_skill_names: Vec::new(),
     }];
@@ -109,6 +190,7 @@ fn installation_policy_source_is_preserved_across_remote_summary_paths() {
         Some(RemotePluginInstallPolicySource::ImplicitCanonicalApp);
     let installed_plugin = RemotePluginInstalledItem {
         plugin: directory_plugin.clone(),
+        installed_at: None,
         enabled: true,
         disabled_skill_names: Vec::new(),
     };
@@ -151,6 +233,87 @@ fn installation_policy_source_is_preserved_across_remote_summary_paths() {
 }
 
 #[test]
+fn plan_eligibility_is_preserved_across_remote_summary_paths() {
+    let mut directory_plugin = directory_plugin("plugin-gmail", "gmail");
+    directory_plugin.installation_policy = PluginInstallPolicy::NotAvailable;
+    directory_plugin.availability = PluginAvailability::DisabledByAdmin;
+    directory_plugin.disabled_reason = Some(PluginDisabledReason::PlanNotEligible);
+    directory_plugin.eligible_plan_types = Some(vec![
+        "plus".to_string(),
+        "pro".to_string(),
+        "enterprise_cbp_automation".to_string(),
+    ]);
+    let installed_plugin = RemotePluginInstalledItem {
+        plugin: directory_plugin.clone(),
+        installed_at: None,
+        enabled: false,
+        disabled_skill_names: Vec::new(),
+    };
+
+    let marketplace = build_remote_marketplace(
+        REMOTE_GLOBAL_MARKETPLACE_NAME,
+        REMOTE_GLOBAL_MARKETPLACE_DISPLAY_NAME,
+        vec![directory_plugin],
+        Vec::new(),
+        /*include_installed_only*/ false,
+    )
+    .expect("marketplace should be valid")
+    .expect("marketplace should not be empty");
+    let expected = vec![(
+        PluginAvailability::DisabledByAdmin,
+        Some(PluginDisabledReason::PlanNotEligible),
+        Some(vec![
+            "plus".to_string(),
+            "pro".to_string(),
+            "enterprise_cbp_automation".to_string(),
+        ]),
+    )];
+    assert_eq!(
+        marketplace
+            .plugins
+            .into_iter()
+            .map(|plugin| (
+                plugin.availability,
+                plugin.disabled_reason,
+                plugin.eligible_plan_types,
+            ))
+            .collect::<Vec<_>>(),
+        expected
+    );
+
+    let installed_plugin = remote_installed_plugin_to_cache_entry(&installed_plugin)
+        .expect("installed plugin should be valid");
+    let marketplaces = group_remote_installed_plugins_by_marketplaces(
+        &[installed_plugin],
+        &[REMOTE_GLOBAL_MARKETPLACE_NAME],
+    );
+    assert_eq!(
+        marketplaces
+            .into_iter()
+            .flat_map(|marketplace| marketplace.plugins)
+            .map(|plugin| (
+                plugin.availability,
+                plugin.disabled_reason,
+                plugin.eligible_plan_types,
+            ))
+            .collect::<Vec<_>>(),
+        expected
+    );
+}
+
+#[test]
+fn unknown_plugin_disabled_reason_preserves_remote_catalog_compatibility() {
+    let plugin = directory_plugin("plugin-gmail", "gmail");
+    let mut plugin_json = serde_json::to_value(plugin).expect("plugin should serialize");
+    plugin_json["disabled_reason"] = serde_json::json!("future_disabled_reason");
+
+    let plugin: RemotePluginDirectoryItem =
+        serde_json::from_value(plugin_json).expect("unknown reason should deserialize");
+
+    assert_eq!(plugin.disabled_reason, Some(PluginDisabledReason::Unknown));
+}
+
+#[test]
 fn installation_interstitial_requirement_is_preserved_across_remote_summary_paths() {
     let mut directory_plugin = directory_plugin("plugin-linear", "linear");
     directory_plugin.must_show_installation_interstitial = Some(true);
@@ -175,6 +338,7 @@ fn installation_interstitial_requirement_is_preserved_across_remote_summary_path
     directory_plugin.must_show_installation_interstitial = Some(false);
     let installed_plugin = remote_installed_plugin_to_cache_entry(&RemotePluginInstalledItem {
         plugin: directory_plugin,
+        installed_at: None,
         enabled: true,
         disabled_skill_names: Vec::new(),
     })
@@ -271,6 +435,8 @@ fn directory_plugin(id: &str, name: &str) -> RemotePluginDirectoryItem {
         must_show_installation_interstitial: None,
         authentication_policy: PluginAuthPolicy::OnUse,
         availability: PluginAvailability::Available,
+        disabled_reason: None,
+        eligible_plan_types: None,
         release: RemotePluginReleaseResponse {
             version: None,
             display_name: name.to_string(),

@@ -140,16 +140,7 @@ pub(crate) async fn handle_mcp_tool_call(
         arguments: arguments_value.clone(),
     };
 
-    sess.refresh_mcp_if_dirty().await;
-    let current_binding = sess
-        .services
-        .mcp_runtime
-        .current_binding_for_call(&server)
-        .await;
-    let Some(prepared_call) = current_binding
-        .as_ref()
-        .and_then(|binding| binding.prepare_call(&server, &tool_name))
-    else {
+    let Some(prepared_call) = sess.prepare_mcp_call(&server, &tool_name).await else {
         let item_metadata =
             McpToolCallItemMetadata::from_tool_metadata(&server, /*metadata*/ None);
         let result = notify_mcp_tool_call_skip(
@@ -220,7 +211,7 @@ pub(crate) async fn handle_mcp_tool_call(
                 .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new())),
         };
     }
-    sess.register_mcp_tool_approval_metadata(turn_context, &call_id, metadata.clone())
+    sess.register_mcp_tool_approval_metadata(turn_context, &call_id, &invocation, metadata.clone())
         .await;
     notify_mcp_tool_call_started(
         sess.as_ref(),
@@ -340,6 +331,7 @@ struct McpToolCallItemMetadata {
     app_name: Option<String>,
     action_name: Option<String>,
     plugin_id: Option<String>,
+    read_only_hint: Option<bool>,
 }
 
 impl McpToolCallItemMetadata {
@@ -364,6 +356,9 @@ impl McpToolCallItemMetadata {
                 .filter(|action_name| !action_name.is_empty())
                 .map(str::to_string),
             plugin_id: metadata.and_then(|metadata| metadata.plugin_id.clone()),
+            read_only_hint: metadata
+                .and_then(|metadata| metadata.annotations.as_ref())
+                .and_then(|annotations| annotations.read_only_hint),
         }
     }
 }
@@ -428,7 +423,7 @@ async fn handle_approved_mcp_tool_call(
                         .await;
                     let rewritten_arguments = rewrite_mcp_tool_arguments_for_openai_files(
                         sess,
-                        turn_context,
+                        step_context,
                         arguments_value,
                         metadata.openai_file_input_optional_fields.as_ref(),
                     )
@@ -918,6 +913,7 @@ async fn notify_mcp_tool_call_started(
         app_name: item_metadata.app_name,
         action_name: item_metadata.action_name,
         plugin_id: item_metadata.plugin_id,
+        read_only_hint: item_metadata.read_only_hint,
         status: McpToolCallStatus::InProgress,
         result: None,
         error: None,
@@ -962,6 +958,7 @@ async fn notify_mcp_tool_call_completed(
         app_name: item_metadata.app_name,
         action_name: item_metadata.action_name,
         plugin_id: item_metadata.plugin_id,
+        read_only_hint: item_metadata.read_only_hint,
         status,
         result,
         error,
@@ -1050,7 +1047,7 @@ impl McpToolApprovalPolicy {
 #[derive(Clone)]
 pub(crate) struct McpToolApprovalMetadata {
     annotations: Option<ToolAnnotations>,
-    connector_id: Option<String>,
+    pub(crate) connector_id: Option<String>,
     link_id: Option<String>,
     connector_name: Option<String>,
     connector_description: Option<String>,
@@ -1068,6 +1065,7 @@ impl Session {
         &self,
         turn_context: &TurnContext,
         call_id: &str,
+        invocation: &McpInvocation,
         metadata: McpToolApprovalMetadata,
     ) {
         let Some(turn_state) = self
@@ -1077,17 +1075,18 @@ impl Session {
         else {
             return;
         };
-        turn_state
-            .lock()
-            .await
-            .insert_mcp_tool_approval_metadata(call_id.to_string(), metadata);
+        turn_state.lock().await.insert_mcp_tool_approval_metadata(
+            call_id.to_string(),
+            (invocation.server == CODEX_APPS_MCP_SERVER_NAME).then(|| invocation.clone()),
+            metadata,
+        );
     }
 
     pub(crate) async fn mcp_tool_approval_metadata(
         &self,
         sub_id: &str,
         call_id: &str,
-    ) -> Option<McpToolApprovalMetadata> {
+    ) -> Option<(Option<McpInvocation>, McpToolApprovalMetadata)> {
         let turn_state = self
             .input_queue
             .turn_state_for_sub_id(&self.active_turn, sub_id)
@@ -1162,6 +1161,10 @@ fn build_mcp_tool_call_request_meta(
     metadata: Option<&McpToolApprovalMetadata>,
 ) -> Option<serde_json::Value> {
     let mut request_meta = serde_json::Map::new();
+    request_meta.insert(
+        "callId".to_string(),
+        serde_json::Value::String(call_id.to_string()),
+    );
 
     if let Some(turn_metadata) = turn_context
         .turn_metadata_state
@@ -1290,6 +1293,7 @@ async fn maybe_request_mcp_tool_approval(
     let approvals_reviewer = connectors::mcp_approvals_reviewer_from_layers(
         &config.config_layer_stack,
         config.approvals_reviewer,
+        Some(turn_context.model_info.slug.as_str()),
         &invocation.server,
         metadata.connector_id.as_deref(),
     );
@@ -1359,10 +1363,10 @@ async fn maybe_request_mcp_tool_approval(
         let review_id = new_guardian_review_id();
         let decision = review_approval_request(
             sess,
-            turn_context,
+            step_context,
             review_id.clone(),
             build_guardian_mcp_tool_review_request(call_id, invocation, Some(metadata)),
-            /*retry_reason*/ None,
+            Default::default(),
         )
         .await;
         let decision = mcp_tool_approval_decision_from_guardian(decision);
@@ -1432,6 +1436,7 @@ async fn maybe_request_mcp_tool_approval(
 
     let args = RequestUserInputArgs {
         questions: vec![question],
+        is_blocking: true,
         auto_resolution_ms: None,
     };
     let response = sess
@@ -1451,6 +1456,7 @@ pub(crate) fn mcp_approvals_reviewer(
 ) -> ApprovalsReviewer {
     connectors::mcp_approvals_reviewer(
         turn_context.config.as_ref(),
+        Some(turn_context.model_info.slug.as_str()),
         server_name,
         metadata.and_then(|metadata| metadata.connector_id.as_deref()),
     )
@@ -1850,6 +1856,7 @@ fn parse_mcp_tool_approval_elicitation_response(
         }
         ElicitationAction::Decline => McpToolApprovalDecision::Decline { message: None },
         ElicitationAction::Cancel => McpToolApprovalDecision::Cancel,
+        _ => McpToolApprovalDecision::Cancel,
     }
 }
 
@@ -2135,7 +2142,6 @@ fn project_mcp_tool_approval_config_folder(
     config
         .config_layer_stack
         .layers_high_to_low()
-        .into_iter()
         .find_map(|layer| {
             if !matches!(layer.name, ConfigLayerSource::Project { .. }) {
                 return None;

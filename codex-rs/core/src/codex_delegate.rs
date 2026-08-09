@@ -36,6 +36,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
+use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::guardian::GuardianApprovalRequest;
 use crate::guardian::GuardianReviewOptions;
 use crate::guardian::new_guardian_review_id;
@@ -84,6 +85,7 @@ pub(crate) async fn run_codex_thread_interactive(
     models_manager: SharedModelsManager,
     parent_session: Arc<Session>,
     parent_ctx: Arc<TurnContext>,
+    parent_environments: TurnEnvironmentSnapshot,
     cancel_token: CancellationToken,
     subagent_source: SubAgentSource,
     initial_history: Option<InitialHistory>,
@@ -126,16 +128,13 @@ pub(crate) async fn run_codex_thread_interactive(
         dynamic_tools: Vec::new(),
         metrics_service_name: None,
         user_shell_override: None,
-        inherited_environments: Some(parent_ctx.environments.clone()),
+        inherited_environments: Some(parent_environments.clone()),
         inherited_exec_policy: Some(Arc::clone(&parent_session.services.exec_policy)),
         parent_rollout_thread_trace: codex_rollout_trace::ThreadTraceContext::disabled(),
         parent_trace: None,
-        environment_selections: parent_ctx.environments.to_selections(),
+        environment_selections: parent_environments.to_selections(),
         thread_extension_init: codex_extension_api::ExtensionDataInit::default(),
-        supports_openai_form_elicitation: parent_session
-            .services
-            .supports_openai_form_elicitation
-            .load(std::sync::atomic::Ordering::Relaxed),
+        client_mcp_extensions: parent_session.services.client_mcp_extensions.clone(),
         analytics_events_client: Some(parent_session.services.analytics_events_client.clone()),
         thread_store: Arc::clone(&parent_session.services.thread_store),
         attestation_provider: parent_session.services.attestation_provider.clone(),
@@ -218,12 +217,15 @@ pub(crate) async fn run_codex_thread_one_shot(
     // Use a child token so we can stop the delegate after completion without
     // requiring the caller to cancel the parent token.
     let child_cancel = cancel_token.child_token();
+    let parent_turn_id = parent_ctx.sub_id.clone();
+    let parent_environments = parent_ctx.environments.clone();
     let (session, io) = Box::pin(run_codex_thread_interactive(
         config,
         auth_manager,
         models_manager,
         parent_session,
         parent_ctx,
+        parent_environments,
         child_cancel.clone(),
         subagent_source,
         initial_history,
@@ -233,13 +235,17 @@ pub(crate) async fn run_codex_thread_one_shot(
     .await?;
 
     // Send the initial input to kick off the one-shot turn.
-    io.submit(Op::UserInput {
-        items: input,
-        final_output_json_schema,
-        responsesapi_client_metadata: None,
-        additional_context: Default::default(),
-        thread_settings: Default::default(),
-    })
+    io.submit_with_trace(
+        Op::UserInput {
+            items: input,
+            final_output_json_schema,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        },
+        /*trace*/ None,
+        Some(parent_turn_id),
+    )
     .await?;
 
     // Bridge events so we can observe completion and shut down automatically.
@@ -262,6 +268,7 @@ pub(crate) async fn run_codex_thread_one_shot(
                         op: Op::Shutdown {},
                         client_user_message_id: None,
                         trace: None,
+                        parent_turn_id: None,
                     })
                     .await;
                 child_cancel.cancel();
@@ -385,7 +392,8 @@ async fn forward_events(
                         // runtime after a refresh.
                         let metadata = session
                             .mcp_tool_approval_metadata(&id, &event.call_id)
-                            .await;
+                            .await
+                            .map(|(_, metadata)| metadata);
                         pending_mcp_invocations
                             .lock()
                             .await
@@ -719,6 +727,7 @@ async fn handle_request_user_input(
 
     let args = RequestUserInputArgs {
         questions: event.questions,
+        is_blocking: event.is_blocking,
         auto_resolution_ms: event.auto_resolution_ms,
     };
     let response_fut =

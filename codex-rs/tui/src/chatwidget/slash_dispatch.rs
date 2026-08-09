@@ -132,10 +132,16 @@ impl ChatWidget {
     }
 
     fn slash_command_blocked_by_active_task(&self, cmd: SlashCommand) -> bool {
-        (!cmd.available_during_task() && self.bottom_pane.is_task_running())
+        (!cmd.available_during_task()
+            && (self.turn_lifecycle.agent_turn_running
+                || self.review.is_review_mode
+                || (self.bottom_pane.is_task_running()
+                    && (self.mcp_startup_status.is_none()
+                        || self.input_queue.user_turn_pending_start))))
             || (cmd == SlashCommand::Resume
                 && (self.input_queue.user_turn_pending_start
                     || self.turn_lifecycle.agent_turn_running))
+            || (cmd == SlashCommand::Export && self.input_queue.suppress_queue_autosend)
     }
 
     pub(super) fn dispatch_command(&mut self, cmd: SlashCommand) {
@@ -237,7 +243,8 @@ impl ChatWidget {
                 self.app_event_tx.send(AppEvent::OpenResumePicker);
             }
             SlashCommand::Fork => {
-                self.app_event_tx.send(AppEvent::ForkCurrentSession);
+                self.app_event_tx
+                    .send(AppEvent::ForkCurrentSession { name: None });
             }
             SlashCommand::App => {
                 let Some(thread_id) = self.thread_id else {
@@ -262,10 +269,14 @@ impl ChatWidget {
                 if !self.bottom_pane.is_task_running() {
                     self.bottom_pane.set_task_running(/*running*/ true);
                 }
+                self.input_queue.user_turn_pending_start = true;
                 self.app_event_tx.compact();
             }
             SlashCommand::Review => {
                 self.open_review_popup();
+                if self.mcp_startup_status.is_some() {
+                    self.defer_input_until_settings_applied();
+                }
             }
             SlashCommand::Rename => {
                 self.session_telemetry
@@ -388,6 +399,9 @@ impl ChatWidget {
             }
             SlashCommand::Copy => {
                 self.copy_last_agent_markdown();
+            }
+            SlashCommand::Export => {
+                self.show_transcript_export_popup();
             }
             SlashCommand::Raw => {
                 let enabled = self.toggle_raw_output_mode_and_notify();
@@ -671,6 +685,15 @@ impl ChatWidget {
         } = prepared;
         let trimmed = args.trim();
         match cmd {
+            SlashCommand::Export if trimmed.is_empty() => self.show_transcript_export_popup(),
+            SlashCommand::Export => {
+                self.set_queue_autosend_suppressed(/*suppressed*/ true);
+                self.app_event_tx.send(AppEvent::ExportTranscript {
+                    destination: crate::app_event::TranscriptExportDestination::File(
+                        PathBuf::from(trimmed),
+                    ),
+                });
+            }
             SlashCommand::Usage => {
                 if self.ensure_usage_command_available() {
                     match tokens::TokenActivityView::parse(trimmed) {
@@ -732,6 +755,11 @@ impl ChatWidget {
             }
             SlashCommand::Clear if !trimmed.is_empty() => {
                 self.app_event_tx.send(AppEvent::ClearUi {
+                    name: Some(trimmed.to_string()),
+                });
+            }
+            SlashCommand::Fork if !trimmed.is_empty() => {
+                self.app_event_tx.send(AppEvent::ForkCurrentSession {
                     name: Some(trimmed.to_string()),
                 });
             }
@@ -1075,6 +1103,7 @@ impl ChatWidget {
             | SlashCommand::Rename
             | SlashCommand::TestApproval => QueueDrain::Continue,
             SlashCommand::Feedback
+            | SlashCommand::Export
             | SlashCommand::New
             | SlashCommand::Archive
             | SlashCommand::Delete

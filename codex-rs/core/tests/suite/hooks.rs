@@ -32,6 +32,7 @@ use codex_protocol::user_input::UserInput;
 use codex_thread_store::InMemoryThreadStore;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use core_test_support::TestTargetOs;
+use core_test_support::fs_wait;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::hooks::trust_hooks;
 use core_test_support::managed_network_requirements_loader;
@@ -304,6 +305,55 @@ if payload.get("prompt") == {blocked_prompt_json}:
 
     fs::write(&script_path, script).context("write user prompt submit hook script")?;
     fs::write(home.join("hooks.json"), hooks.to_string()).context("write hooks.json")?;
+    Ok(())
+}
+
+fn write_async_user_prompt_submit_hook(home: &Path, gated: bool) -> Result<()> {
+    let script_path = home.join("async_user_prompt_submit_hook.py");
+    let started_path = home.join("async_user_prompt_submit_started");
+    let finished_path = home.join("async_user_prompt_submit_finished");
+    let release_path = home.join("async_user_prompt_submit_release");
+    let script = format!(
+        r#"import json
+from pathlib import Path
+import sys
+import time
+
+prompt = json.load(sys.stdin).get("prompt")
+Path(r"{started_path}").write_text(prompt, encoding="utf-8")
+while {gated} and not Path(r"{release_path}").exists():
+    time.sleep(0.01)
+print(json.dumps({{
+    "continue": False,
+    "decision": "block",
+    "reason": "an async hook cannot block its launching operation",
+    "systemMessage": f"async warning for {{prompt}}",
+    "hookSpecificOutput": {{
+        "hookEventName": "UserPromptSubmit",
+        "additionalContext": f"async context for {{prompt}}"
+    }}
+}}), flush=True)
+Path(r"{finished_path}").write_text(prompt, encoding="utf-8")
+"#,
+        started_path = started_path.display(),
+        finished_path = finished_path.display(),
+        release_path = release_path.display(),
+        gated = if gated { "True" } else { "False" },
+    );
+    let hooks = serde_json::json!({
+        "hooks": {
+            "UserPromptSubmit": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("python3 {}", script_path.display()),
+                    "async": true,
+                }]
+            }]
+        }
+    });
+
+    fs::write(&script_path, script).context("write async user prompt submit hook script")?;
+    fs::write(home.join("hooks.json"), hooks.to_string()).context("write async hooks.json")?;
     Ok(())
 }
 
@@ -1520,6 +1570,255 @@ async fn session_start_runs_before_user_prompt_submit_on_first_turn() -> Result<
 }
 
 #[tokio::test]
+async fn async_hook_context_is_injected_into_the_active_turn() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let gate = TempDir::new()?;
+    let release_path = gate.path().join("release");
+    let call_id = "async-hook-context-gated-shell-command";
+    let args = serde_json::json!({
+        "command": format!(
+            r#"python3 -c 'import time; from pathlib import Path; gate = Path(r"{}"); exec("while not gate.exists(): time.sleep(0.01)")'"#,
+            release_path.display()
+        )
+    });
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_function_call(call_id, "shell_command", &serde_json::to_string(&args)?),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-1", "async context observed in this turn"),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+
+    let test = test_codex()
+        .with_pre_build_hook(|home| {
+            write_async_user_prompt_submit_hook(home, /*gated*/ false)
+                .expect("write immediate async user prompt submit hook");
+        })
+        .with_config(trust_discovered_hooks)
+        .build(&server)
+        .await?;
+
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(PermissionProfile::Disabled, test.config.cwd.as_path());
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "observe async context immediately".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                approval_policy: Some(AskForApproval::Never),
+                sandbox_policy: Some(sandbox_policy),
+                permission_profile,
+                ..Default::default()
+            },
+        })
+        .await?;
+
+    let finished_path = test
+        .codex_home_path()
+        .join("async_user_prompt_submit_finished");
+    fs_wait::wait_for_path_exists(finished_path, Duration::from_secs(5))
+        .await
+        .context("timed out waiting for the async hook to finish")?;
+    assert!(
+        timeout(
+            Duration::from_millis(150),
+            wait_for_event(&test.codex, |event| {
+                matches!(
+                    event,
+                    EventMsg::Warning(warning)
+                        if warning.message == "async warning for observe async context immediately"
+                )
+            }),
+        )
+        .await
+        .is_err(),
+        "async hook output must not interrupt the active sampling request"
+    );
+    fs::write(release_path, "ready").context("release gated shell command")?;
+    timeout(
+        Duration::from_secs(5),
+        wait_for_event(&test.codex, |event| {
+            matches!(
+                event,
+                EventMsg::Warning(warning)
+                    if warning.message == "async warning for observe async context immediately"
+            )
+        }),
+    )
+    .await
+    .context("timed out waiting for the async hook warning after sampling")?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let requests = responses.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1]
+            .message_input_texts("developer")
+            .contains(&"async context for observe async context immediately".to_string()),
+        "an async hook should steer its context into the same active turn"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn async_hook_finishing_while_idle_waits_for_the_next_turn() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_assistant_message("msg-1", "first turn completed"),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-2", "idle async context observed"),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+
+    let test = test_codex()
+        .with_pre_build_hook(|home| {
+            write_async_user_prompt_submit_hook(home, /*gated*/ true)
+                .expect("write gated async user prompt submit hook");
+        })
+        .with_config(trust_discovered_hooks)
+        .build(&server)
+        .await?;
+
+    test.submit_turn("finish before the async hook").await?;
+    let first_turn_id = responses.requests()[0].body_json()["client_metadata"]["turn_id"]
+        .as_str()
+        .context("first model request should include its turn ID")?
+        .to_string();
+    let started_path = test
+        .codex_home_path()
+        .join("async_user_prompt_submit_started");
+    fs_wait::wait_for_path_exists(started_path, Duration::from_secs(5))
+        .await
+        .context("timed out waiting for the async hook to start")?;
+
+    fs::write(
+        test.codex_home_path()
+            .join("async_user_prompt_submit_release"),
+        "ready",
+    )
+    .context("release gated async hook")?;
+
+    let finished_path = test
+        .codex_home_path()
+        .join("async_user_prompt_submit_finished");
+    fs_wait::wait_for_path_exists(finished_path, Duration::from_secs(5))
+        .await
+        .context("timed out waiting for the async hook to finish")?;
+
+    assert!(
+        timeout(Duration::from_millis(150), test.codex.next_event())
+            .await
+            .is_err(),
+        "an async hook result from the previous turn must not emit warnings or raw response items"
+    );
+
+    assert_eq!(
+        responses.requests().len(),
+        1,
+        "an async hook result from the previous turn must not start a model turn"
+    );
+
+    let next_prompt = "observe the buffered async context";
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: next_prompt.to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+
+    let mut warning_event = None;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let event = test.codex.next_event().await?;
+            if matches!(
+                &event.msg,
+                EventMsg::Warning(warning)
+                    if warning.message == "async warning for finish before the async hook"
+            ) {
+                warning_event = Some(event);
+                continue;
+            }
+            if matches!(event.msg, EventMsg::TurnComplete(_)) {
+                return Ok::<_, anyhow::Error>(());
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for the next turn to complete")??;
+
+    let requests = responses.requests();
+    assert_eq!(requests.len(), 2);
+    let second_turn_id = requests[1].body_json()["client_metadata"]["turn_id"]
+        .as_str()
+        .context("second model request should include its turn ID")?
+        .to_string();
+    assert_ne!(first_turn_id, second_turn_id);
+    assert_eq!(
+        warning_event
+            .context("buffered async hook warning should be delivered during the next turn")?
+            .id,
+        second_turn_id
+    );
+
+    let input = requests[1].input();
+    let context_index = input
+        .iter()
+        .position(|item| {
+            item.to_string()
+                .contains("async context for finish before the async hook")
+        })
+        .context("buffered async hook context should be present in the next model request")?;
+    let prompt_index = input
+        .iter()
+        .position(|item| item.to_string().contains(next_prompt))
+        .context("next user prompt should be present in the next model request")?;
+    assert!(
+        context_index < prompt_index,
+        "buffered async hook context should precede the next user prompt"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn session_start_hook_spills_large_additional_context() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -2005,12 +2304,6 @@ async fn resumed_thread_runs_resume_then_compact_session_start_hooks() -> Result
             trust_discovered_hooks(config);
         });
     let initial = builder.build(&server).await?;
-    let home = initial.home.clone();
-    let rollout_path = initial
-        .session_configured
-        .rollout_path
-        .clone()
-        .context("rollout path")?;
 
     initial.submit_turn("hello before resume").await?;
     assert_eq!(responses_mock.requests().len(), 1);
@@ -2019,7 +2312,7 @@ async fn resumed_thread_runs_resume_then_compact_session_start_hooks() -> Result
         config.model_auto_compact_token_limit = Some(limit);
         trust_discovered_hooks(config);
     });
-    let resumed = resume_builder.resume(&server, home, rollout_path).await?;
+    let resumed = resume_builder.restart(&server, &initial).await?;
     resumed.submit_turn("hello after resume").await?;
 
     let requests = responses_mock.requests();
@@ -2129,12 +2422,6 @@ async fn resumed_thread_keeps_stop_continuation_prompt_in_history() -> Result<()
         })
         .with_config(trust_discovered_hooks);
     let initial = initial_builder.build(&server).await?;
-    let home = initial.home.clone();
-    let rollout_path = initial
-        .session_configured
-        .rollout_path
-        .clone()
-        .expect("rollout path");
 
     initial.submit_turn("tell me something").await?;
 
@@ -2151,7 +2438,7 @@ async fn resumed_thread_keeps_stop_continuation_prompt_in_history() -> Result<()
     .await;
 
     let mut resume_builder = test_codex().with_config(trust_discovered_hooks);
-    let resumed = resume_builder.resume(&server, home, rollout_path).await?;
+    let resumed = resume_builder.restart(&server, &initial).await?;
 
     resumed.submit_turn("and now continue").await?;
 
@@ -2603,7 +2890,8 @@ async fn permission_request_hook_allow_bypasses_strict_auto_review() -> Result<(
                 .enable(Feature::RequestPermissionsTool)
                 .expect("test config should allow feature update");
         });
-    let test = builder.build_with_auto_env(&server).await?;
+    // Command hooks currently need a local executor even when the tool executor is remote.
+    let test = builder.build_with_remote_and_local_env(&server).await?;
 
     let marker = test
         .executor_environment()
@@ -2996,8 +3284,9 @@ async fn pre_tool_use_blocks_shell_command_before_execution() -> Result<()> {
 
     let server = start_mock_server().await;
     let call_id = "pretooluse-shell-command";
-    let marker = std::env::temp_dir().join("pretooluse-shell-command-marker");
-    let command = format!("printf blocked > {}", marker.display());
+    let marker_dir = TempDir::new()?;
+    let marker = marker_dir.path().join("pretooluse-shell-command-marker");
+    let command = format!("git init --quiet {}", marker.display());
     let args = serde_json::json!({ "command": command });
     let responses = mount_sse_sequence(
         &server,
@@ -3028,10 +3317,6 @@ async fn pre_tool_use_blocks_shell_command_before_execution() -> Result<()> {
         .with_config(trust_discovered_hooks);
     let test = builder.build(&server).await?;
 
-    if marker.exists() {
-        fs::remove_file(&marker).context("remove leftover pre tool use marker")?;
-    }
-
     test.submit_turn_with_permission_profile(
         "run the blocked shell command",
         PermissionProfile::Disabled,
@@ -3054,8 +3339,8 @@ async fn pre_tool_use_blocks_shell_command_before_execution() -> Result<()> {
         "blocked tool output should surface the blocked command",
     );
     assert!(
-        !marker.exists(),
-        "blocked command should not create marker file"
+        !marker.join(".git").is_dir(),
+        "blocked command should not initialize the marker repository"
     );
 
     let hook_inputs = read_pre_tool_use_hook_inputs(test.codex_home_path())?;
@@ -3219,6 +3504,169 @@ async fn blocked_pre_tool_use_records_additional_context_for_shell_command() -> 
     Ok(())
 }
 
+#[tokio::test]
+async fn async_pre_tool_use_cannot_block_or_rewrite_and_still_records_additional_context()
+-> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let gate = TempDir::new()?;
+    let release_path = gate.path().join("release");
+    let hook_finished_path = gate.path().join("hook-finished");
+    let hook_finished_path_for_fixture = hook_finished_path.clone();
+    let original_marker = gate.path().join("original");
+    let rewritten_marker = gate.path().join("rewritten");
+    let call_id = "async-pretooluse-shell-command";
+    let original_command = format!(
+        r#"python3 -c 'import time; from pathlib import Path; gate = Path(r"{}"); exec("while not gate.exists(): time.sleep(0.01)"); Path(r"{}").write_text("original"); print("original-output")'"#,
+        release_path.display(),
+        original_marker.display()
+    );
+    let args = serde_json::json!({ "command": original_command });
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_function_call(call_id, "shell_command", &serde_json::to_string(&args)?),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-1", "async pre-tool hook context observed"),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+
+    let pre_context = "async pre-tool hook cannot block its launching command";
+    let updated_input = serde_json::json!({
+        "command": format!("printf rewritten > {}", rewritten_marker.display())
+    });
+    let test = test_codex()
+        .with_pre_build_hook(move |home| {
+            let denying_script = home.join("async_deny_pre_tool_use_hook.py");
+            fs::write(
+                &denying_script,
+                format!(
+                    r#"import json, sys
+from pathlib import Path
+json.load(sys.stdin)
+print(json.dumps({{
+    "systemMessage": "{pre_context}",
+    "hookSpecificOutput": {{
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": "{pre_context}",
+        "additionalContext": "{pre_context}"
+    }}
+}}), flush=True)
+Path(r"{hook_finished_path}").write_text("finished", encoding="utf-8")
+"#,
+                    hook_finished_path = hook_finished_path_for_fixture.display(),
+                ),
+            )
+            .expect("write async denying pre-tool hook fixture");
+            write_updating_pre_tool_use_hook(home, "^Bash$", &updated_input)
+                .expect("write async rewriting pre-tool hook fixture");
+
+            let hooks_path = home.join("hooks.json");
+            let mut hooks: Value = serde_json::from_slice(
+                &fs::read(&hooks_path).expect("read async pre-tool hook config"),
+            )
+            .expect("parse async pre-tool hook config");
+            let handlers = hooks["hooks"]["PreToolUse"][0]["hooks"]
+                .as_array_mut()
+                .expect("pre-tool hook handlers");
+            handlers[0]["async"] = Value::Bool(true);
+            handlers.push(serde_json::json!({
+                "type": "command",
+                "command": format!("python3 {}", denying_script.display()),
+                "async": true,
+            }));
+            fs::write(hooks_path, hooks.to_string()).expect("write async pre-tool hook config");
+        })
+        .with_config(trust_discovered_hooks)
+        .build(&server)
+        .await?;
+
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(PermissionProfile::Disabled, test.config.cwd.as_path());
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "run the original command with async pre-tool hooks".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                approval_policy: Some(AskForApproval::Never),
+                sandbox_policy: Some(sandbox_policy),
+                permission_profile,
+                ..Default::default()
+            },
+        })
+        .await?;
+
+    fs_wait::wait_for_path_exists(hook_finished_path, Duration::from_secs(5))
+        .await
+        .context("timed out waiting for the async pre-tool hook to finish")?;
+    assert!(
+        timeout(
+            Duration::from_millis(150),
+            wait_for_event(
+                &test.codex,
+                |event| matches!(event, EventMsg::Warning(warning) if warning.message == pre_context),
+            ),
+        )
+        .await
+        .is_err(),
+        "async pre-tool output must not interrupt the launching command"
+    );
+    fs::write(release_path, "ready").context("release original shell command")?;
+    timeout(
+        Duration::from_secs(5),
+        wait_for_event(
+            &test.codex,
+            |event| matches!(event, EventMsg::Warning(warning) if warning.message == pre_context),
+        ),
+    )
+    .await
+    .context("timed out waiting for the async pre-tool warning after sampling")?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let requests = responses.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1]
+            .message_input_texts("developer")
+            .contains(&pre_context.to_string()),
+        "async pre-tool hook context should reach the follow-up model request",
+    );
+    let output_item = requests[1].function_call_output(call_id);
+    let output = output_item
+        .get("output")
+        .and_then(Value::as_str)
+        .expect("shell command output string");
+    assert!(
+        output.contains("original-output"),
+        "async pre-tool hooks should not block the original command",
+    );
+    assert!(original_marker.exists(), "original command should execute");
+    assert!(
+        !rewritten_marker.exists(),
+        "async pre-tool hooks should not rewrite the original command",
+    );
+
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum BashRewriteSurface {
     ExecCommand,
@@ -3251,7 +3699,7 @@ impl BashRewriteSurface {
     fn original_command(self, marker: &Path) -> String {
         match self {
             BashRewriteSurface::ExecCommand | BashRewriteSurface::ShellCommand => {
-                format!("printf original > {}", marker.display())
+                format!("git init --quiet {}", marker.display())
             }
         }
     }
@@ -3259,7 +3707,7 @@ impl BashRewriteSurface {
     fn rewritten_command(self, marker: &Path) -> String {
         match self {
             BashRewriteSurface::ExecCommand | BashRewriteSurface::ShellCommand => {
-                format!("printf rewritten > {}", marker.display())
+                format!("git init {}", marker.display())
             }
         }
     }
@@ -3282,8 +3730,9 @@ async fn assert_pre_tool_use_rewrites_bash_surface(surface: BashRewriteSurface) 
     let server = start_mock_server().await;
     let slug = surface.slug();
     let call_id = format!("pretooluse-{slug}-rewrite");
-    let original_marker = std::env::temp_dir().join(format!("pretooluse-{slug}-original-marker"));
-    let rewritten_marker = std::env::temp_dir().join(format!("pretooluse-{slug}-rewritten-marker"));
+    let marker_dir = TempDir::new()?;
+    let original_marker = marker_dir.path().join("original");
+    let rewritten_marker = marker_dir.path().join("rewritten");
     let original_command = surface.original_command(&original_marker);
     let rewritten_command = surface.rewritten_command(&rewritten_marker);
     let responses = mount_sse_sequence(
@@ -3312,13 +3761,6 @@ async fn assert_pre_tool_use_rewrites_bash_surface(surface: BashRewriteSurface) 
         .with_config(move |config| surface.configure(config));
     let test = builder.build(&server).await?;
 
-    if original_marker.exists() {
-        fs::remove_file(&original_marker).context("remove stale original pre tool marker")?;
-    }
-    if rewritten_marker.exists() {
-        fs::remove_file(&rewritten_marker).context("remove stale rewritten pre tool marker")?;
-    }
-
     test.submit_turn_with_permission_profile(
         &format!("run the rewritten {slug} command"),
         PermissionProfile::Disabled,
@@ -3329,12 +3771,12 @@ async fn assert_pre_tool_use_rewrites_bash_surface(surface: BashRewriteSurface) 
     assert_eq!(requests.len(), 2);
     requests[1].function_call_output(&call_id);
     assert!(
-        !original_marker.exists(),
+        !original_marker.join(".git").is_dir(),
         "original {slug} command should not execute after rewrite"
     );
-    assert_eq!(
-        fs::read_to_string(&rewritten_marker).context("read rewritten pre tool marker")?,
-        "rewritten"
+    assert!(
+        rewritten_marker.join(".git").is_dir(),
+        "rewritten {slug} command should initialize the marker repository"
     );
 
     let hook_inputs = read_pre_tool_use_hook_inputs(test.codex_home_path())?;
@@ -3364,13 +3806,10 @@ async fn pre_tool_use_rewrites_code_mode_nested_exec_command_before_execution() 
     let original_marker = marker_dir.path().join("original");
     let rewritten_marker = marker_dir.path().join("rewritten");
     let original_command = format!(
-        "printf original > {}; printf original-result",
+        "git init --quiet {}; git version",
         original_marker.display()
     );
-    let rewritten_command = format!(
-        "printf rewritten > {}; printf rewritten-result",
-        rewritten_marker.display()
-    );
+    let rewritten_command = format!("git init {}; git version", rewritten_marker.display());
     let original_command_json =
         serde_json::to_string(&original_command).context("serialize original command")?;
     let code = format!(
@@ -3420,21 +3859,16 @@ text(output.output);
     let output_item = requests[1].custom_tool_call_output(call_id);
     let output = code_mode_custom_tool_output_text(&output_item);
     assert!(
-        output.contains("rewritten-result"),
+        output.contains("git version"),
         "code mode should receive the rewritten command result"
     );
     assert!(
-        !output.contains("original-result"),
-        "code mode should not receive the original command result"
-    );
-    assert!(
-        !original_marker.exists(),
+        !original_marker.join(".git").is_dir(),
         "original nested shell command should not execute after rewrite"
     );
-    assert_eq!(
-        fs::read_to_string(&rewritten_marker)
-            .context("read rewritten code mode pre tool marker")?,
-        "rewritten"
+    assert!(
+        rewritten_marker.join(".git").is_dir(),
+        "rewritten nested command should initialize the marker repository"
     );
 
     let hook_inputs = read_pre_tool_use_hook_inputs(test.codex_home_path())?;

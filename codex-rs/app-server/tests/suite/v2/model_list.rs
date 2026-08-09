@@ -16,6 +16,7 @@ use codex_app_server_protocol::ModelUpgradeInfo;
 use codex_app_server_protocol::ReasoningEffortOption;
 use codex_app_server_protocol::RequestId;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_protocol::openai_models::MODEL_SPECIALTY_CYBER;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelsResponse;
@@ -43,6 +44,7 @@ fn model_from_preset(preset: &ModelPreset) -> Model {
         availability_nux: preset.availability_nux.clone().map(Into::into),
         display_name: preset.display_name.clone(),
         description: preset.description.clone(),
+        model_specialty: preset.model_specialty.clone(),
         hidden: !preset.show_in_picker,
         supported_reasoning_efforts: preset
             .supported_reasoning_efforts
@@ -59,6 +61,7 @@ fn model_from_preset(preset: &ModelPreset) -> Model {
         // cache report `supports_personality = false`.
         // todo(sayan): fix, maybe make roundtrip use ModelInfo only
         supports_personality: false,
+        multi_agent_version: preset.multi_agent_version.map(Into::into),
         additional_speed_tiers: preset.additional_speed_tiers.clone(),
         service_tiers: preset
             .service_tiers
@@ -156,6 +159,7 @@ async fn list_models_uses_chatgpt_remote_catalog_as_source_of_truth() -> Result<
         "slug": "chatgpt-remote-only",
         "display_name": "ChatGPT Remote Only",
         "description": "Remote-only model for app-server model/list coverage",
+        "model_specialty": MODEL_SPECIALTY_CYBER,
         "default_reasoning_level": "max",
         "supported_reasoning_levels": [
             {"effort": "max", "description": "Maximum"},
@@ -168,13 +172,13 @@ async fn list_models_uses_chatgpt_remote_catalog_as_source_of_truth() -> Result<
         "supported_in_api": true,
         "priority": 0,
         "upgrade": null,
-        "base_instructions": "base instructions",
         "support_verbosity": false,
         "default_verbosity": null,
         "apply_patch_tool_type": null,
         "truncation_policy": {"mode": "bytes", "limit": 10_000},
         "supports_parallel_tool_calls": false,
         "supports_image_detail_original": false,
+        "multi_agent_version": "v2",
         "context_window": 272_000,
         "max_context_window": 272_000,
         "experimental_supported_tools": [],

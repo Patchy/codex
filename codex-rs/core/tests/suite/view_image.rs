@@ -7,6 +7,7 @@ use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_exec_server::REMOTE_ENVIRONMENT_ID;
 use codex_exec_server::RemoveOptions;
+use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::models::PermissionProfile;
@@ -66,6 +67,19 @@ use wiremock::MockServer;
 
 const VIEW_IMAGE_TURN_COMPLETE_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(Clone, Copy)]
+enum ResizeNoticeExpectation {
+    Disabled,
+    Enabled,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ImageBudgetPolicy {
+    DetailBased,
+    Unified,
+    UnifiedResponsesLiteWithoutOriginalSupport,
+}
+
 fn disabled_user_turn(test: &TestCodex, items: Vec<UserInput>, model: String) -> Op {
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::Disabled, test.config.cwd.as_path());
@@ -116,6 +130,29 @@ fn image_messages(body: &Value) -> Vec<&Value> {
 
 fn find_image_message(body: &Value) -> Option<&Value> {
     image_messages(body).into_iter().next()
+}
+
+fn message_has_text_with_prefix(item: &Value, prefix: &str) -> bool {
+    item.get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|content| {
+            content.iter().any(|span| {
+                span.get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.starts_with(prefix))
+            })
+        })
+}
+
+fn assert_developer_text_message(item: &Value, expected_text: &str) {
+    assert_eq!(item.get("role").and_then(Value::as_str), Some("developer"));
+    assert_eq!(
+        item.get("content").and_then(Value::as_array),
+        Some(&vec![json!({
+            "type": "input_text",
+            "text": expected_text,
+        })])
+    );
 }
 
 fn png_bytes(width: u32, height: u32, rgba: [u8; 4]) -> anyhow::Result<Vec<u8>> {
@@ -174,10 +211,27 @@ async fn write_workspace_png(
 async fn assert_user_turn_local_image_resizes_to(
     original_dimensions: (u32, u32),
     expected_dimensions: (u32, u32),
+    image_budget_policy: ImageBudgetPolicy,
+    resize_notice_expectation: ResizeNoticeExpectation,
 ) -> anyhow::Result<()> {
     let server = start_mock_server().await;
 
-    let mut builder = test_codex();
+    let builder = match image_budget_policy {
+        ImageBudgetPolicy::DetailBased | ImageBudgetPolicy::Unified => test_codex(),
+        ImageBudgetPolicy::UnifiedResponsesLiteWithoutOriginalSupport => test_codex()
+            .with_model_info_override("gpt-5.4", |model_info| {
+                model_info.supports_image_detail_original = false;
+                model_info.use_responses_lite = true;
+            }),
+    };
+    let mut builder = builder.with_config(move |config| {
+        if image_budget_policy != ImageBudgetPolicy::DetailBased {
+            let _ = config.features.enable(Feature::UnifiedImageBudget);
+        }
+        if matches!(resize_notice_expectation, ResizeNoticeExpectation::Enabled) {
+            let _ = config.features.enable(Feature::ImageResizeNotice);
+        }
+    });
     let test = builder.build_with_auto_env(&server).await?;
     let TestCodex {
         codex,
@@ -220,8 +274,42 @@ async fn assert_user_turn_local_image_resizes_to(
     .await;
 
     let body = mock.single_request().body_json();
+    let input = body
+        .get("input")
+        .and_then(Value::as_array)
+        .context("request input")?;
     let image_message =
         find_image_message(&body).context("pending input image message not included in request")?;
+    let image_message_index = input
+        .iter()
+        .position(|item| std::ptr::eq(item, image_message))
+        .context("image message index")?;
+    let resize_notice_indices = input
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            message_has_text_with_prefix(item, "<image_resize_notice>").then_some(index)
+        })
+        .collect::<Vec<_>>();
+    match resize_notice_expectation {
+        ResizeNoticeExpectation::Disabled => {
+            assert_eq!(resize_notice_indices, Vec::<usize>::new());
+        }
+        ResizeNoticeExpectation::Enabled => {
+            assert_eq!(resize_notice_indices, vec![image_message_index + 1]);
+            assert_developer_text_message(
+                &input[image_message_index + 1],
+                &format!(
+                    concat!(
+                        "<image_resize_notice>\n",
+                        "Image 1 of 1 in the preceding user message was resized from {}x{} to {}x{} pixels.\n",
+                        "</image_resize_notice>"
+                    ),
+                    original_width, original_height, expected_dimensions.0, expected_dimensions.1
+                ),
+            );
+        }
+    }
     let image_url = image_message
         .get("content")
         .and_then(Value::as_array)
@@ -255,21 +343,74 @@ async fn assert_user_turn_local_image_resizes_to(
 async fn user_turn_with_local_image_attaches_image() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
-    assert_user_turn_local_image_resizes_to((2304, 864), (2048, 768)).await
+    assert_user_turn_local_image_resizes_to(
+        (2304, 864),
+        (2048, 768),
+        ImageBudgetPolicy::DetailBased,
+        ResizeNoticeExpectation::Disabled,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_turn_with_vertical_local_image_resizes_to_square_bounds() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
-    assert_user_turn_local_image_resizes_to((1024, 4096), (512, 2048)).await
+    assert_user_turn_local_image_resizes_to(
+        (1024, 4096),
+        (512, 2048),
+        ImageBudgetPolicy::DetailBased,
+        ResizeNoticeExpectation::Disabled,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn user_turn_local_image_applies_patch_budget() -> anyhow::Result<()> {
+async fn user_turn_local_image_applies_patch_budget_and_reports_resize() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
-    assert_user_turn_local_image_resizes_to((2048, 2048), (1600, 1600)).await
+    assert_user_turn_local_image_resizes_to(
+        (2048, 2048),
+        (1600, 1600),
+        ImageBudgetPolicy::DetailBased,
+        ResizeNoticeExpectation::Enabled,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_turn_unified_image_budget_enforces_dimension_and_patch_limits() -> anyhow::Result<()>
+{
+    skip_if_no_network!(Ok(()));
+
+    for (source_dimensions, expected_dimensions, resize_notice_expectation) in [
+        ((6401, 100), (6000, 94), ResizeNoticeExpectation::Disabled),
+        ((3201, 3201), (3200, 3200), ResizeNoticeExpectation::Enabled),
+    ] {
+        assert_user_turn_local_image_resizes_to(
+            source_dimensions,
+            expected_dimensions,
+            ImageBudgetPolicy::Unified,
+            resize_notice_expectation,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_turn_unified_image_budget_supports_responses_lite_without_original_detail()
+-> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    assert_user_turn_local_image_resizes_to(
+        (2304, 864),
+        (2304, 864),
+        ImageBudgetPolicy::UnifiedResponsesLiteWithoutOriginalSupport,
+        ResizeNoticeExpectation::Disabled,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -277,7 +418,9 @@ async fn view_image_tool_attaches_local_image() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        let _ = config.features.enable(Feature::ImageResizeNotice);
+    });
     let test = builder.build_with_auto_env(&server).await?;
     let TestCodex {
         codex,
@@ -394,12 +537,31 @@ async fn view_image_tool_attaches_local_image() -> anyhow::Result<()> {
     assert_eq!(
         output_items.len(),
         1,
-        "view_image should return only the image content item (no tag/label text)"
+        "view_image tool output should remain unchanged apart from image preparation"
     );
     assert_eq!(
         output_items[0].get("type").and_then(Value::as_str),
         Some("input_image"),
-        "view_image should return only an input_image content item"
+        "view_image should return only its input_image content item"
+    );
+    let input = body
+        .get("input")
+        .and_then(Value::as_array)
+        .expect("request input");
+    let function_output_index = input
+        .iter()
+        .position(|item| {
+            item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                && item.get("call_id").and_then(Value::as_str) == Some(call_id)
+        })
+        .expect("function call output index");
+    assert_developer_text_message(
+        &input[function_output_index + 1],
+        concat!(
+            "<image_resize_notice>\n",
+            "Image 1 of 1 in the preceding tool output was resized from 2304x864 to 2048x768 pixels.\n",
+            "</image_resize_notice>"
+        ),
     );
     let image_url = output_items[0]
         .get("image_url")
@@ -763,6 +925,82 @@ async fn view_image_tool_can_preserve_original_resolution_when_requested_on_gpt5
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn view_image_unified_budget_hides_detail_but_accepts_legacy_hints() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
+        let _ = config.features.enable(Feature::UnifiedImageBudget);
+    });
+    let test = builder.build_with_auto_env(&server).await?;
+    let rel_path = "assets/unified-example.png";
+    write_workspace_png(
+        &test,
+        rel_path,
+        /*width*/ 2304,
+        /*height*/ 864,
+        [0u8, 80, 255, 255],
+    )
+    .await?;
+
+    let call_id = "view-image-unified";
+    let first_mock = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_function_call(
+                call_id,
+                "view_image",
+                &serde_json::json!({ "path": rel_path, "detail": "high" }).to_string(),
+            ),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let second_mock = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+
+    test.submit_turn("show the screenshot").await?;
+
+    let first_request = first_mock.single_request().body_json();
+    let view_image_tool = first_request["tools"]
+        .as_array()
+        .and_then(|tools| tools.iter().find(|tool| tool["name"] == "view_image"))
+        .context("view_image tool should be available")?;
+    assert!(
+        view_image_tool["parameters"]["properties"]
+            .get("detail")
+            .is_none(),
+        "the unified image budget should not advertise detail"
+    );
+
+    let request = second_mock.single_request();
+    let output = request.function_call_output(call_id);
+    let output_items = output["output"]
+        .as_array()
+        .context("view_image should return image content")?;
+    assert_eq!(output_items.len(), 1);
+    assert_eq!(output_items[0]["detail"], "original");
+
+    let image_url = output_items[0]["image_url"]
+        .as_str()
+        .context("view_image output should include image_url")?;
+    let (_, payload) = image_url
+        .split_once(',')
+        .context("view_image image_url should include a base64 payload")?;
+    let image = load_from_memory(&BASE64_STANDARD.decode(payload)?)?;
+    assert_eq!(image.dimensions(), (2304, 864));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn view_image_tool_errors_clearly_for_unsupported_detail_values() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -934,8 +1172,27 @@ async fn view_image_tool_treats_null_detail_as_omitted() -> anyhow::Result<()> {
 async fn view_image_tool_resizes_when_model_lacks_original_detail_support() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
+    assert_view_image_tool_resizes_without_original_support(ImageBudgetPolicy::DetailBased).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn view_image_unified_budget_stays_disabled_for_unsupported_model() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    assert_view_image_tool_resizes_without_original_support(ImageBudgetPolicy::Unified).await
+}
+
+async fn assert_view_image_tool_resizes_without_original_support(
+    image_budget_policy: ImageBudgetPolicy,
+) -> anyhow::Result<()> {
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5.2");
+    let mut builder = test_codex()
+        .with_model("gpt-5.2")
+        .with_config(move |config| {
+            if image_budget_policy == ImageBudgetPolicy::Unified {
+                let _ = config.features.enable(Feature::UnifiedImageBudget);
+            }
+        });
     let test = builder.build_with_auto_env(&server).await?;
     let TestCodex {
         codex,
@@ -1363,6 +1620,7 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
         supports_search_tool: false,
         use_responses_lite: false,
         auto_review_model_override: None,
+        model_specialty: None,
         tool_mode: None,
         multi_agent_version: None,
         priority: 1,
@@ -1370,9 +1628,10 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
         service_tiers: Vec::new(),
         default_service_tier: None,
         upgrade: None,
-        base_instructions: "base instructions".to_string(),
         model_messages: None,
         include_skills_usage_instructions: false,
+        include_plugin_usage_instructions: false,
+        include_apps_usage_instructions: false,
         supports_reasoning_summary_parameter: true,
         default_reasoning_summary: ReasoningSummary::Auto,
         support_verbosity: false,

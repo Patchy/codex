@@ -11,6 +11,7 @@ use crate::render::SkillRenderReport;
 pub(crate) enum CatalogSurface {
     ThreadContext,
     ExecutorWorldState,
+    OrchestratorWorldState,
     HostWorldState,
     TurnInput,
 }
@@ -20,6 +21,7 @@ impl CatalogSurface {
         match self {
             Self::ThreadContext => "thread_context",
             Self::ExecutorWorldState => "executor_world_state",
+            Self::OrchestratorWorldState => "orchestrator_world_state",
             Self::HostWorldState => "host_world_state",
             Self::TurnInput => "turn_input",
         }
@@ -41,6 +43,13 @@ pub(crate) fn record_catalog_render(
         report.truncated_description_chars,
     );
 
+    trace_catalog_budget_pressure(budget, report);
+}
+
+pub(crate) fn trace_catalog_budget_pressure(
+    budget: SkillMetadataBudget,
+    report: &SkillRenderReport,
+) {
     if report.omitted_count > 0 || report.truncated_description_chars > 0 {
         tracing::info!(
             budget_limit = budget.limit(),

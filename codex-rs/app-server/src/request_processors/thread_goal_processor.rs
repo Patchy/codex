@@ -65,18 +65,11 @@ impl ThreadGoalRequestProcessor {
             .map(|()| None)
     }
 
-    pub(crate) async fn emit_resume_goal_snapshot_and_continue(
-        &self,
-        thread_id: ThreadId,
-        thread: &CodexThread,
-    ) {
+    pub(crate) async fn emit_resume_goal_snapshot(&self, thread_id: ThreadId) {
         if !self.config.features.enabled(Feature::Goals) {
             return;
         }
         self.emit_thread_goal_snapshot(thread_id).await;
-        // App-server owns resume response and snapshot ordering, so wait until
-        // those are sent before letting extensions react to the idle thread.
-        thread.emit_thread_idle_lifecycle_if_idle().await;
     }
 
     pub(crate) async fn pending_resume_goal_state(
@@ -323,6 +316,19 @@ impl ThreadGoalRequestProcessor {
             })?
             .ok_or_else(|| invalid_request(format!("thread not found: {thread_id}")))?,
         };
+
+        if let Ok(Some(metadata)) = state_db.get_thread(thread_id).await
+            && codex_rollout::plain_rollout_path(metadata.rollout_path.as_path())
+                == codex_rollout::plain_rollout_path(rollout_path.as_path())
+            && let Some(existing_path) =
+                codex_rollout::existing_rollout_path(metadata.rollout_path.as_path()).await
+            && codex_rollout::read_session_meta_line(existing_path.as_path())
+                .await
+                .is_ok_and(|session_meta| session_meta.meta.id == thread_id)
+        {
+            return Ok(());
+        }
+
         reconcile_rollout(
             Some(state_db),
             rollout_path.as_path(),

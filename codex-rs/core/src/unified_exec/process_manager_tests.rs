@@ -2,6 +2,7 @@ use super::*;
 use crate::unified_exec::clamp_yield_time;
 use codex_network_proxy::ManagedNetworkSandboxContext;
 use pretty_assertions::assert_eq;
+use tokio::sync::Notify;
 use tokio::time::Duration;
 use tokio::time::Instant;
 
@@ -50,6 +51,7 @@ fn env_overlay_for_exec_server_keeps_runtime_changes_only() {
     let request_env = HashMap::from([
         ("HOME".to_string(), "/client-home".to_string()),
         ("PATH".to_string(), "/sandbox-path".to_string()),
+        ("OpenAI_Federation_Rule_Id".to_string(), "rule".to_string()),
         ("SHELL_SET".to_string(), "policy".to_string()),
         ("CODEX_THREAD_ID".to_string(), "thread-1".to_string()),
         (
@@ -80,12 +82,16 @@ fn env_overlay_for_exec_server_keeps_runtime_changes_only() {
 }
 
 #[test]
-fn exec_env_policy_excludes_runtime_permission_profile() {
+fn exec_env_policy_excludes_non_inheritable_and_runtime_variables() {
     let policy = ShellEnvironmentPolicy {
         r#set: HashMap::from([
             (
                 "codex_permission_profile".to_string(),
                 "stale-profile".to_string(),
+            ),
+            (
+                "openai_identity_token_file".to_string(),
+                "/run/identity-token".to_string(),
             ),
             ("KEEP".to_string(), "value".to_string()),
         ]),
@@ -110,9 +116,6 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
         .expect("current dir")
         .try_into()
         .expect("absolute path");
-    let file_system_sandbox_policy =
-        codex_protocol::permissions::FileSystemSandboxPolicy::unrestricted();
-    let network_sandbox_policy = codex_protocol::permissions::NetworkSandboxPolicy::Restricted;
     let permission_profile = codex_protocol::models::PermissionProfile::Disabled;
     let managed_network = ManagedNetworkSandboxContext {
         loopback_ports: vec![43123],
@@ -167,8 +170,6 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
         windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
         windows_sandbox_private_desktop: false,
         permission_profile: permission_profile.clone(),
-        file_system_sandbox_policy,
-        network_sandbox_policy,
         windows_sandbox_filesystem_overrides: None,
         arg0: None,
         exec_server_sandbox: None,
@@ -263,13 +264,16 @@ async fn output_collection_stays_bounded_across_repeated_drains() {
     let output_closed = Arc::new(AtomicBool::new(false));
     let output_closed_notify = Arc::new(Notify::new());
     let cancellation_token = CancellationToken::new();
+    let output = OutputHandles {
+        output_buffer: Arc::clone(&output_buffer),
+        output_notify: Arc::clone(&output_notify),
+        output_closed: Arc::clone(&output_closed),
+        output_closed_notify: Arc::clone(&output_closed_notify),
+        cancellation_token: cancellation_token.clone(),
+    };
 
     let collect = UnifiedExecProcessManager::collect_output_until_deadline(
-        &output_buffer,
-        &output_notify,
-        &output_closed,
-        &output_closed_notify,
-        &cancellation_token,
+        &output,
         /*pause_state*/ None,
         Instant::now() + Duration::from_secs(5),
     );
@@ -328,13 +332,16 @@ async fn output_collection_preserves_omissions_from_drained_buffer() {
     let output_closed_notify = Arc::new(Notify::new());
     let cancellation_token = CancellationToken::new();
     cancellation_token.cancel();
+    let output = OutputHandles {
+        output_buffer,
+        output_notify,
+        output_closed,
+        output_closed_notify,
+        cancellation_token,
+    };
 
     let collected = UnifiedExecProcessManager::collect_output_until_deadline(
-        &output_buffer,
-        &output_notify,
-        &output_closed,
-        &output_closed_notify,
-        &cancellation_token,
+        &output,
         /*pause_state*/ None,
         Instant::now() + Duration::from_secs(1),
     )
@@ -370,7 +377,7 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
     let (session, turn, rx_event) = crate::session::tests::make_session_and_context_with_rx().await;
     let context = UnifiedExecContext::new(
         Arc::clone(&session),
-        Arc::clone(&turn),
+        crate::session::step_context::StepContext::for_test(Arc::clone(&turn)),
         "call-unified-denied".to_string(),
     );
     let request = ExecCommandRequest {
@@ -517,6 +524,7 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
         crate::unified_exec::process_tests::remote_process(
             codex_exec_server::WriteStatus::Accepted,
             /*terminate_error*/ None,
+            codex_sandboxing::SandboxType::None,
         )
         .await,
     );
@@ -528,6 +536,7 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
         crate::unified_exec::process_tests::remote_process(
             codex_exec_server::WriteStatus::Accepted,
             /*terminate_error*/ None,
+            codex_sandboxing::SandboxType::None,
         )
         .await,
     );

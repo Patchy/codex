@@ -18,7 +18,6 @@ use super::ExecContext;
 use super::PUBLIC_TOOL_NAME;
 use super::call_nested_tool;
 use crate::session::step_context::StepContext;
-use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::parallel::ToolCallRuntime;
 
@@ -46,15 +45,22 @@ impl CodeModeDispatchBroker {
         remove_dispatch_gate(&self.dispatch_gates, cell_id);
     }
 
+    pub(super) fn active_cell_ids(&self) -> Vec<CellId> {
+        self.dispatch_gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     pub(super) fn start_turn_worker(
         &self,
         exec: ExecContext,
-        router: Arc<ToolRouter>,
         step_context: Arc<StepContext>,
         tracker: SharedTurnDiffTracker,
     ) -> CodeModeDispatchWorker {
-        let tool_runtime =
-            ToolCallRuntime::new(router, Arc::clone(&exec.session), step_context, tracker);
+        let tool_runtime = ToolCallRuntime::new(Arc::clone(&exec.session), step_context, tracker);
         let host = Arc::new(CoreTurnHost { exec, tool_runtime });
         let dispatch_rx = self.dispatch_rx.clone();
         let dispatch_gates = Arc::clone(&self.dispatch_gates);
@@ -108,12 +114,13 @@ impl CodeModeDispatchBroker {
                         }
                         let host = Arc::clone(&host);
                         tokio::spawn(async move {
+                            let invocation =
+                                host.invoke_tool(invocation, cancellation_token.clone());
+                            tokio::pin!(invocation);
                             let response = tokio::select! {
-                                response = host.invoke_tool(
-                                    invocation,
-                                    cancellation_token.clone(),
-                                ) => response,
-                                _ = cancellation_token.cancelled() => return,
+                                biased;
+                                _ = cancellation_token.cancelled() => invocation.await,
+                                response = &mut invocation => response,
                             };
                             let _ = response_tx.send(response);
                         });

@@ -34,6 +34,7 @@ impl Default for ViewImageHandler {
         Self {
             options: ViewImageToolOptions {
                 can_request_original_image_detail: false,
+                unified_image_budget: false,
                 include_environment_id: false,
             },
         }
@@ -120,8 +121,7 @@ impl ViewImageHandler {
             environment_id,
             detail,
         } = parse_arguments(&arguments)?;
-        // `high` is the explicit spelling of the default resized path.
-        // Other string values remain invalid rather than being silently reinterpreted.
+        // Keep accepting previously supported detail hints after they disappear from the schema.
         let detail = match detail.as_deref() {
             None => None,
             Some("high") => Some(ViewImageDetail::High),
@@ -175,8 +175,8 @@ impl ViewImageHandler {
             })?;
 
         let can_request_original_detail = can_request_original_image_detail(&turn.model_info);
-        let use_original_detail =
-            can_request_original_detail && matches!(detail, Some(ViewImageDetail::Original));
+        let use_original_detail = self.options.unified_image_budget
+            || can_request_original_detail && matches!(detail, Some(ViewImageDetail::Original));
         let image_detail = if use_original_detail {
             ImageDetail::Original
         } else {
@@ -196,6 +196,7 @@ impl ViewImageHandler {
         Ok(boxed_tool_output(ViewImageOutput {
             image_url,
             image_detail,
+            unified_image_budget: self.options.unified_image_budget,
         }))
     }
 }
@@ -205,6 +206,7 @@ impl CoreToolRuntime for ViewImageHandler {}
 pub struct ViewImageOutput {
     image_url: String,
     image_detail: ImageDetail,
+    unified_image_budget: bool,
 }
 
 impl ToolOutput for ViewImageOutput {
@@ -234,16 +236,21 @@ impl ToolOutput for ViewImageOutput {
     }
 
     fn code_mode_result(&self, _payload: &ToolPayload) -> serde_json::Value {
-        serde_json::json!({
-            "image_url": self.image_url,
-            "detail": self.image_detail
-        })
+        if self.unified_image_budget {
+            serde_json::json!({ "image_url": self.image_url })
+        } else {
+            serde_json::json!({
+                "image_url": self.image_url,
+                "detail": self.image_detail
+            })
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PermissionProfileSnapshot;
     use crate::environment_selection::TurnEnvironmentState;
     use crate::session::step_context::StepContext;
     use crate::session::tests::make_session_and_context;
@@ -273,6 +280,7 @@ mod tests {
             PathUri::from_abs_path(&cwd),
             Vec::new(),
             current.shell,
+            current.config,
         ));
     }
 
@@ -281,6 +289,7 @@ mod tests {
         let output = ViewImageOutput {
             image_url: "data:image/png;base64,AAA".to_string(),
             image_detail: DEFAULT_IMAGE_DETAIL,
+            unified_image_budget: false,
         };
 
         assert_eq!(output.log_preview(), "<image data URL omitted: 25 bytes>");
@@ -291,6 +300,7 @@ mod tests {
         let output = ViewImageOutput {
             image_url: "data:image/png;base64,AAA".to_string(),
             image_detail: DEFAULT_IMAGE_DETAIL,
+            unified_image_budget: false,
         };
 
         let result = output.code_mode_result(&ToolPayload::Function {
@@ -315,7 +325,16 @@ mod tests {
         replace_primary_environment_cwd(&mut turn, image_cwd.clone());
         let image_path = image_cwd.join("image.png");
         std::fs::write(image_path.as_path(), b"not a real image").expect("write test image");
-        turn.permission_profile = PermissionProfile::read_only();
+        Arc::make_mut(&mut turn.config)
+            .permissions
+            .set_permission_profile(PermissionProfile::Disabled)
+            .expect("set thread permission profile");
+        let TurnEnvironmentState::Ready(environment) = &mut turn.environments.environments[0]
+        else {
+            panic!("primary environment should be ready");
+        };
+        environment.config.permission_profile =
+            PermissionProfileSnapshot::legacy(PermissionProfile::read_only());
         let turn = Arc::new(turn);
 
         let result = ViewImageHandler::default()
@@ -382,10 +401,12 @@ mod tests {
         replace_primary_environment_cwd(&mut turn, image_cwd.clone());
         let image_path = image_cwd.join("image.png");
         std::fs::write(image_path.as_path(), b"not a real image").expect("write test image");
-        Arc::make_mut(&mut turn.config)
-            .permissions
-            .set_permission_profile(PermissionProfile::Disabled)
-            .expect("set permission profile");
+        let TurnEnvironmentState::Ready(environment) = &mut turn.environments.environments[0]
+        else {
+            panic!("primary environment should be ready");
+        };
+        environment.config.permission_profile =
+            PermissionProfileSnapshot::legacy(PermissionProfile::Disabled);
         let turn = Arc::new(turn);
 
         let result = ViewImageHandler::default()

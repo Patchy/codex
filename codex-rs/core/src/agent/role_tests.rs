@@ -1,10 +1,10 @@
 use super::*;
-use crate::SkillsService;
+use crate::HostSkillsService;
 use crate::config::ConfigBuilder;
+use crate::plugins::plugins_manager_for_config;
 use crate::skills_load_input_from_config;
-use codex_config::ConfigLayerStackOrdering;
-use codex_core_plugins::PluginsManager;
 use codex_protocol::config_types::ServiceTier;
+use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_utils_absolute_path::test_support::PathExt;
 use pretty_assertions::assert_eq;
@@ -39,11 +39,7 @@ async fn write_role_config(home: &TempDir, name: &str, contents: &str) -> PathBu
 fn session_flags_layer_count(config: &Config) -> usize {
     config
         .config_layer_stack
-        .get_layers(
-            ConfigLayerStackOrdering::LowestPrecedenceFirst,
-            /*include_disabled*/ true,
-        )
-        .into_iter()
+        .all_layers_low_to_high()
         .filter(|layer| layer.name == ConfigLayerSource::SessionFlags)
         .count()
 }
@@ -166,6 +162,7 @@ async fn apply_role_preserves_unspecified_keys() {
     .await;
     config.codex_linux_sandbox_exe = Some(PathBuf::from("/tmp/codex-linux-sandbox"));
     config.main_execve_wrapper_exe = Some(PathBuf::from("/tmp/codex-execve-wrapper"));
+    config.psp = true;
     let role_path = write_role_config(
         &home,
         "instructions-only.toml",
@@ -183,6 +180,12 @@ async fn apply_role_preserves_unspecified_keys() {
 
     config.model = Some("spawn-model".to_string());
     config.model_reasoning_effort = Some(ReasoningEffort::Low);
+    config.base_instructions = Some("inherited model instructions".to_string());
+    config.base_instructions_provenance = Some(BaseInstructionsProvenance::Model {
+        model: "parent-model".to_string(),
+    });
+    let base_instructions = config.base_instructions.clone();
+    let provenance = config.base_instructions_provenance.clone();
 
     apply_role_to_config(&mut config, Some("custom"))
         .await
@@ -200,6 +203,67 @@ async fn apply_role_preserves_unspecified_keys() {
         config.main_execve_wrapper_exe,
         Some(PathBuf::from("/tmp/codex-execve-wrapper"))
     );
+    assert!(config.psp);
+    assert_eq!(config.base_instructions, base_instructions);
+    assert_eq!(config.base_instructions_provenance, provenance);
+}
+
+#[tokio::test]
+async fn apply_role_regenerates_model_instructions_when_personality_changes() {
+    for (role_contents, provenance) in [
+        (
+            "personality = \"none\"",
+            BaseInstructionsProvenance::Model {
+                model: "parent-model".to_string(),
+            },
+        ),
+        (
+            "[features]\npersonality = false",
+            BaseInstructionsProvenance::Model {
+                model: "parent-model".to_string(),
+            },
+        ),
+        ("personality = \"none\"", BaseInstructionsProvenance::Custom),
+    ] {
+        let (home, mut config) = test_config_with_cli_overrides(vec![
+            (
+                "personality".to_string(),
+                TomlValue::String("friendly".to_string()),
+            ),
+            ("features.personality".to_string(), TomlValue::Boolean(true)),
+        ])
+        .await;
+        let role_path = write_role_config(&home, "personality-role.toml", role_contents).await;
+        config.agent_roles.insert(
+            "custom".to_string(),
+            AgentRoleConfig {
+                description: None,
+                config_file: Some(role_path),
+                nickname_candidates: None,
+            },
+        );
+        config.base_instructions = Some("inherited instructions".to_string());
+        config.base_instructions_provenance = Some(provenance.clone());
+
+        apply_role_to_config(&mut config, Some("custom"))
+            .await
+            .expect("custom role should apply");
+
+        let expected = match provenance {
+            BaseInstructionsProvenance::Model { .. } => (None, None),
+            BaseInstructionsProvenance::Custom => (
+                Some("inherited instructions".to_string()),
+                Some(BaseInstructionsProvenance::Custom),
+            ),
+        };
+        assert_eq!(
+            (
+                config.base_instructions,
+                config.base_instructions_provenance
+            ),
+            expected
+        );
+    }
 }
 
 #[tokio::test]
@@ -302,11 +366,7 @@ writable_roots = ["./sandbox-root"]
 
     let role_layer = config
         .config_layer_stack
-        .get_layers(
-            ConfigLayerStackOrdering::LowestPrecedenceFirst,
-            /*include_disabled*/ true,
-        )
-        .into_iter()
+        .all_layers_low_to_high()
         .rfind(|layer| layer.name == ConfigLayerSource::SessionFlags)
         .expect("expected a session flags layer");
     let sandbox_workspace_write = role_layer
@@ -405,9 +465,9 @@ enabled = false
         .await
         .expect("custom role should apply");
 
-    let plugins_manager = Arc::new(PluginsManager::new(home.path().to_path_buf()));
+    let plugins_manager = Arc::new(plugins_manager_for_config(&config));
     let skills_service =
-        SkillsService::new(home.path().abs(), /*bundled_skills_enabled*/ true);
+        HostSkillsService::new(home.path().abs(), /*bundled_skills_enabled*/ true);
     let plugins_input = config.plugins_config_input();
     let plugin_outcome = plugins_manager.plugins_for_config(&plugins_input).await;
     let effective_skill_roots = plugin_outcome.effective_plugin_skill_roots();

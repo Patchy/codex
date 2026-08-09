@@ -266,6 +266,7 @@ impl MemoryStartupContext {
 
         let mut client_session = model_client.new_session();
         let window_id = format!("{}:0", self.thread_id);
+        let permission_profile = config.permissions.effective_permission_profile();
         let responses_metadata = detached_memory_responses_metadata(
             installation_id,
             session_id_string,
@@ -273,6 +274,7 @@ impl MemoryStartupContext {
             window_id,
             &session_source,
             &config.cwd,
+            &permission_profile,
             /*sandbox*/ None,
         )
         .await;
@@ -361,17 +363,13 @@ impl MemoryStartupContext {
         agent: SpawnedConsolidationAgent,
     ) -> anyhow::Result<()> {
         let SpawnedConsolidationAgent { thread_id, thread } = agent;
-        let thread = self
-            .thread_manager
-            .remove_thread(&thread_id)
-            .await
-            .unwrap_or(thread);
-
         tokio::time::timeout(Duration::from_secs(10), thread.shutdown_and_wait())
             .await
             .map_err(|_| {
                 anyhow::anyhow!("memory consolidation agent {thread_id} shutdown timed out")
             })??;
+
+        self.thread_manager.remove_thread(&thread_id).await;
 
         Ok(())
     }

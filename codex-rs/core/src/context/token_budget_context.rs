@@ -1,5 +1,7 @@
 use super::ContextualUserFragment;
-use codex_protocol::ThreadId;
+use super::world_state::PreviousSectionState;
+use super::world_state::WorldStateSection;
+use codex_protocol::AgentPath;
 use codex_protocol::protocol::CONTEXT_WINDOW_CLOSE_TAG;
 use codex_protocol::protocol::CONTEXT_WINDOW_GUIDANCE_CLOSE_TAG;
 use codex_protocol::protocol::CONTEXT_WINDOW_GUIDANCE_OPEN_TAG;
@@ -8,7 +10,7 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TokenBudgetContext {
-    thread_id: ThreadId,
+    agent_path: AgentPath,
     first_window_id: Uuid,
     previous_window_id: Option<Uuid>,
     window_id: Uuid,
@@ -17,14 +19,14 @@ pub(crate) struct TokenBudgetContext {
 
 impl TokenBudgetContext {
     pub(crate) fn new(
-        thread_id: ThreadId,
+        agent_path: AgentPath,
         first_window_id: Uuid,
         previous_window_id: Option<Uuid>,
         window_id: Uuid,
         mcp_result: Option<String>,
     ) -> Self {
         Self {
-            thread_id,
+            agent_path,
             first_window_id,
             previous_window_id,
             window_id,
@@ -38,6 +40,10 @@ impl ContextualUserFragment for TokenBudgetContext {
         "developer"
     }
 
+    fn requires_separate_message(&self) -> bool {
+        true
+    }
+
     fn markers(&self) -> (&'static str, &'static str) {
         Self::type_markers()
     }
@@ -47,11 +53,10 @@ impl ContextualUserFragment for TokenBudgetContext {
     }
 
     fn body(&self) -> String {
-        let thread_id = self.thread_id;
         let first_window_id = self.first_window_id;
         let window_id = self.window_id;
         let mut lines = vec![
-            format!("Thread id: {thread_id}"),
+            format!("Agent name: {}", self.agent_path),
             format!("First context window id: {first_window_id}"),
             format!("Current context window id: {window_id}"),
         ];
@@ -62,6 +67,23 @@ impl ContextualUserFragment for TokenBudgetContext {
             lines.push(mcp_result.clone());
         }
         format!("\n{}\n", lines.join("\n"))
+    }
+}
+
+impl WorldStateSection for TokenBudgetContext {
+    const ID: &'static str = "context_window";
+    type Snapshot = AgentPath;
+
+    fn snapshot(&self) -> Self::Snapshot {
+        self.agent_path.clone()
+    }
+
+    fn render_diff(
+        &self,
+        previous: PreviousSectionState<'_, Self::Snapshot>,
+    ) -> Option<Box<dyn ContextualUserFragment>> {
+        matches!(previous, PreviousSectionState::Known(agent_path) if agent_path != &self.agent_path)
+            .then(|| Box::new(self.clone()) as Box<dyn ContextualUserFragment>)
     }
 }
 

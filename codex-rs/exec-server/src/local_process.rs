@@ -36,6 +36,7 @@ use crate::ProcessId;
 use crate::StartedExecProcess;
 use crate::network_policy_decisions::network_policy_decider;
 use crate::process::ExecProcessEventLog;
+use crate::process::sandbox_type_from_protocol;
 use crate::process_sandbox::prepare_exec_request;
 use crate::protocol::EXEC_CLOSED_METHOD;
 use crate::protocol::ExecClosedNotification;
@@ -47,6 +48,7 @@ use crate::protocol::ExecParams;
 use crate::protocol::ExecResponse;
 use crate::protocol::MAX_NETWORK_POLICY_PROCESS_ID_BYTES;
 use crate::protocol::ProcessOutputChunk;
+use crate::protocol::ProcessSandboxType;
 use crate::protocol::ProcessSignal;
 use crate::protocol::ReadParams;
 use crate::protocol::ReadResponse;
@@ -302,6 +304,12 @@ impl LocalProcess {
         if prepared.command.is_empty() {
             return Err(invalid_params("argv must not be empty".to_string()));
         }
+        let sandbox_type = match prepared.sandbox {
+            SandboxType::None => Some(ProcessSandboxType::None),
+            SandboxType::MacosSeatbelt => Some(ProcessSandboxType::MacosSeatbelt),
+            SandboxType::LinuxSeccomp => Some(ProcessSandboxType::LinuxSeccomp),
+            SandboxType::WindowsRestrictedToken => Some(ProcessSandboxType::WindowsRestrictedToken),
+        };
 
         let start = Arc::new(ProcessStart);
         {
@@ -417,7 +425,14 @@ impl LocalProcess {
             output_notify,
         ));
 
-        Ok((ExecResponse { process_id }, wake_tx, events))
+        Ok((
+            ExecResponse {
+                process_id,
+                sandbox_type,
+            },
+            wake_tx,
+            events,
+        ))
     }
 
     pub(crate) async fn exec(&self, params: ExecParams) -> Result<ExecResponse, JSONRPCErrorError> {
@@ -624,13 +639,17 @@ impl LocalProcess {
 }
 
 fn child_env(params: &ExecParams) -> HashMap<String, String> {
-    let Some(env_policy) = &params.env_policy else {
-        return params.env.clone();
+    let mut env = match &params.env_policy {
+        Some(env_policy) => {
+            let policy = shell_environment_policy(env_policy);
+            let mut env = shell_environment::create_env(&policy, /*thread_id*/ None);
+            env.extend(params.env.clone());
+            env
+        }
+        None => params.env.clone(),
     };
-
-    let policy = shell_environment_policy(env_policy);
-    let mut env = shell_environment::create_env(&policy, /*thread_id*/ None);
-    env.extend(params.env.clone());
+    env.remove(crate::CODEX_EXEC_SERVER_EXIT_ON_STDIN_CLOSE_ENV_VAR);
+    env.retain(|name, _| !shell_environment::is_non_inheritable_env_var(name));
     env
 }
 
@@ -659,6 +678,7 @@ impl LocalProcess {
             .start_process(params)
             .await
             .map_err(map_handler_error)?;
+        let sandbox_type = sandbox_type_from_protocol(response.sandbox_type);
         Ok(StartedExecProcess {
             process: Arc::new(LocalExecProcess {
                 process_id: response.process_id,
@@ -666,6 +686,7 @@ impl LocalProcess {
                 wake_tx,
                 events,
             }),
+            sandbox_type,
         })
     }
 }
@@ -925,6 +946,8 @@ async fn watch_exit(
                     ),
                     ..Default::default()
                 };
+                // Transport the classification to the caller; recording there
+                // attaches audit context once and avoids duplicate events.
                 process.sandbox_denied = is_likely_sandbox_denied(process.sandbox, &exec_output);
             }
             let _ = process.wake_tx.send(seq);
@@ -1246,12 +1269,19 @@ mod tests {
         let mut params = test_exec_params(HashMap::from([
             ("OVERLAY".to_string(), "overlay".to_string()),
             ("POLICY_SET".to_string(), "overlay-wins".to_string()),
+            (
+                "openai_identity_token_file".to_string(),
+                "/run/identity-token".to_string(),
+            ),
         ]));
         params.env_policy = Some(ExecEnvPolicy {
             inherit: ShellEnvironmentPolicyInherit::None,
             ignore_default_excludes: true,
             exclude: Vec::new(),
-            r#set: HashMap::from([("POLICY_SET".to_string(), "policy".to_string())]),
+            r#set: HashMap::from([
+                ("POLICY_SET".to_string(), "policy".to_string()),
+                ("OpenAI_Federation_Rule_Id".to_string(), "rule".to_string()),
+            ]),
             include_only: Vec::new(),
         });
 
