@@ -286,6 +286,15 @@ impl PagerView {
             .render(Rect::new(pct_x, sep_rect.y, pct_w, 1), buf);
     }
 
+    /// Applies a wheel scroll: negative = up, positive = down.
+    fn scroll_lines(&mut self, delta: isize) {
+        if delta < 0 {
+            self.scroll_offset = self.scroll_offset.saturating_sub(delta.unsigned_abs());
+        } else {
+            self.scroll_offset = self.scroll_offset.saturating_add(delta as usize);
+        }
+    }
+
     fn handle_key_event(&mut self, tui: &mut tui::Tui, key_event: KeyEvent) -> Result<()> {
         match key_event {
             e if self.keymap.scroll_up.is_pressed(e) => {
@@ -973,6 +982,14 @@ impl TranscriptOverlay {
                 })?;
                 Ok(())
             }
+            TuiEvent::Mouse(mouse_event) => {
+                if let Some(delta) = wheel_scroll_delta(mouse_event) {
+                    self.view.scroll_lines(delta);
+                    tui.frame_requester().schedule_frame();
+                }
+                Ok(())
+            }
+            #[allow(unreachable_patterns)]
             _ => Ok(()),
         }
     }
@@ -1011,6 +1028,13 @@ impl StaticOverlay {
         }
     }
 
+    /// Replaces the pager content in place, preserving the scroll position.
+    /// Used by live views (e.g. the agent dashboard) that refresh per frame.
+    pub(crate) fn set_lines(&mut self, lines: Vec<Line<'static>>) {
+        let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+        self.view.renderables = vec![Box::new(CachedRenderable::new(paragraph))];
+    }
+
     fn render_hints(&self, area: Rect, buf: &mut Buffer) {
         let line1 = Rect::new(area.x, area.y, area.width, 1);
         let line2 = Rect::new(area.x, area.y.saturating_add(1), area.width, 1);
@@ -1047,11 +1071,29 @@ impl StaticOverlay {
                 })?;
                 Ok(())
             }
+            TuiEvent::Mouse(mouse_event) => {
+                if let Some(delta) = wheel_scroll_delta(mouse_event) {
+                    self.view.scroll_lines(delta);
+                    tui.frame_requester().schedule_frame();
+                }
+                Ok(())
+            }
+            #[allow(unreachable_patterns)]
             _ => Ok(()),
         }
     }
     pub(crate) fn is_done(&self) -> bool {
         self.is_done
+    }
+}
+
+/// Maps a mouse event to a pager scroll delta (3 lines per wheel notch).
+pub(crate) fn wheel_scroll_delta(mouse_event: crossterm::event::MouseEvent) -> Option<isize> {
+    use crossterm::event::MouseEventKind;
+    match mouse_event.kind {
+        MouseEventKind::ScrollUp => Some(-3),
+        MouseEventKind::ScrollDown => Some(3),
+        _ => None,
     }
 }
 

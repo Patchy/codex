@@ -315,6 +315,9 @@ impl ChatWidget {
             SlashCommand::Agent | SlashCommand::MultiAgents => {
                 self.app_event_tx.send(AppEvent::OpenAgentPicker);
             }
+            SlashCommand::Panel => {
+                self.app_event_tx.send(AppEvent::OpenAgentDashboard);
+            }
             SlashCommand::Permissions => {
                 self.open_permissions_popup();
                 self.defer_input_until_settings_applied();
@@ -1084,6 +1087,7 @@ impl ChatWidget {
         }
         match cmd {
             SlashCommand::Ide
+            | SlashCommand::Panel
             | SlashCommand::Status
             | SlashCommand::Usage
             | SlashCommand::DebugConfig

@@ -85,6 +85,7 @@ impl KeymapActionDescriptor {
 #[rustfmt::skip]
 pub(super) const KEYMAP_ACTIONS: &[KeymapActionDescriptor] = &[
     action("global", "Global", "open_transcript", "Open the transcript overlay."),
+    action("global", "Global", "open_dashboard", "Open the agent dashboard overlay."),
     action("global", "Global", "open_external_editor", "Open the current draft in an external editor."),
     action("global", "Global", "copy", "Copy the last agent response to the clipboard."),
     action("global", "Global", "clear_terminal", "Clear the terminal UI."),
@@ -229,6 +230,7 @@ pub(super) fn binding_slot<'a>(
 ) -> Option<&'a mut Option<KeybindingsSpec>> {
     match (context, action) {
         ("global", "open_transcript") => Some(&mut keymap.global.open_transcript),
+        ("global", "open_dashboard") => Some(&mut keymap.global.open_dashboard),
         ("global", "open_external_editor") => Some(&mut keymap.global.open_external_editor),
         ("global", "copy") => Some(&mut keymap.global.copy),
         ("global", "clear_terminal") => Some(&mut keymap.global.clear_terminal),

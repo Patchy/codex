@@ -76,6 +76,7 @@ pub(crate) struct RuntimeKeymap {
 pub(crate) struct AppKeymap {
     /// Open transcript overlay.
     pub(crate) open_transcript: Vec<KeyBinding>,
+    pub(crate) open_dashboard: Vec<KeyBinding>,
     /// Open external editor for the current draft.
     pub(crate) open_external_editor: Vec<KeyBinding>,
     /// Copy the last agent response to the clipboard.
@@ -543,6 +544,11 @@ impl RuntimeKeymap {
             });
 
         let app = AppKeymap {
+            open_dashboard: resolve_bindings(
+                keymap.global.open_dashboard.as_ref(),
+                &defaults.app.open_dashboard,
+                "tui.keymap.global.open_dashboard",
+            )?,
             open_transcript: resolve_bindings(
                 keymap.global.open_transcript.as_ref(),
                 &defaults.app.open_transcript,
@@ -1096,6 +1102,7 @@ impl RuntimeKeymap {
         Self {
             app: AppKeymap {
                 open_transcript: default_bindings![ctrl(KeyCode::Char('t'))],
+                open_dashboard: default_bindings![alt(KeyCode::Char('a'))],
                 open_external_editor: default_bindings![ctrl(KeyCode::Char('g'))],
                 copy: default_bindings![ctrl(KeyCode::Char('o'))],
                 clear_terminal: default_bindings![ctrl(KeyCode::Char('l'))],

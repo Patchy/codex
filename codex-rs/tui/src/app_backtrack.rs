@@ -93,6 +93,11 @@ impl App {
         app_server: &mut AppServerSession,
         event: TuiEvent,
     ) -> Result<bool> {
+        if matches!(event, TuiEvent::Mouse(_)) {
+            // Wheel scrolling goes straight to the pager; never backtrack.
+            self.overlay_forward_event(tui, event)?;
+            return Ok(true);
+        }
         if let TuiEvent::Key(key_event) = &event
             && let Some(Overlay::Transcript(overlay)) = self.overlay.as_ref()
             && (overlay.should_load_older(*key_event)
@@ -215,6 +220,47 @@ impl App {
     }
 
     /// Open transcript overlay (enters alternate screen and shows full transcript).
+    /// Opens the full-screen agent dashboard (all agents seen this session).
+    pub(crate) fn open_agent_dashboard(&mut self, tui: &mut tui::Tui) {
+        if self.agent_dashboard_open {
+            return;
+        }
+        let _ = tui.enter_alt_screen();
+        let stats = self.chat_widget.subagent_stats();
+        self.overlay = Some(Overlay::new_static_with_lines(
+            crate::subagent_dashboard::dashboard_lines(&stats),
+            crate::subagent_dashboard::DASHBOARD_TITLE.to_string(),
+            self.keymap.pager.clone(),
+        ));
+        self.agent_dashboard_open = true;
+        tui.frame_requester().schedule_frame();
+    }
+
+    /// Routes events while the agent dashboard overlay is open: refresh stats
+    /// on draw so the view stays live, and bypass backtrack entirely.
+    pub(crate) fn handle_dashboard_overlay_event(
+        &mut self,
+        tui: &mut tui::Tui,
+        event: TuiEvent,
+    ) -> Result<()> {
+        if matches!(
+            &event,
+            TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_)
+        ) && let Some(Overlay::Static(overlay)) = self.overlay.as_mut()
+        {
+            let stats = self.chat_widget.subagent_stats();
+            overlay.set_lines(crate::subagent_dashboard::dashboard_lines(&stats));
+            // Keep elapsed counters and statuses ticking while open.
+            tui.frame_requester()
+                .schedule_frame_in(std::time::Duration::from_millis(500));
+        }
+        self.overlay_forward_event(tui, event)?;
+        if self.overlay.is_none() {
+            self.agent_dashboard_open = false;
+        }
+        Ok(())
+    }
+
     pub(crate) fn open_transcript_overlay(&mut self, tui: &mut tui::Tui) {
         let _ = tui.enter_alt_screen();
         self.overlay = Some(Overlay::new_transcript(

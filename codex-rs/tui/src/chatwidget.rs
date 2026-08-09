@@ -980,6 +980,11 @@ impl ChatWidget {
     /// Forwards subagent-thread turn liveness into the live panel. Under v2
     /// this is the only signal that an agent finished working; the app layer
     /// calls this alongside `agent_navigation.mark_running`/`mark_stopped`.
+    /// Snapshot of every agent tracked this session, for the dashboard view.
+    pub(crate) fn subagent_stats(&self) -> Vec<crate::subagent_panel::SubagentStats> {
+        self.subagent_panel_registry.all_stats()
+    }
+
     pub(crate) fn on_subagent_thread_liveness(&mut self, thread_id: ThreadId, running: bool) {
         self.subagent_panel_registry
             .set_thread_running(thread_id, running);

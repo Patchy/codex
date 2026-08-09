@@ -35,6 +35,7 @@ impl Tui {
 
         let cached = self.terminal.last_known_screen_size;
         let size = match event {
+            TuiEvent::Mouse(_) => cached,
             TuiEvent::Resize(size) => {
                 self.screen_size.deferred_size = None;
                 *size

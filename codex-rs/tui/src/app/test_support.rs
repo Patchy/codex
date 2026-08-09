@@ -34,6 +34,7 @@ pub(super) async fn make_test_app() -> App {
         file_search,
         transcript_cells: Vec::new(),
         overlay: None,
+        agent_dashboard_open: false,
         deferred_history_lines: Vec::new(),
         has_emitted_history_lines: false,
         transcript_reflow: TranscriptReflowState::default(),

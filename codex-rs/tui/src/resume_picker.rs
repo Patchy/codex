@@ -553,6 +553,7 @@ async fn run_session_picker_with_loader(
                     continue;
                 }
                 match ev {
+                    TuiEvent::Mouse(_) => {}
                     TuiEvent::Key(key) => {
                         if matches!(key.kind, KeyEventKind::Release) {
                             continue;

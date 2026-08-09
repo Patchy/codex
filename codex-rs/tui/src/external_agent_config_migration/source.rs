@@ -60,6 +60,7 @@ pub(crate) async fn run_external_agent_config_source_prompt(
         if let Some(event) = events.next().await {
             let _ = tui.screen_size_for_event(&event);
             match event {
+                TuiEvent::Mouse(_) => {}
                 TuiEvent::Key(key_event) => screen.handle_key(key_event),
                 TuiEvent::Paste(_) => {}
                 TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) => {

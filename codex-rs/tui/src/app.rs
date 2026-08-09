@@ -533,6 +533,8 @@ pub(crate) struct App {
 
     // Pager overlay state (Transcript or Static like Diff)
     pub(crate) overlay: Option<Overlay>,
+    /// True while the agent dashboard overlay is open (routes events away from backtrack).
+    pub(crate) agent_dashboard_open: bool,
     pub(crate) deferred_history_lines: Vec<crate::terminal_hyperlinks::HyperlinkLine>,
     has_emitted_history_lines: bool,
     transcript_reflow: TranscriptReflowState,
@@ -1056,6 +1058,7 @@ See the Codex keymap documentation for supported actions and examples."
             key_chord_matcher: KeyChordMatcher::default(),
             transcript_cells: Vec::new(),
             overlay: None,
+            agent_dashboard_open: false,
             deferred_history_lines: Vec::new(),
             has_emitted_history_lines: false,
             transcript_reflow: TranscriptReflowState::default(),
@@ -1314,13 +1317,28 @@ See the Codex keymap documentation for supported actions and examples."
         };
 
         if self.overlay.is_some() {
-            let _ = self
-                .handle_backtrack_overlay_event(tui, app_server, event)
-                .await?;
+            if self.agent_dashboard_open {
+                self.handle_dashboard_overlay_event(tui, event)?;
+            } else {
+                let _ = self
+                    .handle_backtrack_overlay_event(tui, app_server, event)
+                    .await?;
+            }
         } else {
             match event {
                 TuiEvent::Key(key_event) => {
                     self.handle_key_event(tui, app_server, key_event).await;
+                }
+                TuiEvent::Mouse(mouse_event) => {
+                    // Wheel-up in the live view enters session scrollback via
+                    // the transcript overlay (wheel keeps working there).
+                    if matches!(mouse_event.kind, crossterm::event::MouseEventKind::ScrollUp) {
+                        self.scrollback_has_older_history = self
+                            .chat_widget
+                            .thread_id()
+                            .is_some_and(|thread_id| app_server.has_older_history(thread_id));
+                        self.open_transcript_overlay(tui);
+                    }
                 }
                 TuiEvent::Paste(pasted) => {
                     // Many terminals convert newlines to \r when pasting (e.g., iTerm2),

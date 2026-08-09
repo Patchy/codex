@@ -1662,6 +1662,9 @@ async fn subagent_panel_mounts_from_v2_activity_and_thread_liveness() {
     // A follow-up message restarts the agent's turn: the panel returns.
     chat.on_subagent_thread_liveness(agent_thread_id, /*running*/ true);
     let panel = subagent_panel_text(&chat).expect("panel should remount when agent runs again");
-    assert!(panel.contains("running"), "agent should be running: {panel:?}");
+    assert!(
+        panel.contains("running"),
+        "agent should be running: {panel:?}"
+    );
     drain_insert_history(&mut rx);
 }

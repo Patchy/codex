@@ -1,5 +1,6 @@
 ---
 source: tui/src/bottom_pane/command_popup.rs
+assertion_line: 430
 expression: commands
 ---
 /model - choose what model and reasoning effort to use
@@ -45,3 +46,4 @@ expression: commands
 /clear - clear the terminal and start a new chat
 /test-approval - test approval request
 /subagents - switch the active agent thread
+/panel - show the live subagent dashboard

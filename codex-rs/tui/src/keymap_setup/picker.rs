@@ -71,6 +71,7 @@ const KEYMAP_COMMON_ACTIONS: &[(&str, &str)] = &[
     ("editor", "move_word_left"),
     ("editor", "move_word_right"),
     ("global", "open_transcript"),
+    ("global", "open_dashboard"),
     ("pager", "close"),
     ("pager", "page_up"),
     ("pager", "page_down"),

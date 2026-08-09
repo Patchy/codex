@@ -110,6 +110,7 @@ async fn run_startup_hooks_review_app(
         };
         tui.screen_size_for_event(&event)?;
         match event {
+            TuiEvent::Mouse(_) => {}
             TuiEvent::Key(key_event) => {
                 let key_event = match chord_matcher.advance(
                     key_event,

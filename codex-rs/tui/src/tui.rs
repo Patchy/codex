@@ -218,6 +218,10 @@ pub fn set_modes() -> Result<()> {
     ensure_virtual_terminal_processing()?;
 
     execute!(stdout(), EnableBracketedPaste)?;
+    // Capture mouse events so the wheel can scroll the session (see
+    // TuiEvent::Mouse routing in app.rs). Shift+drag still reaches the
+    // terminal for native text selection in most emulators.
+    let _ = execute!(stdout(), crossterm::event::EnableMouseCapture);
 
     enable_raw_mode()?;
     #[cfg(windows)]
@@ -302,6 +306,7 @@ fn restore_common(
         KeyboardRestore::ResetAfterExit => keyboard_modes::reset_keyboard_reporting_after_exit(),
     }
 
+    let _ = execute!(stdout(), crossterm::event::DisableMouseCapture);
     if let Err(err) = execute!(stdout(), DisableBracketedPaste) {
         first_error.get_or_insert(err);
     }
@@ -556,6 +561,8 @@ pub enum TuiEvent {
     /// Resize is separate from `Draw` so the app can run feature-gated pre-render logic without
     /// changing the default draw path for scheduled frames.
     Resize(Size),
+    /// A raw mouse event (wheel scroll, click); routed by the app layer.
+    Mouse(crossterm::event::MouseEvent),
     /// A scheduled repaint that does not necessarily correspond to a terminal size change.
     Draw,
     /// The first repaint after returning from process suspension.

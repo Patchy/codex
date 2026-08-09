@@ -281,7 +281,7 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
                 self.terminal_focused.store(false, Ordering::Relaxed);
                 None
             }
-            _ => None,
+            Event::Mouse(mouse_event) => Some(TuiEvent::Mouse(mouse_event)),
         }
     }
 }

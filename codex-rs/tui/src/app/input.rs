@@ -253,6 +253,11 @@ impl App {
             return;
         }
 
+        if app_keymap_shortcuts_available && self.keymap.app.open_dashboard.is_pressed(key_event) {
+            self.open_agent_dashboard(tui);
+            return;
+        }
+
         if app_keymap_shortcuts_available && self.keymap.app.open_transcript.is_pressed(key_event) {
             self.scrollback_has_older_history = self
                 .chat_widget

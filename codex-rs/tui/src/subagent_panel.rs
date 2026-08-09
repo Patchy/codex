@@ -80,6 +80,8 @@ struct SubagentInfo {
     spawned_at: Instant,
     latest_preview: String,
     latest_update_at: Instant,
+    turns_completed: u32,
+    activity_count: u32,
 }
 
 impl SubagentInfo {
@@ -95,6 +97,8 @@ impl SubagentInfo {
             spawned_at: now,
             latest_preview: prompt_preview,
             latest_update_at: now,
+            turns_completed: 0,
+            activity_count: 0,
         }
     }
 
@@ -124,8 +128,24 @@ impl SubagentInfo {
         if !preview.is_empty() {
             self.latest_preview = truncate_text(&preview, SUBAGENT_UPDATE_PREVIEW_BUDGET);
         }
+        self.activity_count = self.activity_count.saturating_add(1);
         self.latest_update_at = Instant::now();
     }
+}
+
+/// Point-in-time stats for one tracked agent, consumed by the dashboard view.
+#[derive(Clone, Debug)]
+pub(crate) struct SubagentStats {
+    pub(crate) thread_id: ThreadId,
+    pub(crate) ordinal: i32,
+    pub(crate) name: String,
+    pub(crate) role: Option<String>,
+    pub(crate) status: PanelAgentStatus,
+    pub(crate) spawned_at: Instant,
+    pub(crate) latest_update_at: Instant,
+    pub(crate) latest_preview: String,
+    pub(crate) turns_completed: u32,
+    pub(crate) activity_count: u32,
 }
 
 #[derive(Debug, Default)]
@@ -207,6 +227,9 @@ impl SubagentPanelRegistry {
     /// tool item ever reports a v2 agent finishing.
     pub(crate) fn set_thread_running(&mut self, thread_id: ThreadId, running: bool) {
         if let Some(info) = self.agents.get_mut(&thread_id) {
+            if !running && matches!(info.status, PanelAgentStatus::Running) {
+                info.turns_completed = info.turns_completed.saturating_add(1);
+            }
             let status = if running {
                 PanelAgentStatus::Running
             } else {
@@ -220,9 +243,43 @@ impl SubagentPanelRegistry {
         }
     }
 
+    /// Marks an agent closed but retains it so the dashboard keeps a full
+    /// session history. The pinned panel filters to running agents, so a
+    /// closed agent still drops off the live view.
     pub(crate) fn close(&mut self, thread_id: ThreadId) {
+        if let Some(info) = self.agents.get_mut(&thread_id) {
+            info.update_status(PanelAgentStatus::Shutdown);
+        }
+    }
+
+    fn remove(&mut self, thread_id: ThreadId) {
         self.agents.remove(&thread_id);
         self.order.retain(|candidate| *candidate != thread_id);
+    }
+
+    /// Snapshot of every agent seen this session (running and finished),
+    /// in spawn order, for the dashboard view.
+    pub(crate) fn all_stats(&self) -> Vec<SubagentStats> {
+        let mut stats = self
+            .order
+            .iter()
+            .filter_map(|thread_id| {
+                self.agents.get(thread_id).map(|info| SubagentStats {
+                    thread_id: *thread_id,
+                    ordinal: info.ordinal,
+                    name: info.name.clone(),
+                    role: info.role.clone(),
+                    status: info.status.clone(),
+                    spawned_at: info.spawned_at,
+                    latest_update_at: info.latest_update_at,
+                    latest_preview: info.latest_preview.clone(),
+                    turns_completed: info.turns_completed,
+                    activity_count: info.activity_count,
+                })
+            })
+            .collect::<Vec<_>>();
+        stats.sort_by_key(|stat| stat.ordinal);
+        stats
     }
 
     /// Rebuilds the shared panel state and returns a cell to pin, or `None`
@@ -264,6 +321,7 @@ impl SubagentPanelRegistry {
                 preview: info.latest_preview.clone(),
                 spawned_at: info.spawned_at,
                 latest_update_at: info.latest_update_at,
+                turns_completed: info.turns_completed,
             })
             .collect();
         let state = SubagentPanelState {
@@ -309,7 +367,9 @@ impl SubagentPanelRegistry {
             })
             .collect::<Vec<_>>();
         for thread_id in superseded {
-            self.close(thread_id);
+            // Fully drop superseded watchdogs: they are replaced, not
+            // finished, and would only clutter the dashboard history.
+            self.remove(thread_id);
         }
     }
 }
@@ -323,6 +383,7 @@ pub(crate) struct SubagentPanelAgent {
     pub(crate) preview: String,
     pub(crate) spawned_at: Instant,
     pub(crate) latest_update_at: Instant,
+    pub(crate) turns_completed: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -391,6 +452,11 @@ impl HistoryCell for SubagentStatusCell {
             spans.push(" ".into());
             spans.push(status_span(&agent));
             spans.push(format!(" · {agent_elapsed}").dim());
+            if agent.turns_completed > 0 {
+                let turns = agent.turns_completed;
+                let noun = if turns == 1 { "turn" } else { "turns" };
+                spans.push(format!(" · {turns} {noun}").dim());
+            }
             spans.push(" — ".dim());
             if should_shimmer(&agent, now) {
                 spans.extend(shimmer_text(&preview, self.motion_mode));
