@@ -9,3 +9,11 @@ rustflags = ["-C", "link-arg=/STACK:8388608", "-C", "link-arg=/arm64hazardfree"]
 
 [target.'cfg(all(windows, target_env = "gnu"))']
 rustflags = ["-C", "link-arg=-Wl,--stack,8388608"]
+
+# Fork-local: the v8 crate's build.rs downloads a prebuilt static V8 whose
+# ptrcomp_sandbox flavor only exists on openai/codex's rusty-v8-v* prerelease
+# tags (denoland 404s). Pin the verified local copies; refresh both files from
+# the matching rusty-v8-v<version> release when Cargo.toml bumps `v8`.
+[env]
+RUSTY_V8_ARCHIVE = "/Users/patchy/.cache/codex-v8/librusty_v8_ptrcomp_sandbox_release_aarch64-apple-darwin.a.gz"
+RUSTY_V8_SRC_BINDING_PATH = "/Users/patchy/.cache/codex-v8/src_binding_ptrcomp_sandbox_release_aarch64-apple-darwin.rs"
