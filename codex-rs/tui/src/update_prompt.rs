@@ -58,6 +58,7 @@ pub(crate) async fn run_update_prompt_if_needed(
             tui.screen_size_for_event(&event)?;
             match event {
                 TuiEvent::Key(key_event) => screen.handle_key(key_event),
+                TuiEvent::Mouse(_) => {}
                 TuiEvent::Paste(_) => {}
                 TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) => {
                     tui.draw(u16::MAX, |frame| {
