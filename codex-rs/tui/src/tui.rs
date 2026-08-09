@@ -218,10 +218,6 @@ pub fn set_modes() -> Result<()> {
     ensure_virtual_terminal_processing()?;
 
     execute!(stdout(), EnableBracketedPaste)?;
-    // Capture mouse events so the wheel can scroll the session (see
-    // TuiEvent::Mouse routing in app.rs). Shift+drag still reaches the
-    // terminal for native text selection in most emulators.
-    let _ = execute!(stdout(), crossterm::event::EnableMouseCapture);
 
     enable_raw_mode()?;
     #[cfg(windows)]
@@ -791,6 +787,12 @@ impl Tui {
         let _ = execute!(self.terminal.backend_mut(), EnterAlternateScreen);
         // Enable "alternate scroll" so terminals may translate wheel to arrows
         let _ = execute!(self.terminal.backend_mut(), EnableAlternateScroll);
+        // Capture the mouse only while the alt screen owns the viewport:
+        // inline mode leaves the wheel/selection to the terminal.
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            crossterm::event::EnableMouseCapture
+        );
         if let Ok(size) = self.terminal.size() {
             self.alt_saved_viewport = Some(self.terminal.viewport_area);
             self.terminal.resize(size)?;
@@ -812,6 +814,10 @@ impl Tui {
             return Ok(());
         }
         // Disable alternate scroll when leaving alt-screen
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            crossterm::event::DisableMouseCapture
+        );
         let _ = execute!(self.terminal.backend_mut(), DisableAlternateScroll);
         let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
         if let Some(saved) = self.alt_saved_viewport.take() {
