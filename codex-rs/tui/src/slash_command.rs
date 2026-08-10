@@ -212,7 +212,6 @@ impl SlashCommand {
             | SlashCommand::Import
             | SlashCommand::Review
             | SlashCommand::Plan
-            | SlashCommand::Panel
             | SlashCommand::Clear
             | SlashCommand::Logout
             | SlashCommand::MemoryDrop
@@ -229,6 +228,7 @@ impl SlashCommand {
             | SlashCommand::Skills
             | SlashCommand::Hooks
             | SlashCommand::Status
+            | SlashCommand::Panel
             | SlashCommand::Usage
             | SlashCommand::DebugConfig
             | SlashCommand::Ps
