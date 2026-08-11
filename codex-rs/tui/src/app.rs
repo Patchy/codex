@@ -245,7 +245,10 @@ use self::startup_prompts::*;
 use self::thread_events::*;
 
 const EXTERNAL_EDITOR_HINT: &str = "Save and close external editor to continue.";
-const THREAD_EVENT_CHANNEL_CAPACITY: usize = 32768;
+// Bounds both the per-thread mpsc channel and the replay store. Buffered
+// entries can be large (`ItemCompleted` carries full command output), so an
+// oversized cap lets a single busy background agent retain gigabytes.
+const THREAD_EVENT_CHANNEL_CAPACITY: usize = 4096;
 
 enum ThreadInteractiveRequest {
     AppLink(AppLinkViewParams),

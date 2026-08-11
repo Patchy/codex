@@ -979,7 +979,7 @@ impl App {
             let channel = self.ensure_thread_channel(thread_id);
             (channel.sender.clone(), Arc::clone(&channel.store))
         };
-        let (notification, pending_status, turn_stopped) = {
+        let (notification, pending_status, turn_stopped, thread_closed) = {
             let mut guard = store.lock().await;
             if guard.session.is_none()
                 && let Some(session) = inferred_session
@@ -993,6 +993,7 @@ impl App {
                 ServerNotification::ThreadClosed(_) => true,
                 _ => false,
             };
+            let thread_closed = matches!(&notification, ServerNotification::ThreadClosed(_));
             let notification = if guard.active {
                 guard.push_notification_ref(&notification);
                 Some(notification)
@@ -1004,12 +1005,28 @@ impl App {
                 notification,
                 guard.side_parent_pending_status(),
                 turn_stopped,
+                thread_closed,
             )
         };
         if is_turn_started {
             self.agent_navigation.mark_running(thread_id);
         } else if turn_stopped {
             self.agent_navigation.mark_stopped(thread_id);
+        }
+
+        // Free the buffered event channel once a background thread closes.
+        // Nothing else removes closed background channels, so each one pins
+        // up to THREAD_EVENT_CHANNEL_CAPACITY boxed notifications — including
+        // full `ItemCompleted` payloads — for the rest of the session.
+        // Navigation and picker entries are kept; switching to a closed
+        // thread later backfills its transcript from server history.
+        if thread_closed
+            && notification.is_none()
+            && self.active_thread_id != Some(thread_id)
+            && !self.side_threads.contains_key(&thread_id)
+        {
+            self.abort_thread_event_listener(thread_id);
+            self.thread_event_channels.remove(&thread_id);
         }
 
         if let Some(notification) = notification {
