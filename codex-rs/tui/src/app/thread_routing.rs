@@ -979,7 +979,7 @@ impl App {
             let channel = self.ensure_thread_channel(thread_id);
             (channel.sender.clone(), Arc::clone(&channel.store))
         };
-        let (notification, pending_status, turn_stopped) = {
+        let (notification, pending_status, turn_stopped, thread_closed) = {
             let mut guard = store.lock().await;
             if guard.session.is_none()
                 && let Some(session) = inferred_session
@@ -993,6 +993,7 @@ impl App {
                 ServerNotification::ThreadClosed(_) => true,
                 _ => false,
             };
+            let thread_closed = matches!(&notification, ServerNotification::ThreadClosed(_));
             let notification = if guard.active {
                 guard.push_notification_ref(&notification);
                 Some(notification)
@@ -1004,6 +1005,7 @@ impl App {
                 notification,
                 guard.side_parent_pending_status(),
                 turn_stopped,
+                thread_closed,
             )
         };
         if is_turn_started {
@@ -1014,6 +1016,21 @@ impl App {
             self.agent_navigation.mark_stopped(thread_id);
             self.chat_widget
                 .on_subagent_thread_liveness(thread_id, /*running*/ false);
+        }
+
+        // Free the buffered event channel once a background thread closes.
+        // Each channel's store can pin up to capacity × payload (MBs per
+        // busy agent) and nothing else ever removes closed background
+        // channels — the unbounded growth behind openai/codex#23260.
+        // Navigation/picker entries are kept; a later switch to the closed
+        // thread backfills its transcript from server history.
+        if thread_closed
+            && notification.is_none()
+            && self.active_thread_id != Some(thread_id)
+            && !self.side_threads.contains_key(&thread_id)
+        {
+            self.abort_thread_event_listener(thread_id);
+            self.thread_event_channels.remove(&thread_id);
         }
 
         if let Some(notification) = notification {

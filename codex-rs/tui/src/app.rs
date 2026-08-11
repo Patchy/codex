@@ -245,7 +245,9 @@ use self::startup_prompts::*;
 use self::thread_events::*;
 
 const EXTERNAL_EDITOR_HINT: &str = "Save and close external editor to continue.";
-const THREAD_EVENT_CHANNEL_CAPACITY: usize = 32768;
+// Fork note: upstream used 32768, which lets a single busy background
+// agent's store pin gigabytes of ItemCompleted payloads (see #23260).
+const THREAD_EVENT_CHANNEL_CAPACITY: usize = 4096;
 
 enum ThreadInteractiveRequest {
     AppLink(AppLinkViewParams),
