@@ -14,6 +14,7 @@ use codex_http_client::ClientRouteClass;
 use codex_http_client::RouteAwareClientPool;
 use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_model_provider::SharedModelProvider;
+use codex_model_provider::create_model_provider;
 use codex_protocol::SessionId;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
@@ -316,6 +317,38 @@ impl SessionConfiguration {
         if let Some(collaboration_mode) = updates.collaboration_mode.clone() {
             next_configuration.collaboration_mode = collaboration_mode;
         }
+        if let Some(model_provider_id) = updates.model_provider.clone()
+            && model_provider_id != self.original_config_do_not_use.model_provider_id
+        {
+            let provider_info = self
+                .original_config_do_not_use
+                .model_providers
+                .get(&model_provider_id)
+                .cloned()
+                .ok_or_else(|| {
+                    let mut allowed: Vec<&str> = self
+                        .original_config_do_not_use
+                        .model_providers
+                        .keys()
+                        .map(String::as_str)
+                        .collect();
+                    allowed.sort_unstable();
+                    ConstraintError::InvalidValue {
+                        field_name: "model_provider",
+                        candidate: model_provider_id.clone(),
+                        allowed: allowed.join(", "),
+                        requirement_source: codex_config::RequirementSource::Unknown,
+                    }
+                })?;
+            // Carry the current provider's auth manager into the replacement so
+            // first-party auth keeps working after an in-session provider switch.
+            next_configuration.provider =
+                create_model_provider(provider_info.clone(), self.provider.auth_manager());
+            let mut config = (*next_configuration.original_config_do_not_use).clone();
+            config.model_provider_id = model_provider_id;
+            config.model_provider = provider_info;
+            next_configuration.original_config_do_not_use = Arc::new(config);
+        }
         if let Some(summary) = updates.reasoning_summary {
             next_configuration.model_reasoning_summary = Some(summary);
         }
@@ -522,6 +555,7 @@ pub(crate) struct SessionSettingsUpdate {
     pub(crate) active_permission_profile: Option<ActivePermissionProfile>,
     pub(crate) windows_sandbox_level: Option<WindowsSandboxLevel>,
     pub(crate) collaboration_mode: Option<CollaborationMode>,
+    pub(crate) model_provider: Option<String>,
     pub(crate) reasoning_summary: Option<ReasoningSummaryConfig>,
     pub(crate) service_tier: Option<Option<String>>,
     pub(crate) final_output_json_schema: Option<Option<Value>>,

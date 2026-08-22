@@ -1233,6 +1233,14 @@ impl App {
                         .await;
                 }
             }
+            AppEvent::UpdateModelProvider(model_provider) => {
+                let provider_changed =
+                    self.chat_widget.config_ref().model_provider_id != model_provider;
+                if provider_changed {
+                    self.sync_active_thread_model_provider_setting(app_server, model_provider)
+                        .await;
+                }
+            }
             AppEvent::UpdatePersonality(personality) => {
                 self.on_update_personality(personality);
                 self.sync_active_thread_personality_setting(app_server, personality)

@@ -807,6 +807,9 @@ pub(crate) enum AppEvent {
     /// Update the current model slug in the running app and widget.
     UpdateModel(String),
 
+    /// Switch the active thread to another configured model provider.
+    UpdateModelProvider(String),
+
     /// Update the current personality in the running app and widget.
     UpdatePersonality(Personality),
 

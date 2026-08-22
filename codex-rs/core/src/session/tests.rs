@@ -4728,6 +4728,48 @@ async fn session_settings_legacy_fast_service_tier_update_uses_priority_request_
     );
 }
 
+#[tokio::test]
+async fn session_settings_model_provider_update_switches_provider() {
+    let session_configuration = make_session_configuration_for_tests().await;
+
+    let updated = session_configuration
+        .apply(&SessionSettingsUpdate {
+            model_provider: Some("ollama".to_string()),
+            ..Default::default()
+        })
+        .expect("model provider update should apply");
+
+    assert_eq!(
+        updated.original_config_do_not_use.model_provider_id,
+        "ollama"
+    );
+    let expected_provider_info = updated
+        .original_config_do_not_use
+        .model_providers
+        .get("ollama")
+        .expect("built-in ollama provider should be configured")
+        .clone();
+    assert_eq!(updated.provider.info(), &expected_provider_info);
+    assert_eq!(
+        updated.original_config_do_not_use.model_provider,
+        expected_provider_info
+    );
+}
+
+#[tokio::test]
+async fn session_settings_unknown_model_provider_update_is_rejected() {
+    let session_configuration = make_session_configuration_for_tests().await;
+
+    let Err(err) = session_configuration.apply(&SessionSettingsUpdate {
+        model_provider: Some("does-not-exist".to_string()),
+        ..Default::default()
+    }) else {
+        panic!("unknown model provider update should be rejected");
+    };
+
+    assert!(err.to_string().contains("does-not-exist"));
+}
+
 pub(crate) async fn make_session_configuration_for_tests() -> SessionConfiguration {
     let codex_home = tempfile::tempdir().expect("create temp dir");
     let config = build_test_config(codex_home.path()).await;

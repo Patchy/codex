@@ -3389,6 +3389,7 @@
             "global": {
               "clear_terminal": null,
               "copy": null,
+              "open_dashboard": null,
               "open_external_editor": null,
               "open_transcript": null,
               "queue": null,
@@ -3919,6 +3920,14 @@
           ],
           "description": "Copy the last agent response to the clipboard."
         },
+        "open_dashboard": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Open the agent dashboard overlay."
+        },
         "open_external_editor": {
           "allOf": [
             {
@@ -4077,6 +4086,7 @@
           "default": {
             "clear_terminal": null,
             "copy": null,
+            "open_dashboard": null,
             "open_external_editor": null,
             "open_transcript": null,
             "queue": null,
