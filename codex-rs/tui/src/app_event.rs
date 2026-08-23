@@ -810,6 +810,10 @@ pub(crate) enum AppEvent {
     /// Switch the active thread to another configured model provider.
     UpdateModelProvider(String),
 
+    /// Re-resolve the runtime model provider base URL shown by /status after a
+    /// server-confirmed provider switch.
+    RefreshRuntimeModelProviderBaseUrl,
+
     /// Update the current personality in the running app and widget.
     UpdatePersonality(Personality),
 

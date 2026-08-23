@@ -63,6 +63,9 @@ pub(crate) enum StatusLineItem {
     /// Current reasoning level.
     Reasoning,
 
+    /// Active model provider id.
+    ModelProvider,
+
     /// Current working directory path.
     CurrentDir,
 
@@ -151,6 +154,7 @@ impl StatusLineItem {
             StatusLineItem::ModelName => "Current model name",
             StatusLineItem::ModelWithReasoning => "Current model name with reasoning level",
             StatusLineItem::Reasoning => "Current reasoning level",
+            StatusLineItem::ModelProvider => "Active model provider",
             StatusLineItem::CurrentDir => "Current working directory",
             StatusLineItem::ProjectRoot => "Project name (omitted when unavailable)",
             StatusLineItem::GitBranch => "Current Git branch (omitted when unavailable)",
@@ -202,6 +206,7 @@ impl StatusLineItem {
             StatusLineItem::ModelName => StatusSurfacePreviewItem::Model,
             StatusLineItem::ModelWithReasoning => StatusSurfacePreviewItem::ModelWithReasoning,
             StatusLineItem::Reasoning => StatusSurfacePreviewItem::Reasoning,
+            StatusLineItem::ModelProvider => StatusSurfacePreviewItem::ModelProvider,
             StatusLineItem::CurrentDir => StatusSurfacePreviewItem::CurrentDir,
             StatusLineItem::ProjectRoot => StatusSurfacePreviewItem::ProjectRoot,
             StatusLineItem::GitBranch => StatusSurfacePreviewItem::GitBranch,

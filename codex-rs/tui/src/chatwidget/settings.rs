@@ -190,6 +190,10 @@ impl ChatWidget {
         self.runtime_model_provider_base_url.as_deref()
     }
 
+    pub(crate) fn set_runtime_model_provider_base_url(&mut self, base_url: Option<String>) {
+        self.runtime_model_provider_base_url = base_url;
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn model_catalog(&self) -> Arc<ModelCatalog> {
         self.model_catalog.clone()
@@ -490,8 +494,12 @@ impl ChatWidget {
 
     fn apply_thread_settings(&mut self, mut settings: ThreadSettings) {
         let cwd_changed = self.config.cwd != settings.cwd;
+        let model_provider_changed = self.config.model_provider_id != settings.model_provider;
         self.apply_thread_settings_cwd(settings.cwd.clone());
         self.config.model_provider_id = settings.model_provider.clone();
+        if model_provider_changed {
+            self.on_model_provider_changed();
+        }
         self.set_service_tier(settings.service_tier.clone());
         self.set_approval_policy(settings.approval_policy);
         self.set_approvals_reviewer(settings.approvals_reviewer.to_core());
@@ -556,6 +564,41 @@ impl ChatWidget {
         self.config
             .permissions
             .set_workspace_roots(self.config.workspace_roots.clone());
+    }
+
+    /// Applies a server-confirmed model provider switch to the widget's config
+    /// copy and surfaces the change in the transcript.
+    ///
+    /// Only called from the `ThreadSettingsUpdated` path so the confirmation
+    /// reflects what the session actually switched to, not what was requested.
+    fn on_model_provider_changed(&mut self) {
+        let provider_id = self.config.model_provider_id.clone();
+        let Some(provider_info) = self.config.model_providers.get(&provider_id).cloned() else {
+            tracing::warn!(
+                provider_id,
+                "ThreadSettingsUpdated switched to a model provider missing from config"
+            );
+            return;
+        };
+        let auth = if provider_info.env_key.is_some() {
+            "API key"
+        } else if provider_info.requires_openai_auth {
+            "ChatGPT"
+        } else {
+            "local"
+        };
+        let message = match provider_info.base_url.as_deref() {
+            Some(base_url) => {
+                format!("Provider switched: {provider_id} · {base_url} · auth: {auth}")
+            }
+            None => format!("Provider switched: {provider_id} · auth: {auth}"),
+        };
+        self.config.model_provider = provider_info;
+        self.add_info_message(message, /*hint*/ None);
+        // The runtime base URL shown by /status is resolved asynchronously by
+        // the app layer; ask it to re-resolve for the new provider.
+        self.app_event_tx
+            .send(AppEvent::RefreshRuntimeModelProviderBaseUrl);
     }
 
     pub(super) fn set_effective_collaboration_mode(&mut self, mode: CollaborationMode) {

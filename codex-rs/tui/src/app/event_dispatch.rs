@@ -1241,6 +1241,12 @@ impl App {
                         .await;
                 }
             }
+            AppEvent::RefreshRuntimeModelProviderBaseUrl => {
+                let provider = self.chat_widget.config_ref().model_provider.clone();
+                let base_url = resolve_runtime_model_provider_base_url(&provider).await;
+                self.chat_widget
+                    .set_runtime_model_provider_base_url(base_url);
+            }
             AppEvent::UpdatePersonality(personality) => {
                 self.on_update_personality(personality);
                 self.sync_active_thread_personality_setting(app_server, personality)

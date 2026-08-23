@@ -14,7 +14,7 @@ expression: status_line_popup_snapshot(&mut chat)
   [ ] model                 Current model name
   [ ] model-with-reasoning  Current model name with reasoning level
   [ ] reasoning             Current reasoning level
-  [ ] current-dir           Current working directory
+  [ ] model-provider        Active model provider
 
   monthly 65% left · weekly 50% left
   Press space to toggle; ←/→ to move; enter to confirm and close; esc to close

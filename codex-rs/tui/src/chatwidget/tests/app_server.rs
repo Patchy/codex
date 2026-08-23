@@ -396,6 +396,54 @@ async fn thread_settings_updated_updates_visible_state_without_transcript() {
 }
 
 #[tokio::test]
+async fn thread_settings_updated_provider_switch_confirms_in_transcript() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
+    let thread_id = ThreadId::new();
+    chat.handle_thread_session(configured_thread_session(thread_id));
+    chat.config.tui_status_line = Some(vec!["model-provider".to_string()]);
+    let _ = drain_insert_history(&mut rx);
+
+    let mut notification = thread_settings_for_test("gpt-5.2", thread_id);
+    notification.thread_settings.model_provider = "ollama".to_string();
+    chat.handle_server_notification(
+        ServerNotification::ThreadSettingsUpdated(notification),
+        /*replay_kind*/ None,
+    );
+
+    assert_eq!(chat.config_ref().model_provider_id, "ollama");
+    let expected_base_url = chat.config_ref().model_providers["ollama"]
+        .base_url
+        .clone()
+        .expect("built-in ollama provider has a base URL");
+    assert_eq!(
+        chat.config_ref().model_provider.base_url.as_deref(),
+        Some(expected_base_url.as_str())
+    );
+    assert_eq!(status_line_text(&chat).as_deref(), Some("ollama"));
+
+    let mut saw_base_url_refresh = false;
+    let mut rendered = String::new();
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            AppEvent::InsertHistoryCell(cell) => {
+                rendered.push_str(&lines_to_single_string(&cell.display_lines(/*width*/ 80)));
+            }
+            AppEvent::RefreshRuntimeModelProviderBaseUrl => saw_base_url_refresh = true,
+            _ => {}
+        }
+    }
+    let expected_message = format!("Provider switched: ollama · {expected_base_url} · auth: local");
+    assert!(
+        rendered.contains(&expected_message),
+        "expected provider switch confirmation {expected_message:?}, got {rendered:?}"
+    );
+    assert!(
+        saw_base_url_refresh,
+        "expected a runtime base URL refresh request after the provider switch"
+    );
+}
+
+#[tokio::test]
 async fn thread_settings_updated_preserves_default_settings_for_plan_mode() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
     let thread_id = ThreadId::new();
