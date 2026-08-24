@@ -419,7 +419,7 @@ async fn thread_settings_updated_provider_switch_confirms_in_transcript() {
         chat.config_ref().model_provider.base_url.as_deref(),
         Some(expected_base_url.as_str())
     );
-    assert_eq!(status_line_text(&chat).as_deref(), Some("ollama"));
+    assert_eq!(status_line_text(&chat).as_deref(), Some("ollama (local)"));
 
     let mut saw_base_url_refresh = false;
     let mut rendered = String::new();

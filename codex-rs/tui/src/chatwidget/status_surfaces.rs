@@ -653,7 +653,18 @@ impl ChatWidget {
             StatusLineItem::ModelName => Some(self.model_display_name().to_string()),
             StatusLineItem::ModelWithReasoning => Some(self.model_with_reasoning_display_name()),
             StatusLineItem::Reasoning => Some(self.reasoning_display_name()),
-            StatusLineItem::ModelProvider => Some(self.config.model_provider_id.clone()),
+            StatusLineItem::ModelProvider => {
+                // Append the auth mode so OAuth vs API-key usage is
+                // discernible at a glance, not inferred from provider id.
+                let auth = if self.config.model_provider.env_key.is_some() {
+                    "api-key"
+                } else if self.config.model_provider.requires_openai_auth {
+                    "oauth"
+                } else {
+                    "local"
+                };
+                Some(format!("{} ({auth})", self.config.model_provider_id))
+            }
             StatusLineItem::CurrentDir => {
                 Some(format_directory_display(
                     self.status_line_cwd(),
