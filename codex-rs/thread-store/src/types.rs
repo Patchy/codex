@@ -4,6 +4,8 @@ use std::sync::Arc;
 use chrono::DateTime;
 use chrono::Utc;
 use codex_app_server_protocol::CodexErrorInfo;
+use codex_app_server_protocol::ThreadTimelineEntry;
+use codex_protocol::SanitizedGitUrl;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
@@ -15,12 +17,12 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::MultiAgentVersion;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode as MemoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
+use codex_rollout::RolloutItem;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
@@ -198,6 +200,15 @@ pub struct PrepareForkParams {
     pub boundary: ForkBoundary,
 }
 
+/// Parameters for reverting a paginated thread's durable history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevertThreadParams {
+    /// Stable logical thread to revert.
+    pub thread_id: ThreadId,
+    /// First turn excluded from the retained history.
+    pub before_turn_id: String,
+}
+
 /// Frozen source history and model context for a reference-backed fork.
 #[derive(Debug)]
 pub struct PreparedFork {
@@ -305,6 +316,9 @@ pub struct ListThreadsParams {
     /// Omit to include every section, set to `None` to match unsectioned
     /// threads, or provide a section ID to match that section.
     pub section: Option<Option<String>>,
+    /// Omit to include every project, set to None for unassigned threads,
+    /// or provide a project ID to match that project.
+    pub project_id: ClearableField<String>,
     /// Whether archived threads should be listed instead of active threads.
     pub archived: bool,
     /// Optional substring/full-text search term for thread title/preview.
@@ -498,6 +512,22 @@ pub struct ItemPage {
     pub backwards_cursor: Option<String>,
 }
 
+/// Parameters for reading a bounded mixed thread timeline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListTimelineParams {
+    pub thread_id: ThreadId,
+    pub cursor: Option<String>,
+    pub page_size: usize,
+}
+
+/// Ordinary items, realtime facts, and the session state preceding their page.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TimelinePage {
+    pub items: Vec<ThreadTimelineEntry>,
+    pub next_cursor: Option<String>,
+    pub active_realtime_session_at_page_start: Option<String>,
+}
+
 /// Parameters for searching visible message occurrences within one paginated thread.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchThreadOccurrencesParams {
@@ -539,6 +569,9 @@ pub struct ThreadOccurrenceSearchPage {
 /// Store-owned thread metadata used by list/read/resume responses.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredThread {
+    /// Originator recorded at creation, if available from the backing store.
+    #[serde(default)]
+    pub originator: Option<String>,
     /// Thread id.
     pub thread_id: ThreadId,
     /// Optional extra configuration fields for the thread.
@@ -575,6 +608,12 @@ pub struct StoredThread {
     /// The time when the thread most recently entered its current section.
     #[serde(default)]
     pub section_entered_at: Option<DateTime<Utc>>,
+    /// Canonical project assignment owned by app-server, if any.
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// User-selected Daybreak preference, absent until explicitly set.
+    #[serde(default)]
+    pub daybreak_enabled: Option<bool>,
     /// Working directory captured for the thread.
     pub cwd: PathBuf,
     /// CLI version captured for the thread.
@@ -631,7 +670,7 @@ pub struct GitInfoPatch {
         skip_serializing_if = "Option::is_none",
         with = "optional_option"
     )]
-    pub origin_url: ClearableField<String>,
+    pub origin_url: ClearableField<SanitizedGitUrl>,
 }
 
 impl GitInfoPatch {
@@ -654,7 +693,7 @@ impl GitInfoPatch {
 
 /// Patch for thread metadata.
 ///
-/// Every field is literal: `None` leaves that field unchanged, while `Some`
+/// Unless noted otherwise, `None` leaves a field unchanged, while `Some`
 /// applies the supplied value. Fields whose value may itself be cleared use an
 /// inner `Option`, where `Some(None)` clears the field.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -691,6 +730,8 @@ pub struct ThreadMetadataPatch {
     pub advance_recency_at: Option<DateTime<Utc>>,
     /// Session source.
     pub source: Option<SessionSource>,
+    /// Recorded creation-time originator. Only fills a missing stored value.
+    pub originator: Option<String>,
     /// Optional analytics source classification.
     #[serde(
         default,
@@ -735,6 +776,15 @@ pub struct ThreadMetadataPatch {
     pub git_info: Option<GitInfoPatch>,
     /// Thread memory behavior.
     pub memory_mode: Option<MemoryMode>,
+    /// Initial project assignment supplied with thread creation.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_option"
+    )]
+    pub project_id: ClearableField<String>,
+    /// User-selected Daybreak preference; omission leaves it unchanged.
+    pub daybreak_enabled: Option<bool>,
 }
 
 impl ThreadMetadataPatch {
@@ -777,6 +827,9 @@ impl ThreadMetadataPatch {
         if next.source.is_some() {
             self.source = next.source;
         }
+        if next.originator.is_some() {
+            self.originator = next.originator;
+        }
         if next.thread_source.is_some() {
             self.thread_source = next.thread_source;
         }
@@ -815,6 +868,12 @@ impl ThreadMetadataPatch {
         if next.memory_mode.is_some() {
             self.memory_mode = next.memory_mode;
         }
+        if next.project_id.is_some() {
+            self.project_id = next.project_id;
+        }
+        if next.daybreak_enabled.is_some() {
+            self.daybreak_enabled = next.daybreak_enabled;
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -829,6 +888,7 @@ impl ThreadMetadataPatch {
             && self.updated_at.is_none()
             && self.advance_recency_at.is_none()
             && self.source.is_none()
+            && self.originator.is_none()
             && self.thread_source.is_none()
             && self.agent_nickname.is_none()
             && self.agent_role.is_none()
@@ -841,6 +901,8 @@ impl ThreadMetadataPatch {
             && self.first_user_message.is_none()
             && self.git_info.is_none()
             && self.memory_mode.is_none()
+            && self.project_id.is_none()
+            && self.daybreak_enabled.is_none()
     }
 }
 

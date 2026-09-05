@@ -12,6 +12,7 @@ use codex_api::Compression;
 use codex_api::Provider;
 use codex_api::ResponsesApiRequest;
 use codex_api::ResponsesClient;
+use codex_api::ResponsesEndpoint;
 use codex_api::ResponsesOptions;
 use codex_client::HttpTransport;
 use codex_client::Request;
@@ -307,10 +308,31 @@ async fn responses_client_uses_responses_path() -> Result<()> {
 }
 
 #[tokio::test]
+async fn responses_client_uses_guardian_path() -> Result<()> {
+    let state = RecordingState::default();
+    let transport = RecordingTransport::new(state.clone());
+    let client = ResponsesClient::new(transport, provider("openai"), Arc::new(NoAuth))
+        .with_endpoint(ResponsesEndpoint::Guardian);
+
+    let _stream = client
+        .stream(
+            serde_json::json!({ "echo": true }),
+            HeaderMap::new(),
+            Compression::None,
+            /*turn_state*/ None,
+        )
+        .await?;
+
+    assert_path_ends_with(&state.take_stream_requests(), "/guardian");
+    Ok(())
+}
+
+#[tokio::test]
 async fn responses_client_stream_request_preserves_item_ids() -> Result<()> {
     let state = RecordingState::default();
     let transport = RecordingTransport::new(state.clone());
-    let client = ResponsesClient::new(transport, provider("openai"), Arc::new(NoAuth));
+    let client = ResponsesClient::new(transport, provider("openai"), Arc::new(NoAuth))
+        .with_endpoint(ResponsesEndpoint::Guardian);
     let request = ResponsesApiRequest {
         model: "gpt-test".into(),
         instructions: "Say hi".into(),
@@ -333,15 +355,26 @@ async fn responses_client_stream_request_preserves_item_ids() -> Result<()> {
         prompt_cache_key: None,
         text: None,
         client_metadata: None,
+        access_programs: None,
     };
-    let expected = serde_json::to_value(&request)?;
+    let raw_ticket = "t".repeat(43);
+    let ticket = codex_protocol::guardian_ticket::GuardianTicket::from_server(&raw_ticket).unwrap();
+    let mut expected = serde_json::to_value(&request)?;
+    expected["client_metadata"] = serde_json::json!({"guardian_ticket": raw_ticket});
 
     let _stream = client
-        .stream_request(request, ResponsesOptions::default())
+        .stream_request(
+            request,
+            ResponsesOptions {
+                guardian_ticket: Some(ticket),
+                ..Default::default()
+            },
+        )
         .await?;
 
     let requests = state.take_stream_requests();
     assert_eq!(requests.len(), 1);
+    assert!(!format!("{:?}", requests[0]).contains(&raw_ticket));
     let prepared = requests[0]
         .prepare_body_for_send()
         .expect("body should prepare");
@@ -420,6 +453,7 @@ async fn streaming_client_retries_on_transport_error() -> Result<()> {
         prompt_cache_key: None,
         text: None,
         client_metadata: None,
+        access_programs: None,
     };
     let client = ResponsesClient::new(transport.clone(), provider, Arc::new(NoAuth));
 
@@ -540,6 +574,7 @@ async fn azure_store_sends_ids_and_headers() -> Result<()> {
         prompt_cache_key: None,
         text: None,
         client_metadata: None,
+        access_programs: None,
     };
 
     let mut extra_headers = HeaderMap::new();
@@ -554,6 +589,7 @@ async fn azure_store_sends_ids_and_headers() -> Result<()> {
                 extra_headers,
                 compression: Compression::None,
                 turn_state: None,
+                guardian_ticket: None,
             },
         )
         .await?;

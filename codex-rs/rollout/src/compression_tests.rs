@@ -9,9 +9,6 @@ use std::time::SystemTime;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HistoryPosition;
-use codex_protocol::protocol::InitialHistory;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
@@ -21,7 +18,10 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use super::*;
+use crate::InitialHistory;
 use crate::RolloutConfig;
+use crate::RolloutItem;
+use crate::RolloutLine;
 use crate::RolloutRecorder;
 use crate::RolloutRecorderParams;
 use crate::append_rollout_item_to_path;
@@ -331,61 +331,41 @@ async fn worker_waits_for_rollout_maintenance_before_compressing() -> anyhow::Re
 }
 
 #[tokio::test]
-async fn worker_skips_archived_paginated_fork_pointer_chain() -> anyhow::Result<()> {
+async fn worker_compresses_archived_fork_chain() -> anyhow::Result<()> {
     let home = TempDir::new()?;
+    let thread_id = ThreadId::from_string(&Uuid::from_u128(15).to_string())?;
     let source_uuid = Uuid::from_u128(16);
-    let source_id = ThreadId::from_string(&source_uuid.to_string())?;
+    let source_rollout_id = ThreadId::from_string(&source_uuid.to_string())?;
     let source_path = rollout_path(home.path(), "2025-01-03T12-00-00", source_uuid);
-    write_rollout(&source_path, source_id, "referenced source")?;
+    write_rollout(&source_path, thread_id, "referenced source")?;
     set_old_mtime(&source_path)?;
 
     let child_uuid = Uuid::from_u128(17);
-    let child_id = ThreadId::from_string(&child_uuid.to_string())?;
     let child_path = archived_rollout_path(home.path(), "2025-01-03T12-00-01", child_uuid);
-    write_rollout(&child_path, child_id, "fork child")?;
+    write_rollout(&child_path, thread_id, "fork child")?;
     set_history_base(
         child_path.as_path(),
         HistoryPosition {
-            thread_id: source_id,
+            thread_id: source_rollout_id,
             end_ordinal_exclusive: 2,
             end_byte_offset: std::fs::metadata(source_path.as_path())?.len(),
         },
     )?;
     set_old_mtime(&child_path)?;
+    let original_source = fs::read(&source_path)?;
+    let original_child = fs::read(&child_path)?;
 
     worker::run(home.path().to_path_buf()).await?;
 
-    assert!(source_path.exists());
-    assert!(child_path.exists());
-    Ok(())
-}
-
-#[tokio::test]
-async fn worker_skips_source_referenced_by_archived_compressed_rollout() -> anyhow::Result<()> {
-    let home = TempDir::new()?;
-    let source_uuid = Uuid::from_u128(18);
-    let source_id = ThreadId::from_string(&source_uuid.to_string())?;
-    let source_path = rollout_path(home.path(), "2025-01-03T12-00-00", source_uuid);
-    write_rollout(&source_path, source_id, "referenced source")?;
-    set_old_mtime(&source_path)?;
-
-    let child_uuid = Uuid::from_u128(19);
-    let child_id = ThreadId::from_string(&child_uuid.to_string())?;
-    let child_path = archived_rollout_path(home.path(), "2025-01-03T12-00-01", child_uuid);
-    write_rollout(&child_path, child_id, "fork child")?;
-    set_history_base(
-        child_path.as_path(),
-        HistoryPosition {
-            thread_id: source_id,
-            end_ordinal_exclusive: 2,
-            end_byte_offset: std::fs::metadata(source_path.as_path())?.len(),
-        },
-    )?;
-    compress_now(child_path.as_path())?;
-
-    worker::run(home.path().to_path_buf()).await?;
-
-    assert!(source_path.exists());
+    for (path, original) in [
+        (&source_path, original_source),
+        (&child_path, original_child),
+    ] {
+        assert!(!path.exists(), "compression should replace {path:?}");
+        let mut restored = Vec::new();
+        crate::open_rollout_seekable_reader(path)?.read_to_end(&mut restored)?;
+        assert_eq!(restored, original);
+    }
     Ok(())
 }
 
@@ -697,6 +677,7 @@ fn write_rollout(path: &std::path::Path, thread_id: ThreadId, message: &str) -> 
             session_id: thread_id.into(),
             id: thread_id,
             forked_from_id: None,
+            forked_from_ordinal_exclusive: None,
             parent_thread_id: None,
             timestamp: "2025-01-03T12:00:00Z".to_string(),
             cwd: parent.to_path_buf(),

@@ -33,7 +33,9 @@ pub async fn build_prompt_input(
     config.ephemeral = true;
 
     let auth_manager =
-        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
+        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
+            .await
+            .map_err(|err| CodexErr::Fatal(err.to_string()))?;
 
     let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
         config.codex_self_exe.clone(),
@@ -60,6 +62,7 @@ pub async fn build_prompt_input(
         extensions,
         user_instructions_provider,
         /*analytics_events_client*/ None,
+        crate::thread_manager::passthrough_image_store(),
         thread_store,
         crate::local_agent_graph_store_from_state_db(state_db.as_ref()),
         installation_id,
@@ -99,14 +102,9 @@ pub(crate) async fn build_prompt_input_from_session(
     let prompt_input = sess
         .clone_history()
         .await
-        .for_prompt(&turn_context.model_info.input_modalities);
+        .for_prompt(&step_context.settings.model_info.input_modalities);
     let base_instructions = sess.get_base_instructions().await;
-    let prompt = build_prompt(
-        prompt_input,
-        step_context.tool_router.as_ref(),
-        turn_context.as_ref(),
-        base_instructions,
-    );
+    let prompt = build_prompt(prompt_input, step_context.as_ref(), base_instructions);
 
     Ok(prompt.input)
 }

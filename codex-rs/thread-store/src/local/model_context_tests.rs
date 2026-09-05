@@ -11,18 +11,19 @@ use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AskForApproval;
-use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::ItemCompletedEvent;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::TurnStartedEvent;
+use codex_protocol::protocol::WorldStateItem;
 use codex_protocol::user_input::UserInput;
+use codex_rollout::CompactedItem;
+use codex_rollout::RolloutItem;
+use codex_rollout::RolloutLine;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -79,6 +80,114 @@ async fn loads_latest_checkpoint_with_required_turn_metadata() {
     assert!(context.items.iter().any(|item| {
         matches!(item, RolloutItem::TurnContext(context) if context.turn_id.as_deref() == Some("turn-2"))
     }));
+}
+
+#[tokio::test]
+async fn loads_recent_context_after_many_empty_wake_turns() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 1008);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_paginated_rollout(
+        home.path(),
+        "2025-01-03T13-00-07",
+        uuid,
+        [
+            turn_started("user-turn"),
+            user_message("keep working"),
+            completed_user_message("user-turn", "keep working"),
+            turn_context(home.path(), "user-turn"),
+            turn_complete("user-turn"),
+        ],
+    );
+    let mut expected_suffix = Vec::new();
+    for index in 0..32 {
+        let turn_id = format!("wake-{index}");
+        let mut items = vec![turn_started(&turn_id)];
+        if index % 8 == 0 {
+            expected_suffix.clear();
+            items.extend([
+                compacted(&format!("checkpoint-{index}"), Some(Vec::new())),
+                RolloutItem::WorldState(WorldStateItem::full(Default::default())),
+            ]);
+        }
+        items.extend([
+            turn_context(home.path(), &turn_id),
+            contextual_user_message(),
+            turn_complete(&turn_id),
+        ]);
+        append_items(&path, items.clone());
+        expected_suffix.extend(items);
+    }
+    let session_meta = codex_rollout::read_session_meta_line(&path)
+        .await
+        .expect("read session metadata");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let context = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await
+        .expect("load model context");
+    expected_suffix.insert(0, RolloutItem::SessionMeta(session_meta));
+
+    assert_eq!(
+        serde_json::to_value(context.items).expect("serialize context"),
+        serde_json::to_value(expected_suffix).expect("serialize expected context")
+    );
+}
+
+#[tokio::test]
+async fn empty_wake_requires_surviving_full_world_state_and_matching_context() {
+    enum MissingBaseline {
+        SnapshotBeforeCompaction,
+        PatchOnly,
+        MissingContext,
+        IncompatibleContext,
+    }
+    for baseline in [
+        MissingBaseline::SnapshotBeforeCompaction,
+        MissingBaseline::PatchOnly,
+        MissingBaseline::MissingContext,
+        MissingBaseline::IncompatibleContext,
+    ] {
+        let home = TempDir::new().expect("temp dir");
+        let path = write_paginated_rollout(
+            home.path(),
+            "2025-01-03T13-00-08",
+            Uuid::from_u128(/*v*/ 1009),
+            [
+                turn_started("user-turn"),
+                completed_user_message("user-turn", "keep working"),
+                turn_context(home.path(), "user-turn"),
+                turn_complete("user-turn"),
+                turn_started("wake"),
+            ],
+        );
+        let full = RolloutItem::WorldState(WorldStateItem::full(Default::default()));
+        let checkpoint = compacted("checkpoint", Some(Vec::new()));
+        let context = turn_context(home.path(), "wake");
+        let items = match baseline {
+            MissingBaseline::SnapshotBeforeCompaction => vec![full, checkpoint, context],
+            MissingBaseline::PatchOnly => vec![
+                checkpoint,
+                RolloutItem::WorldState(WorldStateItem::patch(Default::default())),
+                context,
+            ],
+            MissingBaseline::MissingContext => vec![checkpoint, full],
+            MissingBaseline::IncompatibleContext => {
+                vec![
+                    checkpoint,
+                    full,
+                    turn_context(home.path(), "different-turn"),
+                ]
+            }
+        };
+        append_items(&path, items);
+        append_items(&path, [turn_complete("wake")]);
+
+        assert_reverse_scan_matches_full_history(home.path(), &path).await;
+    }
 }
 
 #[tokio::test]
@@ -386,8 +495,33 @@ async fn replays_nested_archived_lineage_from_frozen_prefix() {
         turn_complete("child-turn"),
     ];
     assert_eq!(
-        serde_json::to_value(context.items).expect("serialize context"),
+        serde_json::to_value(&context.items).expect("serialize context"),
+        serde_json::to_value(&expected).expect("serialize expected context")
+    );
+    // The same frozen lineage must replay from compressed files, without materializing or
+    // accidentally including the archived root's records after the inherited cutoff.
+    for path in [&archived_root, &middle_path, &child_path] {
+        let input = std::fs::File::open(path).expect("open rollout");
+        let output = std::fs::File::create(path.with_extension("jsonl.zst"))
+            .expect("create compressed rollout");
+        zstd::stream::copy_encode(input, output, /*level*/ 3).expect("compress rollout");
+        std::fs::remove_file(path).expect("remove plain rollout");
+    }
+    let compressed_context = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id: child_id,
+            include_archived: false,
+        })
+        .await
+        .expect("load compressed lineage model context");
+    assert_eq!(
+        serde_json::to_value(compressed_context.items).expect("serialize compressed context"),
         serde_json::to_value(expected).expect("serialize expected context")
+    );
+    assert!(
+        [archived_root, middle_path, child_path]
+            .iter()
+            .all(|path| !path.exists())
     );
 }
 
@@ -465,8 +599,8 @@ fn rollout_end_byte_offset(path: &Path, end_ordinal_exclusive: u64) -> u64 {
     let contents = std::fs::read(path).expect("read rollout");
     let mut byte_offset = 0_u64;
     for line in contents.split_inclusive(|byte| *byte == b'\n') {
-        let parsed: RolloutLine =
-            serde_json::from_slice(line).expect("parse rollout line for byte offset");
+        let parsed = codex_rollout::parse_rollout_line_bytes(line)
+            .expect("parse rollout line for byte offset");
         if parsed.ordinal == Some(end_ordinal_exclusive) {
             return byte_offset;
         }
@@ -498,7 +632,7 @@ async fn assert_reverse_scan_matches_full_history(home: &Path, path: &Path) {
     );
 }
 
-fn append_items<const N: usize>(path: &Path, items: [RolloutItem; N]) {
+fn append_items(path: &Path, items: impl IntoIterator<Item = RolloutItem>) {
     let mut file = OpenOptions::new()
         .append(true)
         .open(path)
@@ -541,15 +675,18 @@ fn turn_complete(turn_id: &str) -> RolloutItem {
 }
 
 fn user_message(message: &str) -> RolloutItem {
-    RolloutItem::ResponseItem(ResponseItem::Message {
-        id: None,
-        role: "user".to_string(),
-        content: vec![ContentItem::InputText {
-            text: message.to_string(),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    })
+    RolloutItem::ResponseItem(
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: message.to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }
+        .into(),
+    )
 }
 
 fn contextual_user_message() -> RolloutItem {
@@ -575,20 +712,24 @@ fn completed_user_message(turn_id: &str, message: &str) -> RolloutItem {
 }
 
 fn agent_message(message: &str) -> RolloutItem {
-    RolloutItem::ResponseItem(ResponseItem::AgentMessage {
-        id: None,
-        author: "worker".to_string(),
-        recipient: "root".to_string(),
-        content: vec![AgentMessageInputContent::InputText {
-            text: message.to_string(),
-        }],
-        internal_chat_message_metadata_passthrough: None,
-    })
+    RolloutItem::ResponseItem(
+        ResponseItem::AgentMessage {
+            id: None,
+            author: "worker".to_string(),
+            recipient: "root".to_string(),
+            content: vec![AgentMessageInputContent::InputText {
+                text: message.to_string(),
+            }],
+            internal_chat_message_metadata_passthrough: None,
+        }
+        .into(),
+    )
 }
 
 fn turn_context(root: &Path, turn_id: &str) -> RolloutItem {
     RolloutItem::TurnContext(TurnContextItem {
         turn_id: Some(turn_id.to_string()),
+        root_turn_id: None,
         cwd: serde_json::from_value(serde_json::json!(root)).expect("absolute cwd"),
         workspace_roots: None,
         current_date: None,
@@ -597,6 +738,7 @@ fn turn_context(root: &Path, turn_id: &str) -> RolloutItem {
         approvals_reviewer: None,
         sandbox_policy: SandboxPolicy::new_read_only_policy(),
         permission_profile: None,
+        active_permission_profile: None,
         network: None,
         file_system_sandbox_policy: None,
         model: "test-model".to_string(),
@@ -606,6 +748,7 @@ fn turn_context(root: &Path, turn_id: &str) -> RolloutItem {
         multi_agent_version: None,
         multi_agent_mode: None,
         realtime_active: None,
+        cyber_access_program: None,
         effort: None,
         summary: ReasoningSummary::Auto,
     })
@@ -614,10 +757,16 @@ fn turn_context(root: &Path, turn_id: &str) -> RolloutItem {
 fn compacted(message: &str, replacement_history: Option<Vec<ResponseItem>>) -> RolloutItem {
     RolloutItem::Compacted(CompactedItem {
         message: message.to_string(),
-        replacement_history,
+        replacement_history: replacement_history
+            .map(|items| items.into_iter().map(Into::into).collect()),
+        retained_context: None,
+        guardian_history: None,
+        mcp_resource_origins: None,
         window_number: Some(1),
         first_window_id: None,
         previous_window_id: None,
         window_id: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
     })
 }

@@ -7,14 +7,18 @@ pub mod policy_transforms;
 #[cfg(target_os = "macos")]
 pub mod seatbelt;
 mod spawn;
+mod terminal_queries;
 mod violation;
 mod windows;
+#[cfg(windows)]
+mod windows_mxc;
 
 #[cfg(target_os = "linux")]
 pub use bwrap::find_system_bwrap_in_path;
 #[cfg(target_os = "linux")]
 pub use bwrap::system_bwrap_warning;
 pub use codex_windows_sandbox::WindowsSandboxProxySettingsMode;
+pub use denial::is_likely_executor_managed_sandbox_denied;
 pub use denial::is_likely_sandbox_denied;
 pub use manager::SandboxCommand;
 pub use manager::SandboxDirectSpawnTransformRequest;
@@ -65,6 +69,10 @@ impl From<SandboxTransformError> for CodexErr {
                 CodexErr::LandlockSandboxExecutableNotProvided
             }
             SandboxTransformError::EnvironmentNetworkProxy(message) => {
+                CodexErr::UnsupportedOperation(message)
+            }
+            #[cfg(target_os = "macos")]
+            SandboxTransformError::SeatbeltPreparation(message) => {
                 CodexErr::UnsupportedOperation(message)
             }
             #[cfg(target_os = "linux")]

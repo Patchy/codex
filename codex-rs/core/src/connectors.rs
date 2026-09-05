@@ -41,7 +41,6 @@ use codex_mcp::ToolPluginProvenance;
 use codex_mcp::effective_mcp_servers;
 use codex_mcp::tool_plugin_provenance;
 use codex_protocol::mcp::ClientMcpExtensions;
-use codex_protocol::models::PermissionProfile;
 
 const CONNECTORS_READY_TIMEOUT_ON_EMPTY_TOOLS: Duration = Duration::from_secs(30);
 
@@ -120,7 +119,9 @@ pub async fn list_cached_accessible_connectors_from_mcp_tools(
     config: &Config,
 ) -> Option<Vec<AppInfo>> {
     let auth_manager =
-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
+        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false)
+            .await
+            .ok()?;
     let auth = auth_manager.auth().await;
     if !config
         .features
@@ -187,7 +188,12 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_environment_manager(
     force_refetch: bool,
     environment_manager: Arc<EnvironmentManager>,
 ) -> anyhow::Result<AccessibleConnectorsStatus> {
-    let plugins_manager = Arc::new(plugins_manager_for_config(config));
+    let auth_manager =
+        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await?;
+    let plugins_manager = Arc::new(plugins_manager_for_config(
+        config,
+        Arc::clone(&auth_manager),
+    ));
     let mcp_manager = Arc::new(McpManager::new(plugins_manager));
     list_accessible_connectors_from_mcp_tools_with_mcp_manager(
         config,
@@ -205,7 +211,7 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
     mcp_manager: Arc<McpManager>,
 ) -> anyhow::Result<AccessibleConnectorsStatus> {
     let auth_manager =
-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
+        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await?;
     let auth = auth_manager.auth().await;
     if !config
         .features
@@ -217,10 +223,7 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
         });
     }
     let cache_key = accessible_connectors_cache_key(config, auth.as_ref());
-    let mut mcp_config = mcp_manager.runtime_config(config).await;
-    // Discovery has no active turn or reviewer and must never inherit execution authority.
-    mcp_config.permission_profile = PermissionProfile::default();
-    let mcp_config = Arc::new(mcp_config);
+    let mcp_config = mcp_manager.runtime_config(config).await;
     let tool_plugin_provenance = tool_plugin_provenance(&mcp_config);
     if !force_refetch && let Some(cached_connectors) = read_cached_accessible_connectors(&cache_key)
     {
@@ -233,6 +236,7 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
 
     let mut mcp_servers = effective_mcp_servers(&mcp_config, auth.as_ref());
     mcp_servers.retain(|name, _| name == CODEX_APPS_MCP_SERVER_NAME);
+    let mcp_config = Arc::new(mcp_config.for_threadless_operations(&mcp_servers));
     if mcp_servers.is_empty() {
         return Ok(AccessibleConnectorsStatus {
             connectors: Vec::new(),
@@ -264,7 +268,7 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
         codex_apps_tools_cache_key: connector_runtime_context_key(auth.as_ref()),
         client_mcp_extensions: ClientMcpExtensions::default(),
         auth: auth.clone(),
-        codex_apps_auth_manager,
+        auth_manager: codex_apps_auth_manager,
         elicitation_reviewer: None,
         elicitation_lifecycle: None,
     })
@@ -427,8 +431,11 @@ async fn cached_directory_connectors_for_tool_suggest_with_auth(
     let auth = if let Some(auth) = auth {
         Some(auth)
     } else {
-        let auth_manager =
-            AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
+        let Ok(auth_manager) =
+            AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await
+        else {
+            return Vec::new();
+        };
         loaded_auth = auth_manager.auth().await;
         loaded_auth.as_ref()
     };
@@ -504,27 +511,13 @@ pub fn with_app_plugin_sources(
     connectors
 }
 
-pub(crate) fn mcp_approvals_reviewer(
-    config: &Config,
-    model: Option<&str>,
-    server_name: &str,
-    connector_id: Option<&str>,
-) -> ApprovalsReviewer {
-    mcp_approvals_reviewer_from_layers(
-        &config.config_layer_stack,
-        config.approvals_reviewer,
-        model,
-        server_name,
-        connector_id,
-    )
-}
-
 pub(crate) fn mcp_approvals_reviewer_from_layers(
     config_layer_stack: &codex_config::ConfigLayerStack,
     default_reviewer: ApprovalsReviewer,
     model: Option<&str>,
     server_name: &str,
     connector_id: Option<&str>,
+    link_id: Option<&str>,
 ) -> ApprovalsReviewer {
     let requirements = config_layer_stack.requirements();
     if model.is_some_and(|model| requirements.auto_review_required_for_model(model)) {
@@ -533,9 +526,11 @@ pub(crate) fn mcp_approvals_reviewer_from_layers(
 
     let app_reviewer = if server_name == CODEX_APPS_MCP_SERVER_NAME {
         apps_config_from_layer_stack(config_layer_stack).and_then(|apps_config| {
-            connector_id
-                .and_then(|connector_id| apps_config.apps.get(connector_id))
-                .and_then(|app| app.approvals_reviewer)
+            let app = connector_id.and_then(|connector_id| apps_config.apps.get(connector_id));
+            link_id
+                .and_then(|link_id| app?.links.as_ref()?.links.get(link_id))
+                .and_then(|link| link.approvals_reviewer)
+                .or_else(|| app.and_then(|app| app.approvals_reviewer))
                 .or_else(|| {
                     apps_config
                         .default

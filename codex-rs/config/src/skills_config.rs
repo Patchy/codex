@@ -1,6 +1,7 @@
 //! Skill-related configuration types shared across crates.
 
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
 
 use crate::ConfigLayerSource;
 use crate::ConfigLayerStack;
@@ -35,6 +36,11 @@ pub struct SkillsConfig {
     /// Whether turns receive the automatic skills instructions block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_instructions: Option<bool>,
+
+    /// Maximum tokens used by the available-skills catalog. Defaults to 2% of
+    /// the model context window and is capped at 10,000 tokens when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<NonZeroUsize>,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub config: Vec<SkillConfig>,
@@ -117,6 +123,27 @@ impl SkillConfigRules {
 
         disabled_paths
     }
+}
+
+/// Returns whether bundled skills are enabled by the effective configuration.
+pub fn bundled_skills_enabled_from_stack(config_layer_stack: &ConfigLayerStack) -> bool {
+    let effective_config = config_layer_stack.effective_config();
+    let Some(skills_value) = effective_config
+        .as_table()
+        .and_then(|table| table.get("skills"))
+    else {
+        return true;
+    };
+
+    let skills: SkillsConfig = match skills_value.clone().try_into() {
+        Ok(skills) => skills,
+        Err(err) => {
+            warn!("invalid skills config: {err}");
+            return true;
+        }
+    };
+
+    skills.bundled.unwrap_or_default().enabled
 }
 
 /// Resolves skill enablement rules from user and session configuration layers.

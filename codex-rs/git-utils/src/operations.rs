@@ -4,9 +4,27 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
+use codex_protocol::shell_environment::scrub_non_inheritable_env_vars;
+
 use crate::GitToolingError;
 
 const DISABLED_HOOKS_PATH: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+
+/// Encodes Git overrides without treating equals signs in keys as separators.
+pub fn git_config_override_env(
+    overrides: impl IntoIterator<Item = (String, String)>,
+) -> Vec<(String, String)> {
+    let overrides: Vec<_> = overrides.into_iter().collect();
+    if overrides.is_empty() {
+        return Vec::new();
+    }
+    let mut environment = vec![("GIT_CONFIG_COUNT".to_owned(), overrides.len().to_string())];
+    for (index, (key, value)) in overrides.into_iter().enumerate() {
+        environment.push((format!("GIT_CONFIG_KEY_{index}"), key));
+        environment.push((format!("GIT_CONFIG_VALUE_{index}"), value));
+    }
+    environment
+}
 
 pub(crate) fn ensure_git_repository(path: &Path) -> Result<(), GitToolingError> {
     match run_git_for_stdout(
@@ -120,7 +138,7 @@ where
         }
     }
     command.args(&args_vec);
-    crate::scrub_non_inheritable_environment(&mut command);
+    scrub_non_inheritable_env_vars(&mut command);
     let output = command.output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();

@@ -10,12 +10,12 @@ use codex_protocol::ThreadId;
 use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GitInfo;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::protocol::strip_user_message_prefix;
 use codex_protocol::protocol::user_message_preview;
+use codex_rollout::RolloutItem;
 use codex_state::ThreadMetadata;
 
 use crate::CreateThreadParams;
@@ -67,6 +67,7 @@ impl ThreadMetadataSync {
             created_at: Some(created_at),
             updated_at: Some(created_at),
             source: Some(params.source.clone()),
+            originator: (!params.originator.is_empty()).then(|| params.originator.clone()),
             thread_source: Some(params.thread_source.clone()),
             agent_nickname: Some(params.source.get_nickname()),
             agent_role: Some(params.source.get_agent_role()),
@@ -228,6 +229,9 @@ impl ThreadMetadataSync {
                 RolloutItem::SessionMeta(meta_line) if meta_line.meta.id == self.thread_id => {
                     update.created_at = parse_session_timestamp(meta_line.meta.timestamp.as_str());
                     update.source = Some(meta_line.meta.source.clone());
+                    if !meta_line.meta.originator.is_empty() {
+                        update.originator = Some(meta_line.meta.originator.clone());
+                    }
                     update.thread_source = Some(meta_line.meta.thread_source.clone());
                     update.agent_nickname = Some(meta_line.meta.agent_nickname.clone());
                     update.agent_role = Some(meta_line.meta.agent_role.clone());
@@ -304,6 +308,10 @@ impl ThreadMetadataSync {
                 | RolloutItem::InterAgentCommunication(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::Compacted(_)
+                | RolloutItem::RealtimeItem(_)
+                | RolloutItem::TokenUsageRecord(_)
+                | RolloutItem::RetainedContext(_)
+                | RolloutItem::SecurityRiskScore(_)
                 | RolloutItem::WorldState(_) => {}
             }
         }
@@ -377,6 +385,7 @@ fn update_has_metadata_facts(update: &ThreadMetadataPatch) -> bool {
         || update.created_at.is_some()
         || update.advance_recency_at.is_some()
         || update.source.is_some()
+        || update.originator.is_some()
         || update.thread_source.is_some()
         || update.agent_nickname.is_some()
         || update.agent_role.is_some()
@@ -412,7 +421,6 @@ mod tests {
     use codex_protocol::models::PermissionProfile;
     use codex_protocol::openai_models::ReasoningEffort;
     use codex_protocol::protocol::AskForApproval;
-    use codex_protocol::protocol::CompactedItem;
     use codex_protocol::protocol::ItemCompletedEvent;
     use codex_protocol::protocol::SessionMeta;
     use codex_protocol::protocol::SessionMetaLine;
@@ -425,10 +433,47 @@ mod tests {
     use codex_protocol::protocol::TurnStartedEvent;
     use codex_protocol::protocol::UserMessageEvent;
     use codex_protocol::user_input::UserInput;
+    use codex_rollout::CompactedItem;
     use pretty_assertions::assert_eq;
 
     use super::*;
+    use crate::CreateThreadParams;
     use crate::ThreadPersistenceMetadata;
+
+    #[tokio::test]
+    async fn create_metadata_records_originator_without_project() {
+        let thread_id = ThreadId::new();
+        let sync = ThreadMetadataSync::for_create(&CreateThreadParams {
+            session_id: thread_id.into(),
+            thread_id,
+            extra_config: None,
+            forked_from_id: None,
+            parent_thread_id: None,
+            source: SessionSource::Exec,
+            thread_source: None,
+            originator: "test_originator".to_string(),
+            base_instructions: codex_protocol::models::BaseInstructions::default(),
+            dynamic_tools: Vec::new(),
+            selected_capability_roots: Vec::new(),
+            multi_agent_version: None,
+            history_mode: ThreadHistoryMode::Legacy,
+            history_base: None,
+            subagent_history_start_ordinal: None,
+            initial_window_id: uuid::Uuid::now_v7().to_string(),
+            metadata: ThreadPersistenceMetadata {
+                cwd: None,
+                model_provider: "test-provider".to_string(),
+                memory_mode: ThreadMemoryMode::Enabled,
+            },
+        })
+        .await;
+
+        let update = sync.take_pending_update().expect("pending metadata update");
+        assert_eq!(
+            (update.patch.project_id, update.patch.originator.as_deref()),
+            (None, Some("test_originator")),
+        );
+    }
 
     #[test]
     fn resume_history_keeps_derived_metadata_pending_until_applied() {
@@ -451,6 +496,7 @@ mod tests {
             "2025-01-03T12:00:00+00:00"
         );
         assert_eq!(update.patch.preview.as_deref(), Some("hello metadata"));
+        assert_eq!(update.patch.originator.as_deref(), Some("test_originator"));
         assert_eq!(update.patch.title.as_deref(), Some("hello metadata"));
         assert_eq!(
             update.patch.first_user_message.as_deref(),
@@ -547,10 +593,15 @@ mod tests {
         let item = RolloutItem::Compacted(CompactedItem {
             message: "compacted".to_string(),
             replacement_history: None,
+            retained_context: None,
+            guardian_history: None,
+            mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         });
 
         let first = sync
@@ -602,6 +653,7 @@ mod tests {
 
         let mut item = RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
             ThreadSettingsAppliedEvent {
+                thread_id: None,
                 thread_settings: ThreadSettingsSnapshot {
                     model: "gpt-5.2-codex".to_string(),
                     model_provider_id: "updated-provider".to_string(),
@@ -774,6 +826,7 @@ mod tests {
                 id: thread_id,
                 timestamp: "2025-01-03T12:00:00Z".to_string(),
                 source: SessionSource::Exec,
+                originator: "test_originator".to_string(),
                 ..Default::default()
             },
             git: None,

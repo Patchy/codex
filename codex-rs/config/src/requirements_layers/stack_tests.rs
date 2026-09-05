@@ -61,17 +61,26 @@ fn empty_layers_compose_to_none() {
 fn cloud_auth_requirements_do_not_override_local_or_discard_other_policy() {
     let local = RequirementsLayerEntry::from_toml(
         RequirementSource::Unknown,
-        "allowed_login_methods = [\"api\"]",
+        r#"allowed_login_methods = ["api"]
+cli_auth_credentials_store = "keyring"
+chatgpt_base_url = "https://managed.example/backend-api/""#,
     );
     let cloud = layer(
         "req_cloud",
         "Cloud policy",
-        "allowed_login_methods = [\"saml\"]\nallowed_chatgpt_workspaces = \"invalid\"\nallow_login_shell = false",
+        r#"allowed_login_methods = ["saml"]
+allowed_chatgpt_workspaces = "invalid"
+cli_auth_credentials_store = "invalid"
+chatgpt_base_url = false
+allow_login_shell = false"#,
     );
     assert_eq!(
         compose(vec![local, cloud]).expect("cloud auth cannot invalidate enterprise policy"),
         Some(expected_requirements(
-            "allowed_login_methods = [\"api\"]\nallow_login_shell = false"
+            r#"allowed_login_methods = ["api"]
+cli_auth_credentials_store = "keyring"
+chatgpt_base_url = "https://managed.example/backend-api/"
+allow_login_shell = false"#
         ))
     );
 }
@@ -87,6 +96,7 @@ allowed_approval_policies = ["on-request"]
 allowed_sandbox_modes = ["workspace-write"]
 default_permissions = ":workspace"
 allow_remote_control = true
+additional_developer_instructions = "Lower-priority instructions."
 
 [allowed_permission_profiles]
 ":read-only" = true
@@ -101,6 +111,7 @@ allowed_approval_policies = ["never"]
 allowed_sandbox_modes = ["read-only"]
 default_permissions = ":read-only"
 allow_remote_control = false
+additional_developer_instructions = ""
 
 [allowed_permission_profiles]
 ":danger-full-access" = false
@@ -119,6 +130,7 @@ allowed_approval_policies = ["never"]
 allowed_sandbox_modes = ["read-only"]
 default_permissions = ":read-only"
 allow_remote_control = false
+additional_developer_instructions = ""
 
 [allowed_permission_profiles]
 ":danger-full-access" = false
@@ -458,6 +470,35 @@ approval_mode = "approve"
 }
 
 #[test]
+fn feature_aliases_merge_with_layer_precedence() {
+    for (low_key, high_key) in [
+        ("features", "feature_requirements"),
+        ("feature_requirements", "features"),
+    ] {
+        let composed = compose(vec![
+            layer(
+                "req_low",
+                "Low",
+                &format!("[{low_key}]\nchronicle = true\nshell_snapshot = false"),
+            ),
+            layer(
+                "req_high",
+                "High",
+                &format!("[{high_key}]\nchronicle = false\napps = false"),
+            ),
+        ])
+        .expect("compose mixed feature aliases");
+
+        assert_eq!(
+            composed,
+            Some(expected_requirements(
+                "[features]\nchronicle = false\nshell_snapshot = false\napps = false"
+            ))
+        );
+    }
+}
+
+#[test]
 fn merged_table_source_is_composite_in_priority_order() {
     let high_source = RequirementSource::EnterpriseManaged {
         id: "req_high".to_string(),
@@ -595,6 +636,141 @@ fn network_maps_use_regular_toml_merge() {
 "#
         )
     );
+}
+
+#[test]
+fn browser_and_computer_use_requirements_use_regular_toml_merge() {
+    let composed = compose(vec![
+        layer(
+            "req_low",
+            "Low",
+            r#"
+allow_browser_and_computer_use = true
+
+[browser_use]
+allow_history_access = true
+allow_global_persistent_approval = true
+
+[browser_use.default_origin_policy]
+access = "allow"
+access_approval_lifetime = "thread"
+
+[browser_use.origins."https://example.com"]
+access = "deny"
+downloads = "allow"
+
+[computer_use]
+allow_locked_computer_use = true
+default_app_access = "allow"
+
+[computer_use.macos.bundle_ids]
+"com.apple.Safari" = "deny"
+
+[computer_use.windows.aumids]
+"Microsoft.Paint_8wekyb3d8bbwe!App" = "allow"
+"#,
+        ),
+        layer(
+            "req_high",
+            "High",
+            r#"
+allow_browser_and_computer_use = false
+
+[browser_use]
+allow_history_access = false
+allow_global_persistent_approval = false
+
+[browser_use.default_origin_policy]
+persistent_approval = false
+access_approval_lifetime = "turn"
+
+[browser_use.origins."https://example.com"]
+downloads = "deny"
+uploads = "deny"
+
+[computer_use]
+allow_persistent_approval = false
+
+[computer_use.macos.bundle_ids]
+"com.apple.Safari" = "allow"
+
+[[computer_use.windows.exes]]
+publisher_name = "CN=Google LLC"
+product_name = "Google Chrome"
+binary_name = "chrome.exe"
+access = "deny"
+"#,
+        ),
+    ])
+    .expect("compose requirements")
+    .expect("requirements present");
+
+    assert_eq!(
+        composed,
+        expected_requirements(
+            r#"
+allow_browser_and_computer_use = false
+
+[browser_use]
+allow_history_access = false
+allow_global_persistent_approval = false
+
+[browser_use.default_origin_policy]
+access = "allow"
+persistent_approval = false
+access_approval_lifetime = "turn"
+
+[browser_use.origins."https://example.com"]
+access = "deny"
+downloads = "deny"
+uploads = "deny"
+
+[computer_use]
+allow_locked_computer_use = true
+allow_persistent_approval = false
+default_app_access = "allow"
+
+[computer_use.macos.bundle_ids]
+"com.apple.Safari" = "allow"
+
+[computer_use.windows.aumids]
+"Microsoft.Paint_8wekyb3d8bbwe!App" = "allow"
+
+[[computer_use.windows.exes]]
+publisher_name = "CN=Google LLC"
+product_name = "Google Chrome"
+binary_name = "chrome.exe"
+access = "deny"
+"#
+        )
+    );
+}
+
+#[test]
+fn webmcp_requirements_preserve_managed_layer_precedence() {
+    for (lower, higher, expected) in [
+        ("true", "[browser_use]", true),
+        ("false", "[browser_use]", false),
+        ("true", "[browser_use]\nallow_webmcp = false", false),
+        ("false", "[browser_use]\nallow_webmcp = true", true),
+    ] {
+        let lower = format!("[browser_use]\nallow_webmcp = {lower}");
+        let composed = compose(vec![
+            layer("req_low", "Low", &lower),
+            layer("req_high", "High", higher),
+        ])
+        .expect("compose managed WebMCP policy");
+        assert_eq!(
+            composed,
+            Some(ConfigRequirementsToml {
+                browser_use: Some(crate::BrowserUseRequirementsToml {
+                    allow_webmcp: Some(expected),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        );
+    }
 }
 
 #[test]

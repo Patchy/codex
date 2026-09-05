@@ -1,5 +1,5 @@
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::RolloutItem;
+use codex_rollout::RolloutItem;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
@@ -23,12 +23,12 @@ fn parses_legacy_numeric_event_payloads_through_value() {
             "info": null,
             "rate_limits": {
                 "primary": {
-                    "used_percent": 2,
+                    "used_percent": 0.0,
                     "window_minutes": 300,
                     "resets_at": 1_770_414_841,
                 },
                 "secondary": {
-                    "used_percent": 12,
+                    "used_percent": 12.5,
                     "window_minutes": 10_080,
                     "resets_at": 1_770_698_702,
                 },

@@ -19,6 +19,7 @@ use codex_app_server_client::ExecServerRuntimePaths;
 use codex_app_server_client::InProcessAppServerClient;
 use codex_app_server_client::InProcessClientStartArgs;
 use codex_app_server_client::InProcessServerEvent;
+use codex_app_server_client::TypedRequestError;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::JSONRPCErrorError;
@@ -33,6 +34,7 @@ use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::Thread as AppServerThread;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
+use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadItem as AppServerThreadItem;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
@@ -74,11 +76,15 @@ use codex_core::find_thread_meta_by_name_str;
 use codex_core::format_exec_policy_error_with_source;
 use codex_core::path_utils;
 use codex_core::read_session_meta_line;
+use codex_features::Feature;
 use codex_feedback::CodexFeedback;
 use codex_git_utils::get_git_repo_root;
+use codex_history::RolloutItem;
+use codex_history::RolloutLine;
 use codex_login::default_client::set_default_client_residency_requirement;
 use codex_login::default_client::set_default_originator;
 use codex_login::enforce_login_restrictions;
+use codex_login::is_workload_identity_selected;
 use codex_model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
 use codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
 use codex_otel::set_parent_from_context;
@@ -92,8 +98,6 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ReviewTarget;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::user_input::UserInput;
@@ -102,6 +106,9 @@ use codex_utils_absolute_path::canonicalize_existing_preserving_symlinks;
 use codex_utils_cli::SharedCliOptions;
 use codex_utils_oss::ensure_oss_provider_ready;
 use codex_utils_oss::get_default_model_for_oss_provider;
+use codex_worktree::CreateWorktree;
+use codex_worktree::WorktreeManager;
+use codex_worktree::WorktreeSettings;
 use event_processor_with_human_output::EventProcessorWithHumanOutput;
 pub use event_processor_with_jsonl_output::CodexStatus;
 pub use event_processor_with_jsonl_output::CollectedThreadEvents;
@@ -215,11 +222,18 @@ struct ExecRunArgs {
     json_mode: bool,
     last_message_file: Option<PathBuf>,
     model_provider: Option<String>,
+    managed_worktree: Option<ManagedExecWorktree>,
     oss: bool,
     output_schema_path: Option<PathBuf>,
     prompt: Option<String>,
     skip_git_repo_check: bool,
     stderr_with_ansi: bool,
+    thread_source: ThreadSource,
+}
+
+struct ManagedExecWorktree {
+    manager: WorktreeManager,
+    checkout: PathBuf,
 }
 
 fn exec_root_span() -> tracing::Span {
@@ -245,10 +259,10 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     }
 
     let Cli {
-        psp,
         command,
         strict_config,
         shared,
+        thread_source,
         skip_git_repo_check,
         ephemeral,
         ignore_user_config,
@@ -273,8 +287,27 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         dangerously_bypass_approvals_and_sandbox,
         bypass_hook_trust,
         cwd,
-        add_dir,
+        mut add_dir,
+        worktree,
     } = shared;
+
+    if worktree {
+        if ignore_user_config {
+            anyhow::bail!("--worktree cannot be combined with --ignore-user-config");
+        }
+        if ephemeral {
+            anyhow::bail!("--worktree cannot be combined with --ephemeral");
+        }
+        match command.as_ref() {
+            Some(ExecCommand::Resume(_)) => {
+                anyhow::bail!("--worktree is not supported with `codex exec resume`");
+            }
+            Some(ExecCommand::Review(_)) => {
+                anyhow::bail!("--worktree is not supported with `codex exec review`");
+            }
+            Some(ExecCommand::Fork(_)) | None => {}
+        }
+    }
 
     let (_stdout_with_ansi, stderr_with_ansi) = match color {
         cli::Color::Always => (true, true),
@@ -305,8 +338,8 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         }
     };
 
-    let resolved_cwd = cwd.clone();
-    let config_cwd = match resolved_cwd.as_deref() {
+    let mut resolved_cwd = cwd.clone();
+    let mut config_cwd = match resolved_cwd.as_deref() {
         Some(path) => {
             AbsolutePathBuf::from_absolute_path(canonicalize_existing_preserving_symlinks(path)?)?
         }
@@ -333,6 +366,77 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         ..Default::default()
     };
 
+    if worktree
+        && EnvironmentManager::prepare_from_codex_home(&codex_home)
+            .await?
+            .default_environment_is_remote()
+    {
+        anyhow::bail!("--worktree requires local execution");
+    }
+
+    let managed_worktree = if worktree {
+        let gate_bootstrap = load_bootstrap_config_or_exit(
+            &codex_home,
+            /*cwd*/ None,
+            cli_kv_overrides.clone(),
+            loader_overrides.clone(),
+            strict_config,
+            CloudConfigBundleLoader::default(),
+        )
+        .await;
+        let gate_cloud_config = cloud_config_bundle_loader_for_storage(
+            bootstrap_auth_config(&codex_home, &gate_bootstrap)?,
+            /*enable_codex_api_key_env*/ false,
+        )
+        .await?;
+        let gate_config = ConfigBuilder::default()
+            .codex_home(codex_home.to_path_buf())
+            .cli_overrides(cli_kv_overrides.clone())
+            .loader_overrides(LoaderOverrides {
+                ignore_project_config: true,
+                ..loader_overrides.clone()
+            })
+            .fallback_cwd(Some(config_cwd.to_path_buf()))
+            .strict_config(strict_config)
+            .cloud_config_bundle(gate_cloud_config)
+            .build()
+            .await?;
+        if !gate_config.features.enabled(Feature::Worktrees) {
+            anyhow::bail!(
+                "--worktree requires the worktrees feature; enable it with --enable worktrees"
+            );
+        }
+        for path in &mut add_dir {
+            if path.is_relative() {
+                *path = config_cwd.as_path().join(&*path);
+            }
+        }
+        // Allocation belongs to the host, not this session's project, profile, or overrides.
+        let host_config = load_bootstrap_config_or_exit(
+            &codex_home,
+            /*cwd*/ None,
+            Vec::new(),
+            LoaderOverrides::default(),
+            strict_config,
+            CloudConfigBundleLoader::default(),
+        )
+        .await;
+        let settings =
+            WorktreeSettings::for_cli(&codex_home, host_config.config_toml.desktop.as_ref())?;
+        let manager = WorktreeManager::new(settings);
+        let checkout = manager.create(&CreateWorktree {
+            source_cwd: config_cwd.as_path().to_path_buf(),
+            base: None,
+        })?;
+        resolved_cwd = Some(checkout.cwd.clone());
+        config_cwd = AbsolutePathBuf::from_absolute_path(checkout.cwd.clone())?;
+        Some(ManagedExecWorktree {
+            manager,
+            checkout: checkout.root,
+        })
+    } else {
+        None
+    };
     let bootstrap_config = load_bootstrap_config_or_exit(
         &codex_home,
         Some(&config_cwd),
@@ -343,11 +447,15 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     )
     .await;
     let bootstrap_config_toml = &bootstrap_config.config_toml;
+    let bootstrap_auth_config = bootstrap_auth_config(&codex_home, &bootstrap_config)?;
+    // API keys cannot fetch workspace-managed configuration. Preserve the
+    // existing ChatGPT bootstrap identity even when model requests allow
+    // CODEX_API_KEY.
     let cloud_config_bundle = cloud_config_bundle_loader_for_storage(
-        bootstrap_auth_config(&codex_home, &bootstrap_config)?,
+        bootstrap_auth_config,
         /*enable_codex_api_key_env*/ false,
     )
-    .await;
+    .await?;
     let run_cli_overrides = cli_kv_overrides.clone();
     let run_loader_overrides = loader_overrides.clone();
     let run_cloud_config_bundle = cloud_config_bundle.clone();
@@ -407,6 +515,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         sandbox_mode,
         permission_profile: None,
         default_permissions: None,
+        persisted_permission_profile_id: None,
         cwd: resolved_cwd,
         workspace_roots: None,
         model_provider: model_provider.clone(),
@@ -423,7 +532,6 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         tools_web_search_request: None,
         ephemeral: ephemeral.then_some(true),
         bypass_hook_trust: bypass_hook_trust.then_some(true),
-        psp: Some(psp),
         additional_writable_roots: add_dir,
     };
 
@@ -462,7 +570,9 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
 
     set_default_client_residency_requirement(config.enforce_residency.value());
 
-    if let Err(err) = enforce_login_restrictions(&config.auth_config()).await {
+    if !is_workload_identity_selected()
+        && let Err(err) = enforce_login_restrictions(&config.auth_config()).await
+    {
         eprintln!("{err}");
         std::process::exit(1);
     }
@@ -516,6 +626,10 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         arg0_paths.codex_self_exe.clone(),
         arg0_paths.codex_linux_sandbox_exe.clone(),
     )?;
+    #[cfg(target_os = "macos")]
+    let local_runtime_paths = local_runtime_paths.with_allowed_symlinked_codex_home(
+        codex_config::allowed_symlinked_codex_home(&config.config_layer_stack, &config.codex_home),
+    );
     let state_db = codex_core::init_state_db(&config).await;
     let environment_manager = if run_loader_overrides.ignore_user_config {
         EnvironmentManager::from_env(Some(local_runtime_paths), config.http_client_factory())
@@ -561,11 +675,13 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         json_mode,
         last_message_file,
         model_provider,
+        managed_worktree,
         oss,
         output_schema_path,
         prompt,
         skip_git_repo_check,
         stderr_with_ansi,
+        thread_source: thread_source.map(Into::into).unwrap_or(ThreadSource::User),
     })
     .instrument(exec_span)
     .await
@@ -659,11 +775,13 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         json_mode,
         last_message_file,
         model_provider,
+        managed_worktree,
         oss,
         output_schema_path,
         prompt,
         skip_git_repo_check,
         stderr_with_ansi,
+        thread_source,
     } = args;
 
     let mut event_processor: Box<dyn EventProcessor> = match json_mode {
@@ -829,16 +947,9 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     .map_err(anyhow::Error::msg)?;
             (session_configured.thread_id, session_configured)
         } else {
-            let response: ThreadStartResponse = send_request_with_response(
-                &client,
-                ClientRequest::ThreadStart {
-                    request_id: request_ids.next(),
-                    params: thread_start_params_from_config(&config),
-                },
-                "thread/start",
-            )
-            .await
-            .map_err(anyhow::Error::msg)?;
+            let response = start_thread(&client, &mut request_ids, &config, &thread_source)
+                .await
+                .map_err(anyhow::Error::msg)?;
             let session_configured =
                 session_configured_from_thread_start_response(&response, &config)
                     .map_err(anyhow::Error::msg)?;
@@ -879,7 +990,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     permissions,
                     config: thread_config_overrides_from_config(&config),
                     ephemeral: config.ephemeral,
-                    thread_source: Some(ThreadSource::User),
+                    thread_source: Some(thread_source.clone()),
                     exclude_turns: true,
                     defer_goal_continuation: !config.ephemeral,
                     ..ThreadForkParams::default()
@@ -910,20 +1021,19 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         .map_err(anyhow::Error::msg)?;
         (session_configured.thread_id, session_configured)
     } else {
-        let response: ThreadStartResponse = send_request_with_response(
-            &client,
-            ClientRequest::ThreadStart {
-                request_id: request_ids.next(),
-                params: thread_start_params_from_config(&config),
-            },
-            "thread/start",
-        )
-        .await
-        .map_err(anyhow::Error::msg)?;
+        let response = start_thread(&client, &mut request_ids, &config, &thread_source)
+            .await
+            .map_err(anyhow::Error::msg)?;
         let session_configured = session_configured_from_thread_start_response(&response, &config)
             .map_err(anyhow::Error::msg)?;
         (session_configured.thread_id, session_configured)
     };
+
+    if let Some(worktree) = managed_worktree.as_ref() {
+        worktree
+            .manager
+            .bind_thread(&worktree.checkout, &primary_thread_id.to_string())?;
+    }
 
     let primary_thread_id_for_span = primary_thread_id.to_string();
     // Use the start/resume response as the authoritative bootstrap payload.
@@ -975,8 +1085,10 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     request_id: request_ids.next(),
                     params: TurnStartParams {
                         thread_id: primary_thread_id_for_span.clone(),
+                        turn_trigger: None,
                         client_user_message_id: None,
                         input: items.into_iter().map(Into::into).collect(),
+                        tool_output: None,
                         responsesapi_client_metadata: None,
                         additional_context: None,
                         environments: None,
@@ -988,12 +1100,14 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                         permissions: None,
                         model: None,
                         service_tier: None,
+                        service_tier_for_turn: None,
                         effort: default_effort,
                         summary: None,
                         personality: None,
                         output_schema,
                         collaboration_mode: None,
                         multi_agent_mode: None,
+                        cyber_access_program: None,
                     },
                 },
                 "turn/start",
@@ -1143,7 +1257,39 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn thread_start_params_from_config(config: &Config) -> ThreadStartParams {
+async fn start_thread(
+    client: &InProcessAppServerClient,
+    request_ids: &mut RequestIdSequencer,
+    config: &Config,
+    thread_source: &ThreadSource,
+) -> Result<ThreadStartResponse, String> {
+    let mut params = thread_start_params_from_config(config, thread_source);
+    loop {
+        match client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: request_ids.next(),
+                params: params.clone(),
+            })
+            .await
+        {
+            Ok(response) => return Ok(response),
+            Err(TypedRequestError::Server { source, .. })
+                if params.history_mode.is_some()
+                    && source.code == -32600
+                    && source.message
+                        == "paginated threads require thread/turns/list and thread/items/list support" =>
+            {
+                params.history_mode = None;
+            }
+            Err(err) => return Err(format!("thread/start: {err}")),
+        }
+    }
+}
+
+fn thread_start_params_from_config(
+    config: &Config,
+    thread_source: &ThreadSource,
+) -> ThreadStartParams {
     let permissions = permissions_selection_from_config(config);
     let sandbox = permissions.is_none().then(|| {
         sandbox_mode_from_permission_profile(
@@ -1162,7 +1308,8 @@ fn thread_start_params_from_config(config: &Config) -> ThreadStartParams {
         permissions,
         config: thread_config_overrides_from_config(config),
         ephemeral: Some(config.ephemeral),
-        thread_source: Some(ThreadSource::User),
+        history_mode: (!config.ephemeral).then_some(ThreadHistoryMode::Paginated),
+        thread_source: Some(thread_source.clone()),
         ..ThreadStartParams::default()
     }
 }
@@ -1228,7 +1375,7 @@ fn sandbox_mode_from_permission_profile(
                     .network_sandbox_policy()
                     .is_enabled()
                     .then_some(codex_app_server_protocol::SandboxMode::DangerFullAccess)
-            } else if file_system_policy.can_write_path_with_cwd(cwd, cwd) {
+            } else if file_system_policy.can_write_local_path_with_cwd(cwd, cwd) {
                 Some(codex_app_server_protocol::SandboxMode::WorkspaceWrite)
             } else {
                 Some(codex_app_server_protocol::SandboxMode::ReadOnly)
@@ -1384,6 +1531,10 @@ fn should_process_notification(
             .thread_id
             .as_deref()
             .is_none_or(|candidate| candidate == thread_id),
+        ServerNotification::AuthRecoveryStarted(notification)
+        | ServerNotification::AuthRecoveryCompleted(notification) => {
+            notification.thread_id == thread_id && notification.turn_id == turn_id
+        }
         ServerNotification::Error(notification) => {
             notification.thread_id == thread_id && notification.turn_id == turn_id
         }
@@ -1524,20 +1675,24 @@ async fn latest_thread_cwd(thread: &AppServerThread) -> PathBuf {
 }
 
 async fn parse_latest_turn_context_cwd(path: &Path) -> Option<PathBuf> {
-    let text = tokio::fs::read_to_string(path).await.ok()?;
-    for line in text.lines().rev() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let reader = codex_rollout::open_rollout_seekable_reader(&path).ok()?;
+        let mut scanner = codex_rollout::ReverseJsonlScanner::new(reader).ok()?;
+        while let Some(outcome) = scanner.scan_next_rollout_line().ok()? {
+            if let codex_rollout::ScanOutcome::Parsed(RolloutLine {
+                item: RolloutItem::TurnContext(item),
+                ..
+            }) = outcome
+            {
+                return Some(item.cwd.into_path_buf());
+            }
         }
-        let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(trimmed) else {
-            continue;
-        };
-        if let RolloutItem::TurnContext(item) = rollout_line.item {
-            return Some(item.cwd.into_path_buf());
-        }
-    }
-    None
+        None
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 fn cwds_match(current_cwd: &Path, session_cwd: &Path) -> bool {
@@ -1561,6 +1716,7 @@ async fn resolve_resume_thread_id(
                 ClientRequest::ThreadList {
                     request_id: RequestId::Integer(0),
                     params: ThreadListParams {
+                        originators: None,
                         cursor,
                         limit: Some(100),
                         sort_key: Some(ThreadSortKey::UpdatedAt),
@@ -1569,6 +1725,7 @@ async fn resolve_resume_thread_id(
                         source_kinds: Some(all_thread_source_kinds()),
                         archived: Some(false),
                         section_id: None,
+                        project_id: None,
                         parent_thread_id: None,
                         ancestor_thread_id: None,
                         cwd: None,
@@ -1645,6 +1802,7 @@ async fn resolve_resume_thread_id(
             ClientRequest::ThreadList {
                 request_id: RequestId::Integer(0),
                 params: ThreadListParams {
+                    originators: None,
                     cursor,
                     limit: Some(100),
                     sort_key: Some(ThreadSortKey::UpdatedAt),
@@ -1653,6 +1811,7 @@ async fn resolve_resume_thread_id(
                     source_kinds: Some(all_thread_source_kinds()),
                     archived: Some(false),
                     section_id: None,
+                    project_id: None,
                     parent_thread_id: None,
                     ancestor_thread_id: None,
                     cwd: None,

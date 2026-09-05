@@ -73,6 +73,9 @@ use codex_app_server_protocol::PluginSkillReadParams;
 use codex_app_server_protocol::PluginUninstallParams;
 use codex_app_server_protocol::ProcessKillParams;
 use codex_app_server_protocol::ProcessSpawnParams;
+use codex_app_server_protocol::ProjectImportParams;
+use codex_app_server_protocol::ProjectListParams;
+use codex_app_server_protocol::ProjectReadParams;
 use codex_app_server_protocol::RemoteControlClientsListParams;
 use codex_app_server_protocol::RemoteControlClientsRevokeParams;
 use codex_app_server_protocol::RemoteControlPairingStartParams;
@@ -110,6 +113,7 @@ use codex_app_server_protocol::ThreadSettingsUpdateParams;
 use codex_app_server_protocol::ThreadShellCommandParams;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::ThreadTimelineListParams;
 use codex_app_server_protocol::ThreadTurnsListParams;
 use codex_app_server_protocol::ThreadUnarchiveParams;
 use codex_app_server_protocol::ThreadUnsubscribeParams;
@@ -191,7 +195,15 @@ impl TestAppServer {
     /// Closes stdio and waits for app-server's graceful thread teardown to finish.
     pub async fn shutdown_gracefully(&mut self) -> std::io::Result<ExitStatus> {
         drop(self.stdin.take());
-        self.process.wait().await
+        // Drain final notifications so a full stdout pipe cannot block runtime shutdown.
+        let mut sink = tokio::io::sink();
+        tokio::select! {
+            status = self.process.wait() => status,
+            drained = tokio::io::copy(&mut self.stdout, &mut sink) => {
+                drained?;
+                self.process.wait().await
+            }
+        }
     }
 
     /// Returns the automatically selected test environment retained by this server.
@@ -471,6 +483,33 @@ impl TestAppServer {
     ) -> anyhow::Result<i64> {
         let params = Some(serde_json::to_value(params)?);
         self.send_request("thread/start", params).await
+    }
+
+    /// Send a `project/import` JSON-RPC request.
+    pub async fn send_project_import_request(
+        &mut self,
+        params: ProjectImportParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("project/import", params).await
+    }
+
+    /// Send a `project/list` JSON-RPC request.
+    pub async fn send_project_list_request(
+        &mut self,
+        params: ProjectListParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("project/list", params).await
+    }
+
+    /// Send a project/read JSON-RPC request.
+    pub async fn send_project_read_request(
+        &mut self,
+        params: ProjectReadParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("project/read", params).await
     }
 
     /// Sends a `thread/start` request selecting the builder's automatic
@@ -1161,6 +1200,14 @@ impl TestAppServer {
         self.send_request("thread/realtime/stop", params).await
     }
 
+    pub async fn send_thread_timeline_list_request(
+        &mut self,
+        params: ThreadTimelineListParams,
+    ) -> anyhow::Result<i64> {
+        self.send_request("thread/timeline/list", Some(serde_json::to_value(params)?))
+            .await
+    }
+
     pub async fn send_thread_realtime_list_voices_request(
         &mut self,
         params: ThreadRealtimeListVoicesParams,
@@ -1519,7 +1566,7 @@ impl TestAppServer {
         tokio::time::timeout(DEFAULT_REQUEST_TIMEOUT, self.read_response(request_id)).await?
     }
 
-    async fn send_request(
+    pub async fn send_request(
         &mut self,
         method: &str,
         params: Option<serde_json::Value>,

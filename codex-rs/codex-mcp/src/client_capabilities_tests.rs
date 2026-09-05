@@ -14,9 +14,18 @@ fn selects_only_supported_mcp_extensions() {
         ],
         "futureField": {"preserved": true},
     });
+    let form = json!({"futureField": {"preserved": true}});
     let extensions = HashMap::from([
+        (
+            OPENAI_ELICITATION_EXTENSION_ID.to_string(),
+            json!({"form": form, "userVerification": {}, "unsupported": {}}),
+        ),
         (MCP_APP_UI_EXTENSION_ID.to_string(), app_ui.clone()),
         (OPENAI_FORM_EXTENSION_ID.to_string(), json!({})),
+        (
+            OPENAI_STANDARD_FORM_INPUT_EXTENSION_ID.to_string(),
+            json!({}),
+        ),
         ("example/other".to_string(), json!({"enabled": true})),
     ]);
 
@@ -26,8 +35,16 @@ fn selects_only_supported_mcp_extensions() {
             /*legacy_openai_form_elicitation*/ false,
         ),
         ClientMcpExtensions::new(HashMap::from([
+            (
+                OPENAI_ELICITATION_EXTENSION_ID.to_string(),
+                json!({"form": form}),
+            ),
             (MCP_APP_UI_EXTENSION_ID.to_string(), app_ui),
             (OPENAI_FORM_EXTENSION_ID.to_string(), json!({})),
+            (
+                OPENAI_STANDARD_FORM_INPUT_EXTENSION_ID.to_string(),
+                json!({}),
+            ),
         ]))
     );
 }

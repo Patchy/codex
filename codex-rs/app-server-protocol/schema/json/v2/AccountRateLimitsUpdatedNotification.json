@@ -38,6 +38,8 @@
         "enterprise_cbp_usage_based",
         "enterprise",
         "edu",
+        "edu_plus",
+        "edu_pro",
         "unknown"
       ],
       "type": "string"
@@ -81,6 +83,13 @@
           ]
         },
         "limitName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "normalModelSlug": {
+          "description": "Normal model whose display name and reasoning options describe this quota alias.",
           "type": [
             "string",
             "null"

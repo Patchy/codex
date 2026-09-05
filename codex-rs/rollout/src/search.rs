@@ -8,8 +8,6 @@ use std::process::Stdio;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::strip_user_message_prefix;
 use regex::Regex;
 use regex::RegexBuilder;
@@ -18,6 +16,8 @@ use tokio::process::Command;
 use super::ARCHIVED_SESSIONS_SUBDIR;
 use super::SESSIONS_SUBDIR;
 use super::compression;
+use crate::ResponseItemEnvelope;
+use crate::RolloutItem;
 
 const MATCH_CONTEXT_BEFORE_CHARS: usize = 48;
 const MATCH_CONTEXT_AFTER_CHARS: usize = 96;
@@ -247,7 +247,7 @@ fn case_insensitive_literal_regex(search_term: impl AsRef<str>) -> io::Result<Re
 }
 
 fn content_match_snippet(jsonl_line: &str, search_term: &Regex) -> Option<String> {
-    let rollout_line = serde_json::from_str::<RolloutLine>(jsonl_line.trim()).ok()?;
+    let rollout_line = crate::parse_rollout_line(jsonl_line.trim()).ok()?;
     let text = conversation_text_from_item(&rollout_line.item)?;
     excerpt_around_match(text.as_str(), search_term)
 }
@@ -269,7 +269,10 @@ fn conversation_text_from_item(item: &RolloutItem) -> Option<String> {
                 Some(agent.message.trim().to_string())
             }
         }
-        RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) => {
+        RolloutItem::ResponseItem(ResponseItemEnvelope {
+            item: ResponseItem::Message { role, content, .. },
+            ..
+        }) => {
             let text = content
                 .iter()
                 .filter_map(content_item_text)
@@ -288,6 +291,10 @@ fn conversation_text_from_item(item: &RolloutItem) -> Option<String> {
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::Compacted(_)
+        | RolloutItem::RealtimeItem(_)
+        | RolloutItem::RetainedContext(_)
+        | RolloutItem::SecurityRiskScore(_)
+        | RolloutItem::TokenUsageRecord(_)
         | RolloutItem::WorldState(_) => None,
     }
 }

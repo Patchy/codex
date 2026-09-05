@@ -45,14 +45,30 @@ pub(super) struct ThreadEventStore {
     pub(super) buffer: VecDeque<ThreadBufferedEvent>,
     pub(super) pending_interactive_replay: PendingInteractiveReplayState,
     pub(super) active_turn_id: Option<String>,
+    // Lifecycle identity must survive bounded replay-buffer eviction.
+    pub(super) latest_turn_id: Option<String>,
     pub(super) pending_interrupt_turn_id: Option<String>,
     pub(super) input_state: Option<ThreadInputState>,
     pub(super) capacity: usize,
     pub(super) active: bool,
+    pub(super) buffered_agent_message_delta_bytes: usize,
+    recap_progress: recap::RecapProgress,
 }
 
 impl ThreadEventStore {
-    pub(super) fn event_survives_session_refresh(event: &ThreadBufferedEvent) -> bool {
+    pub(super) fn event_survives_session_refresh(event: &mut ThreadBufferedEvent) -> bool {
+        if let ThreadBufferedEvent::Notification(notification) = event
+            && let ServerNotification::ItemCompleted(notification) = notification.as_mut()
+            && let ThreadItem::AgentMessage {
+                questions: Some(_),
+                text,
+                ..
+            } = &mut notification.item
+        {
+            // Refreshed turns contain the text; retain only the live question state.
+            text.clear();
+            return true;
+        }
         match event {
             ThreadBufferedEvent::Request(_) | ThreadBufferedEvent::FeedbackSubmission(_) => true,
             ThreadBufferedEvent::Notification(notification) => matches!(
@@ -72,10 +88,13 @@ impl ThreadEventStore {
             buffer: VecDeque::new(),
             pending_interactive_replay: PendingInteractiveReplayState::default(),
             active_turn_id: None,
+            latest_turn_id: None,
             pending_interrupt_turn_id: None,
             input_state: None,
             capacity,
             active: false,
+            buffered_agent_message_delta_bytes: 0,
+            recap_progress: recap::RecapProgress::default(),
         }
     }
 
@@ -97,16 +116,25 @@ impl ThreadEventStore {
     }
 
     pub(super) fn rebase_buffer_after_session_refresh(&mut self) {
-        self.buffer.retain(Self::event_survives_session_refresh);
+        self.buffer.retain_mut(Self::event_survives_session_refresh);
+        self.buffered_agent_message_delta_bytes = 0;
     }
 
     pub(super) fn set_turns(&mut self, turns: Vec<Turn>) {
+        self.recap_progress
+            .merge(recap::RecapProgress::from_turns(&turns));
         self.active_turn_id = turns
             .iter()
             .rev()
             .find(|turn| matches!(turn.status, TurnStatus::InProgress))
             .map(|turn| turn.id.clone());
+        self.latest_turn_id = turns.last().map(|turn| turn.id.clone());
         self.turns = turns;
+    }
+
+    pub(super) fn set_active_turn_id(&mut self, turn_id: String) {
+        self.latest_turn_id = Some(turn_id.clone());
+        self.active_turn_id = Some(turn_id);
     }
 
     pub(super) fn push_notification(&mut self, notification: ServerNotification) {
@@ -122,15 +150,29 @@ impl ThreadEventStore {
             .note_server_notification(notification.as_ref());
         match notification.as_ref() {
             ServerNotification::TurnStarted(turn) => {
-                self.active_turn_id = Some(turn.turn.id.clone());
+                self.set_active_turn_id(turn.turn.id.clone());
             }
             ServerNotification::TurnCompleted(turn) => {
+                if self.active_turn_id.is_none() {
+                    self.latest_turn_id = Some(turn.turn.id.clone());
+                }
+                if matches!(turn.turn.status, TurnStatus::Completed) {
+                    self.recap_progress.completed_turns += 1;
+                }
                 if self.active_turn_id.as_deref() == Some(turn.turn.id.as_str()) {
                     self.active_turn_id = None;
                 }
                 if self.pending_interrupt_turn_id.as_deref() == Some(turn.turn.id.as_str()) {
                     self.pending_interrupt_turn_id = None;
                 }
+            }
+            ServerNotification::Error(n)
+                if self.active_turn_id.is_none()
+                    && !n.will_retry
+                    && n.error.codex_error_info
+                        == Some(AppServerCodexErrorInfo::MisalignmentPolicyViolation) =>
+            {
+                self.latest_turn_id = Some(n.turn_id.clone());
             }
             ServerNotification::ThreadClosed(_) => {
                 self.active_turn_id = None;
@@ -160,31 +202,13 @@ impl ThreadEventStore {
             return;
         }
 
-        self.buffer
-            .push_back(ThreadBufferedEvent::Notification(Box::new(
-                notification.into_owned(),
-            )));
-        if self.buffer.len() > self.capacity
-            && let Some(removed) = self.buffer.pop_front()
-            && let ThreadBufferedEvent::Request(request) = &removed
-        {
-            self.pending_interactive_replay
-                .note_evicted_server_request(request.as_ref());
-        }
+        self.push_replay_notification(notification);
     }
 
     pub(super) fn push_request(&mut self, request: ServerRequest) {
         self.pending_interactive_replay
             .note_server_request(&request);
-        self.buffer
-            .push_back(ThreadBufferedEvent::Request(Box::new(request)));
-        if self.buffer.len() > self.capacity
-            && let Some(removed) = self.buffer.pop_front()
-            && let ThreadBufferedEvent::Request(request) = &removed
-        {
-            self.pending_interactive_replay
-                .note_evicted_server_request(request.as_ref());
-        }
+        self.push_buffered_event(ThreadBufferedEvent::Request(Box::new(request)));
     }
 
     pub(super) fn pending_replay_requests(&self) -> Vec<ServerRequest> {
@@ -211,39 +235,11 @@ impl ThreadEventStore {
         turn_id: &str,
         item_id: &str,
     ) -> Option<Vec<codex_app_server_protocol::FileUpdateChange>> {
-        self.buffer
-            .iter()
-            .rev()
-            .find_map(|event| match event {
-                ThreadBufferedEvent::Notification(notification) => match notification.as_ref() {
-                    ServerNotification::ItemStarted(notification)
-                        if turn_id_matches(turn_id, &notification.turn_id) =>
-                    {
-                        file_change_item_changes(&notification.item, item_id)
-                    }
-                    ServerNotification::ItemCompleted(notification)
-                        if turn_id_matches(turn_id, &notification.turn_id) =>
-                    {
-                        file_change_item_changes(&notification.item, item_id)
-                    }
-                    _ => None,
-                },
-                ThreadBufferedEvent::Request(_)
-                | ThreadBufferedEvent::HistoryEntryResponse(_)
-                | ThreadBufferedEvent::FeedbackSubmission(_) => None,
-            })
-            .or_else(|| {
-                self.turns
-                    .iter()
-                    .rev()
-                    .filter(|turn| turn_id_matches(turn_id, &turn.id))
-                    .flat_map(|turn| turn.items.iter().rev())
-                    .find_map(|item| file_change_item_changes(item, item_id))
-            })
+        file_change_changes(self.buffer.iter(), &self.turns, turn_id, item_id)
     }
 
     pub(super) fn snapshot(&self) -> ThreadEventSnapshot {
-        ThreadEventSnapshot {
+        let mut snapshot = ThreadEventSnapshot {
             session: self.session.clone(),
             turns: self.turns.clone(),
             // Thread switches replay buffered events into a rebuilt ChatWidget. Only replay
@@ -262,7 +258,19 @@ impl ThreadEventStore {
                 .cloned()
                 .collect(),
             input_state: self.input_state.clone(),
+        };
+        if let Some(latest_turn_id) = &self.latest_turn_id {
+            replay_filter::omit_resolved_misalignment_errors(&mut snapshot, latest_turn_id);
         }
+        snapshot
+    }
+
+    pub(super) fn recap_progress(&self) -> recap::RecapProgress {
+        self.recap_progress
+    }
+
+    pub(super) fn merge_recap_progress(&mut self, progress: recap::RecapProgress) {
+        self.recap_progress.merge(progress);
     }
 
     pub(super) fn note_outbound_op<T>(&mut self, op: T)
@@ -311,6 +319,38 @@ impl ThreadEventStore {
 
 fn turn_id_matches(request_turn_id: &str, candidate_turn_id: &str) -> bool {
     request_turn_id.is_empty() || request_turn_id == candidate_turn_id
+}
+
+pub(super) fn file_change_changes<'a>(
+    events: impl DoubleEndedIterator<Item = &'a ThreadBufferedEvent>,
+    turns: &'a [Turn],
+    turn_id: &str,
+    item_id: &str,
+) -> Option<Vec<codex_app_server_protocol::FileUpdateChange>> {
+    let event_items = events.rev().filter_map(|event| {
+        let ThreadBufferedEvent::Notification(notification) = event else {
+            return None;
+        };
+        let (candidate_turn_id, item) = match notification.as_ref() {
+            ServerNotification::ItemStarted(notification) => {
+                (&notification.turn_id, &notification.item)
+            }
+            ServerNotification::ItemCompleted(notification) => {
+                (&notification.turn_id, &notification.item)
+            }
+            _ => return None,
+        };
+        turn_id_matches(turn_id, candidate_turn_id).then_some(item)
+    });
+    event_items
+        .chain(
+            turns
+                .iter()
+                .rev()
+                .filter(|turn| turn_id_matches(turn_id, &turn.id))
+                .flat_map(|turn| turn.items.iter().rev()),
+        )
+        .find_map(|item| file_change_item_changes(item, item_id))
 }
 
 fn file_change_item_changes(
@@ -523,6 +563,7 @@ mod tests {
         ServerRequest::CommandExecutionRequestApproval {
             request_id: AppServerRequestId::Integer(1),
             params: CommandExecutionRequestApprovalParams {
+                kind: Default::default(),
                 thread_id: thread_id.to_string(),
                 turn_id: turn_id.to_string(),
                 item_id: item_id.to_string(),
@@ -564,6 +605,38 @@ mod tests {
             TurnStatus::Interrupted,
         ));
         assert_eq!(store.active_turn_id(), None);
+    }
+
+    #[test]
+    fn thread_event_store_preserves_recap_progress_across_replay() {
+        let thread_id = ThreadId::new();
+        let mut store = ThreadEventStore::new(/*capacity*/ 8);
+        store.set_turns(vec![
+            test_turn("turn-1", TurnStatus::Completed, Vec::new()),
+            test_turn("turn-2", TurnStatus::Failed, Vec::new()),
+        ]);
+        store.push_notification(turn_completed_notification(
+            thread_id,
+            "turn-3",
+            TurnStatus::Completed,
+        ));
+        store.push_notification(turn_completed_notification(
+            thread_id,
+            "turn-4",
+            TurnStatus::Interrupted,
+        ));
+        store.merge_recap_progress(recap::RecapProgress {
+            completed_turns: 2,
+            last_recapped_turn_count: Some(2),
+        });
+
+        assert_eq!(
+            store.recap_progress(),
+            recap::RecapProgress {
+                completed_turns: 2,
+                last_recapped_turn_count: Some(2),
+            }
+        );
     }
 
     #[test]
@@ -658,6 +731,28 @@ mod tests {
         let snapshot = store.snapshot();
         assert!(snapshot.events.is_empty());
         assert_eq!(store.has_pending_thread_approvals(), false);
+    }
+
+    #[test]
+    fn refresh_retains_live_questions_without_replaying_their_text() {
+        let mut expected = serde_json::json!({
+            "method": "item/completed", "params": {
+                "threadId": "thread", "turnId": "turn", "completedAtMs": 0,
+                "item": {
+                    "type": "agentMessage", "id": "question", "text": "already in the snapshot",
+                    "phase": null, "memoryCitation": null, "delivery": null,
+                    "questions": [{"title": "Which way?", "options": null}]
+                }
+            }
+        });
+        let mut store = ThreadEventStore::new(/*capacity*/ 8);
+        store.push_notification(serde_json::from_value(expected.clone()).unwrap());
+        store.rebase_buffer_after_session_refresh();
+        expected["params"]["item"]["text"] = serde_json::json!("");
+        let ThreadBufferedEvent::Notification(actual) = &store.snapshot().events[0] else {
+            panic!("missing live question");
+        };
+        assert_eq!(serde_json::to_value(actual).unwrap(), expected);
     }
 
     #[test]

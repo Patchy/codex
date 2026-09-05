@@ -11,6 +11,9 @@ use pretty_assertions::assert_eq;
 use std::path::Path;
 use std::path::PathBuf;
 
+#[path = "code_fence_render_tests.rs"]
+mod code_fence_tests;
+
 fn test_cwd() -> PathBuf {
     std::env::temp_dir()
 }
@@ -104,6 +107,26 @@ fn incremental_render_keeps_final_block_mutable_and_matches_full_render() {
     assert!(render.stable_source_len > 0);
     assert!(render.stable_source_len < source.len());
     assert_debug_snapshot!("incremental_render_representative_stream", render.lines);
+}
+
+#[test]
+fn incremental_file_citations_preserve_metadata_unicode_and_markdown() {
+    let cwd = test_cwd();
+    let rendered_cases = [
+        (
+            "Quarterly Report.xlsx",
+            "- :codex-file-citation{artifact_kind=\"workbook\" ",
+        ),
+        ("Résumé *final* ✨.xlsx", "- :codex-file-citation{"),
+    ]
+    .map(|(filename, prefix)| {
+        let tail = format!("path=\"{}\"}}\n", cwd.join(filename).display());
+        let chunks = ["# Output\n\n", prefix, &tail, "\n", "Continue.\n"];
+        let (_, render) = assert_rich_stream_matches_full_render(&chunks, Some(80));
+
+        render.lines
+    });
+    assert_debug_snapshot!("incremental_file_citations", rendered_cases);
 }
 
 #[test]

@@ -1,7 +1,8 @@
 use codex_core_plugins::PluginsManager;
 use codex_core_plugins::store::PluginStore;
+use codex_login::AuthManager;
+use codex_login::CodexAuth;
 use codex_plugin::PluginId;
-use codex_protocol::auth::AuthMode;
 use codex_protocol::protocol::Product;
 use codex_skills_extension::HostSkillsLoadInput;
 use codex_skills_extension::HostSkillsService;
@@ -36,6 +37,9 @@ remote_plugin = true
 
 [plugins."{PLUGIN_CONFIG_NAME}"]
 enabled = true
+
+[skills.bundled]
+enabled = false
 "#,
         ),
     );
@@ -52,7 +56,7 @@ enabled = true
     let plugins_manager = PluginsManager::new_with_options(
         codex_home.path().to_path_buf(),
         Some(Product::Codex),
-        Some(AuthMode::Chatgpt),
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
         skills_service.clone(),
     );
     let plugin_outcome = plugins_manager.plugins_for_config(&plugins_input).await;
@@ -68,7 +72,6 @@ enabled = true
             cwd,
             plugin_outcome.effective_plugin_skill_roots(),
             config.config_layer_stack.clone(),
-            /*bundled_skills_enabled*/ false,
         )
         .with_plugin_skill_snapshots(
             plugins_manager.plugin_skill_snapshots_for_config(&plugins_input),

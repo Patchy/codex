@@ -96,11 +96,10 @@ impl WorkloadIdentityExchange {
                 return Ok(token);
             }
         }
-
         let valid_from = Instant::now();
         let result = match self.exchange_uncached().await {
             Ok(token) => state.store(token, valid_from, Instant::now()),
-            Err(error) if error.allows_cached_fallback() => {
+            Err(error) if error.is_transient() => {
                 let now = Instant::now();
                 match state.cached.as_mut() {
                     Some(cached) if cached.expires_at > now => {
@@ -156,6 +155,15 @@ impl WorkloadIdentityExchange {
         result
     }
 
+    /// Drops the cached token only when it is still the token the caller rejected.
+    pub async fn invalidate_if_current(&self, observed_token_version: u64) {
+        let mut state = self.state.lock().await;
+        if state.token_generation == observed_token_version {
+            state.cached = None;
+            state.last_attempt_error = None;
+        }
+    }
+
     fn complete_attempt(&self, state: &mut CacheState, error: Option<&WorkloadIdentityError>) {
         state.last_attempt_error = error.cloned();
         self.completed_attempts.fetch_add(1, Ordering::Release);
@@ -163,11 +171,17 @@ impl WorkloadIdentityExchange {
 
     async fn exchange_uncached(&self) -> Result<WorkloadIdentityToken, WorkloadIdentityError> {
         let assertion = read_assertion(&self.config.assertion_file).await?;
-        let body = url::form_urlencoded::Serializer::new(String::new())
-            .append_pair("grant_type", JWT_BEARER_GRANT_TYPE)
-            .append_pair("assertion", &assertion)
-            .append_pair("federation_rule_id", &self.config.federation_rule_id)
-            .finish();
+        let body = {
+            let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+            serializer
+                .append_pair("grant_type", JWT_BEARER_GRANT_TYPE)
+                .append_pair("assertion", &assertion)
+                .append_pair("federation_rule_id", &self.config.federation_rule_id);
+            if let Some(context) = &self.config.workload_identity_context {
+                serializer.append_pair("workload_identity_context", context);
+            }
+            serializer.finish()
+        };
         let response = self
             .client
             .post(self.token_url.as_str())
@@ -204,17 +218,6 @@ impl WorkloadIdentityExchange {
         serde_json::from_slice::<TokenExchangeResponse>(&bytes)
             .map_err(|_| WorkloadIdentityError::InvalidExchangeResponse)?
             .into_token()
-    }
-}
-
-impl WorkloadIdentityError {
-    fn allows_cached_fallback(&self) -> bool {
-        matches!(
-            self,
-            Self::AssertionFile { .. }
-                | Self::ExchangeUnavailable
-                | Self::ExchangeRejected(408 | 429 | 500..=599)
-        )
     }
 }
 

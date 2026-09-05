@@ -71,7 +71,6 @@ const KEYMAP_COMMON_ACTIONS: &[(&str, &str)] = &[
     ("editor", "move_word_left"),
     ("editor", "move_word_right"),
     ("global", "open_transcript"),
-    ("global", "open_dashboard"),
     ("pager", "close"),
     ("pager", "page_up"),
     ("pager", "page_down"),
@@ -105,13 +104,24 @@ const KEYMAP_CONTEXT_TABS: &[KeymapContextTab] = &[
         id: "vim-shortcuts",
         label: "Vim",
         description: "Vim normal-mode and operator shortcuts.",
-        contexts: &["vim_normal", "vim_operator", "vim_text_object"],
+        contexts: &[
+            "vim_normal",
+            "vim_operator",
+            "vim_search",
+            "vim_text_object",
+        ],
     },
     KeymapContextTab {
         id: "navigation-shortcuts",
         label: "Navigation",
         description: "Pager and selection-list navigation shortcuts.",
         contexts: &["pager", "list"],
+    },
+    KeymapContextTab {
+        id: "agents-shortcuts",
+        label: "Agents",
+        description: "Shared agents dashboard shortcuts.",
+        contexts: &["agents"],
     },
     KeymapContextTab {
         id: "approval-shortcuts",

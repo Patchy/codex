@@ -231,6 +231,7 @@ deny = [
         "pagable",
         "rmcp",
         "tonic",
+        "webrtc",
         "zbus",
     ], reason = "first-party traits must use native async trait methods with explicit Send bounds" },
     # Migration ratchet: `codex-http-client` is the intended reqwest owner. Remove each temporary
@@ -238,11 +239,12 @@ deny = [
     { crate = "reqwest", wrappers = [
         # Intended owner.
         "codex-http-client",
+        # Intentional exception: gRPC uses reqwest directly as tonic's HTTP/2 transport.
+        "codex-code-mode",
         # Intentional exception: this standalone, privileged Responses API proxy owns its blocking
         # upstream HTTP transport independently of Codex.
         "codex-responses-api-proxy",
         # Temporary migration exceptions.
-        "codex-app-server",
         "codex-otel",
         # Third-party crates that own their reqwest integration. These are not part of the
         # first-party migration count above.
@@ -312,6 +314,7 @@ allow-git = [
     "https://github.com/dzbarsky/rules_rust",
     "https://github.com/helix-editor/nucleo.git",
     "https://github.com/juberti-oai/rust-sdks.git",
+    "https://github.com/microsoft/mxc",
     "https://github.com/openai-oss-forks/crossterm",
     "https://github.com/openai-oss-forks/tokio-tungstenite",
     "https://github.com/openai-oss-forks/tungstenite-rs",

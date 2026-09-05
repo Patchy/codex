@@ -70,6 +70,19 @@ pub struct PromptImageResizeLimits {
     pub max_patches: usize,
 }
 
+impl PromptImageMode {
+    /// Resize policy for high-detail prompt images.
+    pub const HIGH_DETAIL: Self = Self::ResizeWithLimits(PromptImageResizeLimits {
+        max_dimension: 2048,
+        max_patches: 2_500,
+    });
+    /// Resize policy for original-detail prompt images.
+    pub const ORIGINAL_DETAIL: Self = Self::ResizeWithLimits(PromptImageResizeLimits {
+        max_dimension: 6000,
+        max_patches: 10_000,
+    });
+}
+
 struct ImageMetadata {
     icc_profile: Option<Vec<u8>>,
     exif: Option<Vec<u8>>,
@@ -102,7 +115,18 @@ pub fn load_for_prompt_bytes(
         return Ok(image);
     }
 
-    let image = (move || {
+    let image = load_for_prompt_bytes_uncached(&path_buf, file_bytes, mode)?;
+    cache_image(&IMAGE_CACHE, key, image.clone(), MAX_IMAGE_CACHE_BYTES);
+    Ok(image)
+}
+
+fn load_for_prompt_bytes_uncached(
+    path: &Path,
+    file_bytes: Vec<u8>,
+    mode: PromptImageMode,
+) -> Result<EncodedImage, ImageProcessingError> {
+    let path_buf = path.to_path_buf();
+    (move || {
         let guessed_format = image::guess_format(&file_bytes)
             .map_err(|source| ImageProcessingError::decode_error(&path_buf, source))?;
         let format = match guessed_format {
@@ -194,10 +218,7 @@ pub fn load_for_prompt_bytes(
         };
 
         Ok(encoded)
-    })()?;
-
-    cache_image(&IMAGE_CACHE, key, image.clone(), MAX_IMAGE_CACHE_BYTES);
-    Ok(image)
+    })()
 }
 
 fn cache_image(cache: &ImageCache, key: ImageCacheKey, image: EncodedImage, byte_capacity: usize) {
@@ -223,6 +244,21 @@ fn cache_image(cache: &ImageCache, key: ImageCacheKey, image: EncodedImage, byte
 pub fn load_data_url_for_prompt(
     image_url: &str,
     mode: PromptImageMode,
+) -> Result<EncodedImage, ImageProcessingError> {
+    load_data_url_for_prompt_with(image_url, mode, load_for_prompt_bytes)
+}
+
+pub fn load_data_url_for_prompt_uncached(
+    image_url: &str,
+    mode: PromptImageMode,
+) -> Result<EncodedImage, ImageProcessingError> {
+    load_data_url_for_prompt_with(image_url, mode, load_for_prompt_bytes_uncached)
+}
+
+fn load_data_url_for_prompt_with(
+    image_url: &str,
+    mode: PromptImageMode,
+    load: impl FnOnce(&Path, Vec<u8>, PromptImageMode) -> Result<EncodedImage, ImageProcessingError>,
 ) -> Result<EncodedImage, ImageProcessingError> {
     let rest = image_url
         .get(..DATA_URL_PREFIX.len())
@@ -266,7 +302,7 @@ pub fn load_data_url_for_prompt(
         });
     }
 
-    load_for_prompt_bytes(Path::new("<data-url-image>"), file_bytes, mode)
+    load(Path::new("<data-url-image>"), file_bytes, mode)
 }
 
 fn prompt_image_output_dimensions_for_limits(

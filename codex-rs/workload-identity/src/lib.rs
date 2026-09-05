@@ -13,12 +13,14 @@ use thiserror::Error;
 pub struct WorkloadIdentityConfig {
     pub(crate) assertion_file: PathBuf,
     pub(crate) federation_rule_id: String,
+    pub(crate) workload_identity_context: Option<String>,
 }
 
 impl WorkloadIdentityConfig {
     pub fn new(
         federation_rule_id: String,
         assertion_file: PathBuf,
+        workload_identity_context: Option<String>,
     ) -> Result<Self, WorkloadIdentityError> {
         let federation_rule_id = federation_rule_id.trim();
         if federation_rule_id.is_empty() {
@@ -30,6 +32,7 @@ impl WorkloadIdentityConfig {
         Ok(Self {
             assertion_file,
             federation_rule_id: federation_rule_id.to_string(),
+            workload_identity_context,
         })
     }
 }
@@ -60,4 +63,28 @@ pub enum WorkloadIdentityError {
     ExchangeRejected(u16),
     #[error("the workload identity token exchange returned an invalid response")]
     InvalidExchangeResponse,
+}
+
+impl WorkloadIdentityError {
+    /// Whether retrying the operation may succeed without changing configuration.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::AssertionFile { source, .. } => matches!(
+                source.kind(),
+                std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::WouldBlock
+            ),
+            Self::ExchangeUnavailable | Self::ExchangeRejected(408 | 429 | 500..=599) => true,
+            Self::InvalidFederationRuleId
+            | Self::AssertionFileMustBeAbsolute
+            | Self::InvalidAssertion
+            | Self::AssertionTooLarge
+            | Self::HttpClientConfiguration
+            | Self::InvalidTokenUrl
+            | Self::ExchangeRejected(_)
+            | Self::InvalidExchangeResponse => false,
+        }
+    }
 }

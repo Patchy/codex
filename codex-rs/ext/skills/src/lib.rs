@@ -11,6 +11,7 @@ mod host_prompt;
 mod host_roots;
 mod host_service;
 mod host_snapshot;
+mod invocation;
 mod loader;
 pub mod provider;
 mod render;
@@ -19,6 +20,7 @@ mod selection;
 mod shadow_selection_experiment;
 mod sources;
 mod state;
+mod telemetry;
 mod tools;
 mod warnings;
 mod world_state;
@@ -32,16 +34,17 @@ pub use host_outcome::SkillLoadOutcome;
 pub use host_prompt::HostSkillPrompts;
 pub use host_prompt::InjectedHostSkillPrompts;
 pub use host_service::HostSkillsLoadInput;
+pub use host_service::HostSkillsRequest;
 pub use host_service::HostSkillsService;
-pub use host_service::bundled_skills_enabled_from_stack;
 pub use host_snapshot::HostSkillsSnapshot;
-pub use loader::HostSkillRoot;
+pub use invocation::detect_implicit_skill_invocation;
 pub use provider::ExecutorSkillProvider;
 pub use provider::HostSkillProvider;
 pub use provider::OrchestratorSkillProvider;
 pub use provider::SkillProvider;
 pub use sources::SkillProviderSource;
 pub use sources::SkillProviders;
+pub use telemetry::record_plugin_turn_usage;
 
 /// Recognizes persisted explicit skill prompts without exposing their fragment implementation.
 pub fn is_skill_prompt_fragment(text: &str) -> bool {

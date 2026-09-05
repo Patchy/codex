@@ -1,6 +1,6 @@
 use crate::accepted_lines::AcceptedLineFingerprintEventInput;
+use crate::accepted_lines::accepted_line_counts_from_unified_diff;
 use crate::accepted_lines::accepted_line_fingerprint_event_requests;
-use crate::accepted_lines::accepted_line_fingerprints_from_unified_diff;
 use crate::accepted_lines::accepted_line_repo_hash_for_cwd;
 use crate::events::AppServerRpcTransport;
 use crate::events::CodexAppMentionedEventRequest;
@@ -11,6 +11,8 @@ use crate::events::CodexCollabAgentToolCallEventRequest;
 use crate::events::CodexCommandExecutionEventParams;
 use crate::events::CodexCommandExecutionEventRequest;
 use crate::events::CodexCompactionEventRequest;
+use crate::events::CodexControlToolCallEventParams;
+use crate::events::CodexControlToolCallEventRequest;
 use crate::events::CodexDynamicToolCallEventParams;
 use crate::events::CodexDynamicToolCallEventRequest;
 use crate::events::CodexFileChangeEventParams;
@@ -29,6 +31,8 @@ use crate::events::CodexPluginEventRequest;
 use crate::events::CodexPluginInstallFailedEventRequest;
 use crate::events::CodexPluginInstallFailedMetadata;
 use crate::events::CodexPluginInstallRequestedEventRequest;
+use crate::events::CodexPluginMeasurementEventParams;
+use crate::events::CodexPluginMeasurementEventRequest;
 use crate::events::CodexPluginUsedEventRequest;
 use crate::events::CodexReviewEventParams;
 use crate::events::CodexReviewEventRequest;
@@ -61,6 +65,7 @@ use crate::events::ToolItemTerminalStatus;
 use crate::events::TrackEventRequest;
 use crate::events::WebSearchActionKind;
 use crate::events::codex_app_metadata;
+use crate::events::codex_artifact_operation_event_request;
 use crate::events::codex_compaction_event_params;
 use crate::events::codex_goal_event_params;
 use crate::events::codex_hook_run_metadata;
@@ -74,21 +79,28 @@ use crate::facts::AnalyticsFact;
 use crate::facts::AnalyticsJsonRpcError;
 use crate::facts::AppMentionedInput;
 use crate::facts::AppUsedInput;
+use crate::facts::ArtifactOperationInput;
 use crate::facts::CodeModeToolCallFact;
 use crate::facts::CodeModeToolCallStatus;
 use crate::facts::CodexCompactionEvent;
 use crate::facts::CodexGoalEvent;
+use crate::facts::ControlToolCallFact;
+use crate::facts::ControlToolCallStatus;
 use crate::facts::CustomAnalyticsFact;
 use crate::facts::ExternalAgentConfigImportCompletedInput;
 use crate::facts::ExternalAgentConfigImportFailureInput;
 use crate::facts::HookRunInput;
 use crate::facts::ImagePreparationFact;
 use crate::facts::ImagePreparationMetadata;
+use crate::facts::InvocationType;
 use crate::facts::PluginInstallFailedInput;
 use crate::facts::PluginInstallRequestedInput;
+use crate::facts::PluginMeasurementRow;
+use crate::facts::PluginMeasurementsInput;
 use crate::facts::PluginState;
 use crate::facts::PluginStateChangedInput;
 use crate::facts::PluginUsedInput;
+use crate::facts::SkillInvocationLocation;
 use crate::facts::SkillInvokedInput;
 use crate::facts::SubAgentThreadStartedInput;
 use crate::facts::ThreadInitializationMode;
@@ -101,6 +113,9 @@ use crate::facts::TurnStatus;
 use crate::facts::TurnSteerRejectionReason;
 use crate::facts::TurnSteerResult;
 use crate::facts::TurnTokenUsageFact;
+use crate::guardian_v2::GuardianV2EventKind;
+use crate::guardian_v2::GuardianV2EventParams;
+use crate::guardian_v2::GuardianV2EventRequest;
 use crate::now_unix_millis;
 use crate::now_unix_seconds;
 use crate::option_i64_to_u64;
@@ -114,6 +129,7 @@ use codex_app_server_protocol::CollabAgentTool;
 use codex_app_server_protocol::CollabAgentToolCallStatus;
 use codex_app_server_protocol::CommandAction;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
+use codex_app_server_protocol::CommandExecutionApprovalKind;
 use codex_app_server_protocol::CommandExecutionSource;
 use codex_app_server_protocol::CommandExecutionStatus;
 use codex_app_server_protocol::DynamicToolCallOutputContentItem;
@@ -131,10 +147,12 @@ use codex_app_server_protocol::RequestPermissionProfile;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ServerResponse;
+use codex_app_server_protocol::SubAgentActivityKind;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::TurnSteerResponse;
 use codex_app_server_protocol::UserInput;
 use codex_app_server_protocol::WebSearchAction;
+use codex_git_utils::SanitizedGitUrl;
 use codex_git_utils::collect_git_info;
 use codex_git_utils::get_git_repo_root;
 use codex_login::default_client::originator;
@@ -151,10 +169,33 @@ use codex_protocol::request_permissions::PermissionGrantScope as CorePermissionG
 use codex_protocol::request_permissions::RequestPermissionsResponse as CoreRequestPermissionsResponse;
 use sha1::Digest;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
 const MAX_TOOL_RESPONSE_ENTRIES: usize = 256;
+
+pub(crate) const MAX_PLUGIN_MEASUREMENTS_PER_BATCH: usize = 100;
+const MAX_PLUGIN_MEASUREMENT_DIMENSIONS: usize = 8;
+const MAX_PLUGIN_MEASUREMENT_IDENTIFIER_BYTES: usize = 64;
+
+pub(crate) fn valid_plugin_measurement_identifier(value: &str) -> bool {
+    let mut characters = value.chars();
+    matches!(characters.next(), Some('a'..='z'))
+        && value.len() <= MAX_PLUGIN_MEASUREMENT_IDENTIFIER_BYTES
+        && characters.all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+        })
+}
+
+pub(crate) fn valid_plugin_measurement_row(row: &PluginMeasurementRow) -> bool {
+    row.number_value.is_finite()
+        && valid_plugin_measurement_identifier(&row.measurement_name)
+        && row.dimensions.len() <= MAX_PLUGIN_MEASUREMENT_DIMENSIONS
+        && row.dimensions.iter().all(|(name, value)| {
+            valid_plugin_measurement_identifier(name) && valid_plugin_measurement_identifier(value)
+        })
+}
 
 #[derive(Default)]
 pub(crate) struct AnalyticsReducer {
@@ -392,6 +433,8 @@ struct TurnState {
     latest_diff: Option<String>,
     steer_count: usize,
     tool_counts: TurnToolCounts,
+    resource_skill_invocations: HashSet<String>,
+    turn_event_emitted: bool,
 }
 
 #[derive(Clone, Hash, Eq, PartialEq)]
@@ -427,6 +470,7 @@ struct TurnToolCounts {
     mcp_tool_call: usize,
     dynamic_tool_call: usize,
     subagent_tool_call: usize,
+    subagent_tool_call_ids: HashSet<String>,
     web_search: usize,
     image_generation: usize,
 }
@@ -438,7 +482,15 @@ impl TurnToolCounts {
             ThreadItem::FileChange { .. } => self.file_change += 1,
             ThreadItem::McpToolCall { .. } => self.mcp_tool_call += 1,
             ThreadItem::DynamicToolCall { .. } => self.dynamic_tool_call += 1,
-            ThreadItem::CollabAgentToolCall { .. } | ThreadItem::SubAgentActivity { .. } => {
+            ThreadItem::SubAgentActivity {
+                kind: SubAgentActivityKind::Completed,
+                ..
+            } => return,
+            ThreadItem::CollabAgentToolCall { id, .. }
+            | ThreadItem::SubAgentActivity { id, .. } => {
+                if !self.subagent_tool_call_ids.insert(id.clone()) {
+                    return;
+                }
                 self.subagent_tool_call += 1;
             }
             ThreadItem::WebSearch(_) => self.web_search += 1,
@@ -446,6 +498,7 @@ impl TurnToolCounts {
             ThreadItem::UserMessage { .. }
             | ThreadItem::HookPrompt { .. }
             | ThreadItem::AgentMessage { .. }
+            | ThreadItem::FunctionCallOutput { .. }
             | ThreadItem::Plan { .. }
             | ThreadItem::Reasoning { .. }
             | ThreadItem::ImageView { .. }
@@ -550,8 +603,14 @@ impl AnalyticsReducer {
                 self.ingest_server_request_aborted(completed_at_ms, request_id, out);
             }
             AnalyticsFact::Custom(input) => match input {
+                CustomAnalyticsFact::ArtifactOperation(input) => {
+                    self.ingest_artifact_operation(input, out);
+                }
                 CustomAnalyticsFact::CodeModeToolCall(input) => {
                     self.ingest_code_mode_tool_call(input, out);
+                }
+                CustomAnalyticsFact::ControlToolCall(input) => {
+                    self.ingest_control_tool_call(input, out);
                 }
                 CustomAnalyticsFact::SubAgentThreadStarted(input) => {
                     self.ingest_subagent_thread_started(input, out);
@@ -561,6 +620,68 @@ impl AnalyticsReducer {
                 }
                 CustomAnalyticsFact::Goal(input) => {
                     self.ingest_goal(*input, out);
+                }
+                CustomAnalyticsFact::ThreadHintStatus(input) => {
+                    if let Some((connection, thread, metadata)) =
+                        self.thread_context_or_warn(AnalyticsDropSite {
+                            event_name: "codex_thread_hint_status",
+                            thread_id: &input.thread_id,
+                            turn_id: None,
+                            review_id: None,
+                            item_id: None,
+                        })
+                    {
+                        out.push(TrackEventRequest::ThreadHintStatus(Box::new(
+                            crate::thread_hint::ThreadHintStatusEventRequest {
+                                event_type: "codex_thread_hint_status",
+                                event_params: crate::thread_hint::ThreadHintStatusEventParams {
+                                    thread_id: input.thread_id,
+                                    session_id: metadata.session_id.clone(),
+                                    app_server_client: thread.app_server_client(connection),
+                                    runtime: connection.runtime.clone(),
+                                    thread_source: metadata.thread_source.clone(),
+                                    subagent_source: metadata.subagent_source.clone(),
+                                    parent_thread_id: metadata.parent_thread_id.clone(),
+                                    status: input.status,
+                                    occurred_at_ms: input.occurred_at_ms,
+                                },
+                            },
+                        )));
+                    }
+                }
+                CustomAnalyticsFact::GuardianV2(input) => {
+                    let event_type = match &input.kind {
+                        GuardianV2EventKind::Classification { .. } => {
+                            "codex_guardian_v2_classification"
+                        }
+                        GuardianV2EventKind::FastDecision { .. } => {
+                            "codex_guardian_v2_fast_decision"
+                        }
+                    };
+                    if let Some((connection, thread, metadata)) =
+                        self.thread_context_or_warn(AnalyticsDropSite {
+                            event_name: event_type,
+                            thread_id: &input.thread_id,
+                            turn_id: Some(&input.turn_id),
+                            review_id: None,
+                            item_id: input.item_id.as_deref(),
+                        })
+                    {
+                        out.push(TrackEventRequest::GuardianV2(Box::new(
+                            GuardianV2EventRequest {
+                                event_type,
+                                event_params: GuardianV2EventParams {
+                                    session_id: metadata.session_id.clone(),
+                                    app_server_client: thread.app_server_client(connection),
+                                    runtime: connection.runtime.clone(),
+                                    thread_source: metadata.thread_source.clone(),
+                                    subagent_source: metadata.subagent_source.clone(),
+                                    parent_thread_id: metadata.parent_thread_id.clone(),
+                                    guardian_v2: *input,
+                                },
+                            },
+                        )));
+                    }
                 }
                 CustomAnalyticsFact::GuardianReview(input) => {
                     self.ingest_guardian_review(*input, out);
@@ -604,6 +725,9 @@ impl AnalyticsReducer {
                 CustomAnalyticsFact::PluginInstallFailed(input) => {
                     self.ingest_plugin_install_failed(input, out);
                 }
+                CustomAnalyticsFact::PluginMeasurements(input) => {
+                    self.ingest_plugin_measurements(input, out);
+                }
                 CustomAnalyticsFact::ExternalAgentConfigImportCompleted(input) => {
                     self.ingest_external_agent_config_import_completed(input, out);
                 }
@@ -612,6 +736,16 @@ impl AnalyticsReducer {
                 }
             },
         }
+    }
+
+    fn ingest_artifact_operation(
+        &mut self,
+        input: ArtifactOperationInput,
+        out: &mut Vec<TrackEventRequest>,
+    ) {
+        out.push(TrackEventRequest::ArtifactOperation(
+            codex_artifact_operation_event_request(input.tracking, input.operation),
+        ));
     }
 
     fn ingest_code_mode_tool_call(
@@ -628,8 +762,8 @@ impl AnalyticsReducer {
         };
         let has_thread_context = self.threads.get(thread_id).is_some_and(|thread| {
             thread.metadata.is_some()
-                && thread
-                    .connection_id
+                && self
+                    .thread_connection_id(thread_id)
                     .is_some_and(|connection_id| self.connections.contains_key(&connection_id))
         });
         if !has_thread_context {
@@ -712,6 +846,7 @@ impl AnalyticsReducer {
             CodeModeToolCallFact::Completed {
                 thread_id,
                 turn_id,
+                turn_metadata,
                 call_id,
                 cell_id,
                 tool_name,
@@ -776,12 +911,92 @@ impl AnalyticsReducer {
                 self.record_tool_event(
                     &thread_id,
                     &turn_id,
+                    turn_metadata.root_turn_id(),
                     event,
                     ToolEventEmission::AwaitResponse,
                     out,
                 );
             }
         }
+    }
+
+    fn ingest_control_tool_call(
+        &mut self,
+        input: ControlToolCallFact,
+        out: &mut Vec<TrackEventRequest>,
+    ) {
+        let ControlToolCallFact {
+            thread_id,
+            turn_id,
+            turn_metadata,
+            call_id,
+            cell_id,
+            tool_name,
+            started_at_ms,
+            completed_at_ms,
+            status,
+        } = input;
+        let drop_site = AnalyticsDropSite {
+            event_name: "control tool",
+            thread_id: &thread_id,
+            turn_id: Some(&turn_id),
+            review_id: None,
+            item_id: Some(&call_id),
+        };
+        let Some((connection_state, thread_state, thread_metadata)) =
+            self.thread_context_or_warn(drop_site)
+        else {
+            return;
+        };
+        let mut base = tool_item_base(
+            &thread_id,
+            &turn_id,
+            call_id,
+            tool_name,
+            ToolItemOutcome {
+                terminal_status: match status {
+                    ControlToolCallStatus::Completed => ToolItemTerminalStatus::Completed,
+                    ControlToolCallStatus::Failed => ToolItemTerminalStatus::Failed,
+                    ControlToolCallStatus::Rejected => ToolItemTerminalStatus::Rejected,
+                    ControlToolCallStatus::Interrupted => ToolItemTerminalStatus::Interrupted,
+                },
+                failure_kind: match status {
+                    ControlToolCallStatus::Failed => Some(ToolItemFailureKind::ToolError),
+                    ControlToolCallStatus::Rejected => Some(ToolItemFailureKind::PolicyForbidden),
+                    ControlToolCallStatus::Completed | ControlToolCallStatus::Interrupted => None,
+                },
+                execution_duration_ms: observed_duration_ms(started_at_ms, completed_at_ms),
+            },
+            ToolItemContext {
+                started_at_ms,
+                completed_at_ms,
+                connection_state,
+                thread_state,
+                thread_metadata,
+                review_summary: None,
+            },
+        );
+        base.cell_id = cell_id;
+        let event = TrackEventRequest::ControlToolCall(CodexControlToolCallEventRequest {
+            event_type: "codex_control_tool_call_event",
+            event_params: CodexControlToolCallEventParams {
+                base,
+                success: status == ControlToolCallStatus::Completed,
+            },
+        });
+        self.turns
+            .entry(turn_id.clone())
+            .or_default()
+            .tool_counts
+            .total += 1;
+        self.record_tool_event(
+            &thread_id,
+            &turn_id,
+            turn_metadata.root_turn_id(),
+            event,
+            ToolEventEmission::AwaitResponse,
+            out,
+        );
     }
 
     fn ingest_sampling_response_completed(
@@ -836,14 +1051,16 @@ impl AnalyticsReducer {
         &mut self,
         thread_id: &str,
         turn_id: &str,
+        root_turn_id: Option<String>,
         mut event: TrackEventRequest,
         emission: ToolEventEmission,
         out: &mut Vec<TrackEventRequest>,
     ) {
-        if tool_event_base_mut(&mut event).is_none() {
+        let Some(base) = tool_event_base_mut(&mut event) else {
             out.push(event);
             return;
-        }
+        };
+        base.root_turn_id = root_turn_id;
         let state = self
             .tool_response_states
             .entry((thread_id.to_string(), turn_id.to_string()))
@@ -921,9 +1138,8 @@ impl AnalyticsReducer {
     ) {
         let parent_thread_id = input.parent_thread_id.clone();
         let parent_connection_id = parent_thread_id
-            .as_ref()
-            .and_then(|parent_thread_id| self.threads.get(parent_thread_id))
-            .and_then(|thread| thread.connection_id);
+            .as_deref()
+            .and_then(|parent_thread_id| self.thread_connection_id(parent_thread_id));
         let thread_state = self.threads.entry(input.thread_id.clone()).or_default();
         thread_state
             .originator
@@ -932,7 +1148,7 @@ impl AnalyticsReducer {
             .metadata
             .get_or_insert_with(|| ThreadMetadataState {
                 session_id: input.session_id.clone(),
-                thread_source: Some(ThreadSource::Subagent),
+                thread_source: input.thread_source.clone(),
                 initialization_mode: ThreadInitializationMode::New,
                 subagent_source: Some(subagent_source_name(&input.subagent_source)),
                 parent_thread_id,
@@ -940,9 +1156,13 @@ impl AnalyticsReducer {
         if thread_state.connection_id.is_none() {
             thread_state.connection_id = parent_connection_id;
         }
-        out.push(TrackEventRequest::ThreadInitialized(
-            subagent_thread_started_event_request(input),
-        ));
+        // Guardian prewarm can register lineage before parent client metadata is set.
+        // Keep the existing completeness requirement for the initialization event.
+        if input.client_name.is_some() && input.client_version.is_some() {
+            out.push(TrackEventRequest::ThreadInitialized(
+                subagent_thread_started_event_request(input),
+            ));
+        }
     }
 
     fn ingest_guardian_review(
@@ -1063,26 +1283,54 @@ impl AnalyticsReducer {
             invocations,
         } = input;
         for invocation in invocations {
-            let skill_scope = match invocation.skill_scope {
-                SkillScope::User => "user",
-                SkillScope::Repo => "repo",
-                SkillScope::System => "system",
-                SkillScope::Admin => "admin",
+            let (skill_id, repo_url, skill_scope) = match invocation.location {
+                SkillInvocationLocation::Host { path, scope } => {
+                    let skill_scope = match scope {
+                        SkillScope::User => "user",
+                        SkillScope::Repo => "repo",
+                        SkillScope::System => "system",
+                        SkillScope::Admin => "admin",
+                    };
+                    let repo_root = get_git_repo_root(path.as_path());
+                    let repo_url = if let Some(root) = repo_root.as_ref() {
+                        collect_git_info(root)
+                            .await
+                            .and_then(|info| info.repository_url)
+                    } else {
+                        None
+                    };
+                    let skill_id = skill_id_for_local_skill(
+                        repo_url.as_ref().map(SanitizedGitUrl::as_str),
+                        repo_root.as_deref(),
+                        path.as_path(),
+                        invocation.skill_name.as_str(),
+                    );
+                    (skill_id, repo_url, Some(skill_scope.to_string()))
+                }
+                SkillInvocationLocation::Resource {
+                    id,
+                    skill_id,
+                    scope,
+                } => {
+                    if matches!(invocation.invocation_type, InvocationType::Implicit) {
+                        let turn_state = self.turns.entry(tracking.turn_id.clone()).or_default();
+                        if !turn_state.resource_skill_invocations.insert(id.clone()) {
+                            continue;
+                        }
+                    }
+                    let skill_id = skill_id
+                        .unwrap_or_else(|| format!("{:x}", sha1::Sha1::digest(id.as_bytes())));
+                    let skill_scope = scope
+                        .map(|scope| match scope {
+                            SkillScope::User => "user",
+                            SkillScope::Repo => "repo",
+                            SkillScope::System => "system",
+                            SkillScope::Admin => "admin",
+                        })
+                        .map(str::to_owned);
+                    (skill_id, None, skill_scope)
+                }
             };
-            let repo_root = get_git_repo_root(invocation.skill_path.as_path());
-            let repo_url = if let Some(root) = repo_root.as_ref() {
-                collect_git_info(root)
-                    .await
-                    .and_then(|info| info.repository_url)
-            } else {
-                None
-            };
-            let skill_id = skill_id_for_local_skill(
-                repo_url.as_deref(),
-                repo_root.as_deref(),
-                invocation.skill_path.as_path(),
-                invocation.skill_name.as_str(),
-            );
             out.push(TrackEventRequest::SkillInvocation(
                 SkillInvocationEventRequest {
                     event_type: "skill_invocation",
@@ -1094,8 +1342,8 @@ impl AnalyticsReducer {
                         invoke_type: Some(invocation.invocation_type),
                         model_slug: Some(tracking.model_slug.clone()),
                         product_client_id: Some(tracking.product_client_id.clone()),
-                        repo_url,
-                        skill_scope: Some(skill_scope.to_string()),
+                        repo_url: repo_url.map(String::from),
+                        skill_scope,
                         plugin_id: invocation.plugin_id,
                         remote_plugin_id: invocation.remote_plugin_id,
                     },
@@ -1321,6 +1569,10 @@ impl AnalyticsReducer {
     fn ingest_server_request(&mut self, _connection_id: u64, request: ServerRequest) {
         match request {
             ServerRequest::CommandExecutionRequestApproval { request_id, params } => {
+                let is_stdin_review = match params.kind {
+                    CommandExecutionApprovalKind::WriteStdin => true,
+                    CommandExecutionApprovalKind::Command => false,
+                };
                 let is_network_access_review = params.network_approval_context.is_some();
                 let requested_network_access = is_network_access_review
                     || params
@@ -1334,7 +1586,9 @@ impl AnalyticsReducer {
                         .and_then(|network| network.enabled)
                         .unwrap_or(false);
                 let requested_additional_permissions = params.additional_permissions.is_some();
-                let trigger = if params.approval_id.is_some() {
+                let trigger = if is_stdin_review {
+                    ReviewTrigger::Initial
+                } else if params.approval_id.is_some() {
                     ReviewTrigger::ExecveIntercept
                 } else if requested_network_access {
                     ReviewTrigger::NetworkPolicyDenial
@@ -1353,12 +1607,16 @@ impl AnalyticsReducer {
                         turn_id: params.turn_id,
                         item_id: Some(params.item_id),
                         review_id: user_review_id(&request_id),
-                        subject_kind: if is_network_access_review {
+                        subject_kind: if is_stdin_review {
+                            ReviewSubjectKind::WriteStdin
+                        } else if is_network_access_review {
                             ReviewSubjectKind::NetworkAccess
                         } else {
                             ReviewSubjectKind::CommandExecution
                         },
-                        subject_name: if is_network_access_review {
+                        subject_name: if is_stdin_review {
+                            "write_stdin".to_string()
+                        } else if is_network_access_review {
                             "network_access".to_string()
                         } else {
                             "command_execution".to_string()
@@ -1570,6 +1828,38 @@ impl AnalyticsReducer {
         );
     }
 
+    fn thread_archive_event_params(
+        &self,
+        thread_id: String,
+        action: ThreadArchiveAction,
+    ) -> ThreadArchiveEventParams {
+        let thread_state = self.threads.get(&thread_id);
+        let connection_state = self
+            .thread_connection_id(&thread_id)
+            .and_then(|connection_id| self.connections.get(&connection_id));
+        let thread_metadata = thread_state.and_then(|thread_state| thread_state.metadata.as_ref());
+
+        ThreadArchiveEventParams {
+            thread_id,
+            action,
+            occurred_at_ms: now_unix_millis(),
+            app_server_client: thread_state
+                .zip(connection_state)
+                .map(|(thread_state, connection_state)| {
+                    thread_state.app_server_client(connection_state)
+                }),
+            runtime: connection_state.map(|connection_state| connection_state.runtime.clone()),
+            thread_source: thread_metadata
+                .and_then(|thread_metadata| thread_metadata.thread_source.as_ref())
+                .filter(|thread_source| {
+                    !matches!(thread_source, ThreadSource::Feature(feature) if feature != "automation")
+                })
+                .cloned(),
+            parent_thread_id: thread_metadata
+                .and_then(|thread_metadata| thread_metadata.parent_thread_id.clone()),
+        }
+    }
+
     async fn ingest_notification(
         &mut self,
         notification: ServerNotification,
@@ -1579,21 +1869,19 @@ impl AnalyticsReducer {
             ServerNotification::ThreadArchived(notification) => {
                 out.push(TrackEventRequest::ThreadArchive(ThreadArchiveEvent {
                     event_type: "codex_thread_archive_event",
-                    event_params: ThreadArchiveEventParams {
-                        thread_id: notification.thread_id,
-                        action: ThreadArchiveAction::Archived,
-                        occurred_at_ms: now_unix_millis(),
-                    },
+                    event_params: self.thread_archive_event_params(
+                        notification.thread_id,
+                        ThreadArchiveAction::Archived,
+                    ),
                 }));
             }
             ServerNotification::ThreadUnarchived(notification) => {
                 out.push(TrackEventRequest::ThreadArchive(ThreadArchiveEvent {
                     event_type: "codex_thread_archive_event",
-                    event_params: ThreadArchiveEventParams {
-                        thread_id: notification.thread_id,
-                        action: ThreadArchiveAction::Unarchived,
-                        occurred_at_ms: now_unix_millis(),
-                    },
+                    event_params: self.thread_archive_event_params(
+                        notification.thread_id,
+                        ThreadArchiveAction::Unarchived,
+                    ),
                 }));
             }
             ServerNotification::ItemStarted(notification) => {
@@ -1673,15 +1961,37 @@ impl AnalyticsReducer {
                     thread_metadata,
                     review_summary: self.item_review_summaries.get(&key),
                 }) {
+                    let root_turn_id = self
+                        .turns
+                        .get(&notification.turn_id)
+                        .and_then(|turn| turn.resolved_config.as_ref())
+                        .and_then(|config| config.turn_metadata.root_turn_id());
+                    // Fast collaborator tools can complete before their sampling response.
+                    // Keep the event until that response can supply its originating ID.
+                    let emission =
+                        if matches!(&notification.item, ThreadItem::CollabAgentToolCall { .. }) {
+                            ToolEventEmission::AwaitResponse
+                        } else {
+                            ToolEventEmission::ImmediateUnlessCorrelated
+                        };
                     self.record_tool_event(
                         &notification.thread_id,
                         &notification.turn_id,
+                        root_turn_id,
                         event,
-                        ToolEventEmission::ImmediateUnlessCorrelated,
+                        emission,
                         out,
                     );
                 }
                 self.item_review_summaries.remove(&key);
+                if self
+                    .turns
+                    .get(&notification.turn_id)
+                    .is_some_and(|turn_state| turn_state.turn_event_emitted)
+                    && !self.has_pending_tool_items_for_turn(&notification.turn_id)
+                {
+                    self.turns.remove(&notification.turn_id);
+                }
             }
             ServerNotification::ItemGuardianApprovalReviewStarted(notification) => {
                 let _ = notification;
@@ -1736,6 +2046,50 @@ impl AnalyticsReducer {
             }
             _ => {}
         }
+    }
+
+    fn ingest_plugin_measurements(
+        &mut self,
+        input: PluginMeasurementsInput,
+        out: &mut Vec<TrackEventRequest>,
+    ) {
+        if input.rows.is_empty()
+            || input.rows.len() > MAX_PLUGIN_MEASUREMENTS_PER_BATCH
+            || !valid_plugin_measurement_identifier(&input.operation)
+        {
+            return;
+        }
+        let PluginMeasurementsInput {
+            thread_id,
+            turn_id,
+            item_id,
+            originator,
+            plugin_id,
+            execution_id,
+            operation,
+            rows,
+        } = input;
+        out.extend(
+            rows.into_iter()
+                .filter(valid_plugin_measurement_row)
+                .map(|row| {
+                    TrackEventRequest::PluginMeasurement(CodexPluginMeasurementEventRequest {
+                        event_type: "codex_plugin_measurement_event",
+                        event_params: CodexPluginMeasurementEventParams {
+                            thread_id: thread_id.clone(),
+                            turn_id: turn_id.clone(),
+                            item_id: item_id.clone(),
+                            originator: originator.clone(),
+                            plugin_id: plugin_id.clone(),
+                            execution_id: execution_id.clone(),
+                            operation: operation.clone(),
+                            measurement_name: row.measurement_name,
+                            number_value: row.number_value,
+                            dimensions: (!row.dimensions.is_empty()).then_some(row.dimensions),
+                        },
+                    })
+                }),
+        );
     }
 
     fn emit_thread_initialized(
@@ -2011,6 +2365,9 @@ impl AnalyticsReducer {
         let Some(turn_state) = self.turns.get(turn_id) else {
             return;
         };
+        if turn_state.turn_event_emitted {
+            return;
+        }
         if turn_state.thread_id.is_none()
             || turn_state.num_input_images.is_none()
             || turn_state.resolved_config.is_none()
@@ -2023,11 +2380,9 @@ impl AnalyticsReducer {
             return;
         };
         let drop_site = AnalyticsDropSite::turn(thread_id, turn_id);
-        let connection_id = turn_state.connection_id.or_else(|| {
-            self.threads
-                .get(drop_site.thread_id)
-                .and_then(|thread| thread.connection_id)
-        });
+        let connection_id = turn_state
+            .connection_id
+            .or_else(|| self.thread_connection_id(drop_site.thread_id));
         let Some(connection_id) = connection_id else {
             warn_missing_analytics_context(&drop_site, MissingAnalyticsContext::ThreadConnection);
             return;
@@ -2064,18 +2419,39 @@ impl AnalyticsReducer {
             input.repo_hash = accepted_line_repo_hash_for_cwd(cwd.as_path()).await;
             out.extend(accepted_line_fingerprint_event_requests(input));
         }
-        self.turns.remove(turn_id);
+        if self.has_pending_tool_items_for_turn(turn_id) {
+            if let Some(turn_state) = self.turns.get_mut(turn_id) {
+                turn_state.turn_event_emitted = true;
+            }
+        } else {
+            self.turns.remove(turn_id);
+        }
+    }
+
+    fn has_pending_tool_items_for_turn(&self, turn_id: &str) -> bool {
+        self.tool_items_started_at_ms
+            .keys()
+            .any(|key| key.turn_id == turn_id)
+    }
+
+    /// Resolve the parent connection lazily when a subagent fact arrives first.
+    ///
+    /// Parents are spawned before their children, so ancestor links cannot cycle.
+    fn thread_connection_id(&self, thread_id: &str) -> Option<u64> {
+        let mut thread = self.threads.get(thread_id)?;
+        while thread.connection_id.is_none() {
+            let thread_metadata = thread.metadata.as_ref()?;
+            let parent_thread_id = thread_metadata.parent_thread_id.as_deref()?;
+            thread = self.threads.get(parent_thread_id)?;
+        }
+        thread.connection_id
     }
 
     fn thread_connection_or_warn(
         &self,
         drop_site: AnalyticsDropSite<'_>,
     ) -> Option<&ConnectionState> {
-        let Some(thread_state) = self.threads.get(drop_site.thread_id) else {
-            warn_missing_analytics_context(&drop_site, MissingAnalyticsContext::ThreadConnection);
-            return None;
-        };
-        let Some(connection_id) = thread_state.connection_id else {
+        let Some(connection_id) = self.thread_connection_id(drop_site.thread_id) else {
             warn_missing_analytics_context(&drop_site, MissingAnalyticsContext::ThreadConnection);
             return None;
         };
@@ -2130,7 +2506,7 @@ fn warn_missing_analytics_context(
     );
 }
 
-fn tracked_tool_item_id(item: &ThreadItem) -> Option<&str> {
+pub(crate) fn tracked_tool_item_id(item: &ThreadItem) -> Option<&str> {
     match item {
         ThreadItem::CommandExecution { id, .. }
         | ThreadItem::FileChange { id, .. }
@@ -2142,6 +2518,7 @@ fn tracked_tool_item_id(item: &ThreadItem) -> Option<&str> {
         ThreadItem::UserMessage { .. }
         | ThreadItem::HookPrompt { .. }
         | ThreadItem::AgentMessage { .. }
+        | ThreadItem::FunctionCallOutput { .. }
         | ThreadItem::Plan { .. }
         | ThreadItem::Reasoning { .. }
         | ThreadItem::SubAgentActivity { .. }
@@ -2159,6 +2536,7 @@ fn tool_event_base_mut(event: &mut TrackEventRequest) -> Option<&mut CodexToolIt
         TrackEventRequest::FileChange(event) => Some(&mut event.event_params.base),
         TrackEventRequest::McpToolCall(event) => Some(&mut event.event_params.base),
         TrackEventRequest::DynamicToolCall(event) => Some(&mut event.event_params.base),
+        TrackEventRequest::ControlToolCall(event) => Some(&mut event.event_params.base),
         TrackEventRequest::CollabAgentToolCall(event) => Some(&mut event.event_params.base),
         TrackEventRequest::WebSearch(event) => Some(&mut event.event_params.base),
         TrackEventRequest::ImageGeneration(event) => Some(&mut event.event_params.base),
@@ -2205,7 +2583,9 @@ fn item_review_summary_key(pending_review: &PendingReviewState) -> Option<ToolIt
             turn_id: pending_review.turn_id.clone(),
             item_id: pending_review.item_id.clone()?,
         }),
-        ReviewSubjectKind::Permissions | ReviewSubjectKind::NetworkAccess => None,
+        ReviewSubjectKind::WriteStdin
+        | ReviewSubjectKind::Permissions
+        | ReviewSubjectKind::NetworkAccess => None,
     }
 }
 
@@ -2439,7 +2819,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                 ToolItemOutcome {
                     terminal_status,
                     failure_kind,
-                    execution_duration_ms: None,
+                    execution_duration_ms: observed_duration_ms(started_at_ms, completed_at_ms),
                 },
                 ToolItemContext {
                     started_at_ms,
@@ -2544,6 +2924,8 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                         base,
                         revised_prompt_present: item.revised_prompt.is_some(),
                         saved_path_present: item.saved_path.is_some(),
+                        transparent_background: item.transparent_background,
+                        imagegen_request_id: item.imagegen_request_id.clone(),
                     },
                 },
             ))
@@ -2615,6 +2997,7 @@ fn tool_item_base(
         thread_id: thread_id.to_string(),
         session_id: thread_metadata.session_id.clone(),
         turn_id: turn_id.to_string(),
+        root_turn_id: None,
         item_id,
         cell_id: None,
         parent_call_id: None,
@@ -2744,6 +3127,11 @@ fn guardian_review_subject_metadata(
             "command_execution".to_string(),
             ReviewTrigger::Initial,
         ),
+        GuardianApprovalReviewAction::WriteStdin { .. } => (
+            ReviewSubjectKind::WriteStdin,
+            "write_stdin".to_string(),
+            ReviewTrigger::Initial,
+        ),
         GuardianApprovalReviewAction::Execve { .. } => (
             ReviewSubjectKind::CommandExecution,
             "command_execution".to_string(),
@@ -2795,6 +3183,7 @@ fn guardian_review_requested_additional_permissions(action: &GuardianApprovalRev
                 || permissions.file_system.is_some()
         }
         GuardianApprovalReviewAction::Command { .. }
+        | GuardianApprovalReviewAction::WriteStdin { .. }
         | GuardianApprovalReviewAction::Execve { .. }
         | GuardianApprovalReviewAction::McpToolCall { .. } => false,
     }
@@ -2808,6 +3197,7 @@ fn guardian_review_requested_network_access(action: &GuardianApprovalReviewActio
         }
         GuardianApprovalReviewAction::ApplyPatch { .. }
         | GuardianApprovalReviewAction::Command { .. }
+        | GuardianApprovalReviewAction::WriteStdin { .. }
         | GuardianApprovalReviewAction::Execve { .. }
         | GuardianApprovalReviewAction::McpToolCall { .. } => false,
     }
@@ -2916,6 +3306,7 @@ fn collab_tool_call_outcome(
     match status {
         CollabAgentToolCallStatus::InProgress => None,
         CollabAgentToolCallStatus::Completed => Some((ToolItemTerminalStatus::Completed, None)),
+        CollabAgentToolCallStatus::Interrupted => Some((ToolItemTerminalStatus::Interrupted, None)),
         CollabAgentToolCallStatus::Failed => Some((
             ToolItemTerminalStatus::Failed,
             Some(ToolItemFailureKind::ToolError),
@@ -2940,6 +3331,10 @@ fn collab_agent_tool_name(tool: &CollabAgentTool) -> &'static str {
         CollabAgentTool::ResumeAgent => "resume_agent",
         CollabAgentTool::Wait => "wait_agent",
         CollabAgentTool::CloseAgent => "close_agent",
+        CollabAgentTool::SendMessage => "send_message",
+        CollabAgentTool::FollowupTask => "followup_task",
+        CollabAgentTool::InterruptAgent => "interrupt_agent",
+        CollabAgentTool::ListAgents => "list_agents",
     }
 }
 
@@ -3018,7 +3413,7 @@ fn accepted_line_event_input(
     turn_state: &TurnState,
 ) -> Option<(AcceptedLineFingerprintEventInput, PathBuf)> {
     let latest_diff = turn_state.latest_diff.as_deref()?;
-    let summary = accepted_line_fingerprints_from_unified_diff(latest_diff);
+    let summary = accepted_line_counts_from_unified_diff(latest_diff);
     if summary.accepted_added_lines == 0 && summary.accepted_deleted_lines == 0 {
         return None;
     }
@@ -3037,7 +3432,6 @@ fn accepted_line_event_input(
             repo_hash: None,
             accepted_added_lines: summary.accepted_added_lines,
             accepted_deleted_lines: summary.accepted_deleted_lines,
-            line_fingerprints: summary.line_fingerprints,
         },
         resolved_config.permission_profile_cwd,
     ))
@@ -3070,6 +3464,7 @@ fn codex_turn_event_params(
     let TurnResolvedConfigFact {
         turn_id: _resolved_turn_id,
         thread_id: _resolved_thread_id,
+        turn_metadata,
         num_input_images: _resolved_num_input_images,
         submission_type,
         ephemeral,
@@ -3083,6 +3478,7 @@ fn codex_turn_event_params(
         service_tier,
         approval_policy,
         approvals_reviewer,
+        guardian_v2_enabled,
         sandbox_network_access,
         collaboration_mode,
         personality,
@@ -3105,6 +3501,9 @@ fn codex_turn_event_params(
         thread_id,
         session_id: thread_metadata.session_id.clone(),
         turn_id,
+        root_turn_id: turn_metadata.root_turn_id(),
+        turn_trigger: turn_metadata.turn_trigger(),
+        codex_turn_source: turn_metadata.codex_turn_source(),
         app_server_client,
         runtime,
         submission_type,
@@ -3126,6 +3525,7 @@ fn codex_turn_event_params(
             .unwrap_or_else(|| "default".to_string()),
         approval_policy: approval_policy.to_string(),
         approvals_reviewer: approvals_reviewer.to_string(),
+        guardian_v2_enabled,
         sandbox_network_access,
         collaboration_mode: Some(collaboration_mode_mode(collaboration_mode)),
         personality: personality_mode(personality),

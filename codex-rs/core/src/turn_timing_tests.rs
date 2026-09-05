@@ -29,7 +29,9 @@ async fn turn_timing_state_records_ttft_only_once_per_turn() {
     state.mark_turn_started(Instant::now()).await;
     assert_eq!(
         state
-            .record_ttft_for_response_event(&ResponseEvent::Created)
+            .record_ttft_for_response_event(&ResponseEvent::Created {
+                guardian_ticket: None
+            })
             .await,
         None
     );
@@ -65,6 +67,8 @@ async fn turn_timing_state_records_ttfm_independently_of_ttft() {
                 content: Vec::new(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
+                questions: None,
             }))
             .await
             .is_some()
@@ -76,6 +80,8 @@ async fn turn_timing_state_records_ttfm_independently_of_ttft() {
                 content: Vec::new(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
+                questions: None,
             }))
             .await,
         None
@@ -190,7 +196,9 @@ fn response_item_records_turn_ttft_ignores_empty_non_output_items() {
     assert!(!response_item_records_turn_ttft(
         &ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "call-1".to_string(),
+            call_id: Some("call-1".to_string()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload::from_text("ok".to_string()),
             internal_chat_message_metadata_passthrough: None,
         }

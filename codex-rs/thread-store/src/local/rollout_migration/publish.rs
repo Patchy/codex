@@ -22,8 +22,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 
 use codex_protocol::ThreadId;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
+use codex_rollout::RolloutItem;
 use tokio::fs::File;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
@@ -170,7 +169,7 @@ pub(super) async fn rewrite_subagent_history_boundary(
         .read_until(b'\n', &mut head_bytes)
         .await
         .map_err(migration_error)?;
-    let mut head = serde_json::from_slice::<RolloutLine>(&head_bytes).map_err(migration_error)?;
+    let mut head = codex_rollout::parse_rollout_line_bytes(&head_bytes).map_err(migration_error)?;
     let RolloutItem::SessionMeta(session_meta) = &mut head.item else {
         return Err(migration_error(
             "staged rollout head is not session metadata",

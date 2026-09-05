@@ -4,9 +4,9 @@ use anyhow::Result;
 use core_test_support::responses::WebSocketConnectionConfig;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_exec_command_call;
 use core_test_support::responses::ev_reasoning_item;
 use core_test_support::responses::ev_response_created;
-use core_test_support::responses::ev_shell_command_call;
 use core_test_support::responses::mount_response_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::sse_response;
@@ -30,7 +30,7 @@ async fn responses_turn_state_persists_within_turn_and_resets_after() -> Result<
     let first_response = sse(vec![
         ev_response_created("resp-1"),
         ev_reasoning_item("rsn-1", &["thinking"], &[]),
-        ev_shell_command_call(call_id, "echo turn-state"),
+        ev_exec_command_call(call_id, "echo turn-state"),
         ev_completed("resp-1"),
     ]);
     let second_response = sse(vec![
@@ -102,7 +102,7 @@ async fn websocket_turn_state_persists_within_turn_and_resets_after() -> Result<
                 }),
                 ev_response_created("resp-1"),
                 ev_reasoning_item("rsn-1", &["thinking"], &[]),
-                ev_shell_command_call("ws-shell-turn-state", "echo websocket"),
+                ev_exec_command_call("ws-shell-turn-state", "echo websocket"),
                 ev_completed("resp-1"),
             ],
             vec![
@@ -125,6 +125,12 @@ async fn websocket_turn_state_persists_within_turn_and_resets_after() -> Result<
     let mut builder = test_codex();
     let test = builder.build_with_websocket_server(&server).await?;
     // Phase 1: startup prewarm uses the connection without generating a response.
+    // Wait before submitting a turn, which changes the session's sandbox policy.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(/*secs*/ 10),
+        server.wait_for_request(/*connection_index*/ 0, /*request_index*/ 0),
+    )
+    .await?;
     // Phase 2: the first turn mints state for its same-turn tool follow-up.
     test.submit_turn("run the echo command").await?;
     // Phase 3: the follow-up replays that state on the same physical connection.
@@ -209,7 +215,7 @@ async fn websocket_turn_state_is_stable_within_turn() -> Result<()> {
                     "headers": {(TURN_STATE_HEADER): "ts-1"},
                 }),
                 ev_response_created("resp-1"),
-                ev_shell_command_call("ws-shell-1", "echo one"),
+                ev_exec_command_call("ws-shell-1", "echo one"),
                 ev_completed("resp-1"),
             ],
             vec![
@@ -218,7 +224,7 @@ async fn websocket_turn_state_is_stable_within_turn() -> Result<()> {
                     "headers": {(TURN_STATE_HEADER): "ts-2"},
                 }),
                 ev_response_created("resp-2"),
-                ev_shell_command_call("ws-shell-2", "echo two"),
+                ev_exec_command_call("ws-shell-2", "echo two"),
                 ev_completed("resp-2"),
             ],
             vec![

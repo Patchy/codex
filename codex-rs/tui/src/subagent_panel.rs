@@ -133,21 +133,6 @@ impl SubagentInfo {
     }
 }
 
-/// Point-in-time stats for one tracked agent, consumed by the dashboard view.
-#[derive(Clone, Debug)]
-pub(crate) struct SubagentStats {
-    pub(crate) thread_id: ThreadId,
-    pub(crate) ordinal: i32,
-    pub(crate) name: String,
-    pub(crate) role: Option<String>,
-    pub(crate) status: PanelAgentStatus,
-    pub(crate) spawned_at: Instant,
-    pub(crate) latest_update_at: Instant,
-    pub(crate) latest_preview: String,
-    pub(crate) turns_completed: u32,
-    pub(crate) activity_count: u32,
-}
-
 #[derive(Debug, Default)]
 pub(crate) struct SubagentPanelRegistry {
     agents: HashMap<ThreadId, SubagentInfo>,
@@ -255,31 +240,6 @@ impl SubagentPanelRegistry {
     fn remove(&mut self, thread_id: ThreadId) {
         self.agents.remove(&thread_id);
         self.order.retain(|candidate| *candidate != thread_id);
-    }
-
-    /// Snapshot of every agent seen this session (running and finished),
-    /// in spawn order, for the dashboard view.
-    pub(crate) fn all_stats(&self) -> Vec<SubagentStats> {
-        let mut stats = self
-            .order
-            .iter()
-            .filter_map(|thread_id| {
-                self.agents.get(thread_id).map(|info| SubagentStats {
-                    thread_id: *thread_id,
-                    ordinal: info.ordinal,
-                    name: info.name.clone(),
-                    role: info.role.clone(),
-                    status: info.status.clone(),
-                    spawned_at: info.spawned_at,
-                    latest_update_at: info.latest_update_at,
-                    latest_preview: info.latest_preview.clone(),
-                    turns_completed: info.turns_completed,
-                    activity_count: info.activity_count,
-                })
-            })
-            .collect::<Vec<_>>();
-        stats.sort_by_key(|stat| stat.ordinal);
-        stats
     }
 
     /// Rebuilds the shared panel state and returns a cell to pin, or `None`

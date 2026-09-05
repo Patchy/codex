@@ -35,8 +35,7 @@ pub(crate) struct ConfigManager {
     strict_config: bool,
     cloud_config_bundle: Arc<RwLock<CloudConfigBundleLoader>>,
     arg0_paths: Arg0DispatchPaths,
-    thread_config_loader: Arc<RwLock<Arc<dyn ThreadConfigLoader>>>,
-    pub(crate) psp: bool,
+    thread_config_loader: Arc<dyn ThreadConfigLoader>,
 }
 
 impl ConfigManager {
@@ -57,8 +56,7 @@ impl ConfigManager {
             strict_config,
             cloud_config_bundle: Arc::new(RwLock::new(cloud_config_bundle)),
             arg0_paths,
-            thread_config_loader: Arc::new(RwLock::new(thread_config_loader)),
-            psp: false,
+            thread_config_loader,
         }
     }
 
@@ -121,24 +119,6 @@ impl ConfigManager {
         }
     }
 
-    pub(crate) fn replace_thread_config_loader(
-        &self,
-        thread_config_loader: Arc<dyn ThreadConfigLoader>,
-    ) {
-        if let Ok(mut guard) = self.thread_config_loader.write() {
-            *guard = thread_config_loader;
-        } else {
-            warn!("failed to update thread config loader");
-        }
-    }
-
-    fn current_thread_config_loader(&self) -> Arc<dyn ThreadConfigLoader> {
-        self.thread_config_loader
-            .read()
-            .map(|guard| Arc::clone(&*guard))
-            .unwrap_or_else(|_| Arc::new(codex_config::NoopThreadConfigLoader))
-    }
-
     pub(crate) async fn sync_default_client_residency_requirement(&self) {
         match self.load_latest_config(/*fallback_cwd*/ None).await {
             Ok(config) => {
@@ -162,6 +142,14 @@ impl ConfigManager {
             fallback_cwd,
         )
         .await
+    }
+
+    /// Loads system, user, and runtime settings without discovering a project
+    /// from the app-server process's working directory.
+    pub(crate) async fn load_non_project_config(&self) -> std::io::Result<Config> {
+        let mut manager = self.clone();
+        manager.loader_overrides.ignore_project_config = true;
+        manager.load_latest_config(/*fallback_cwd*/ None).await
     }
 
     pub(crate) async fn load_latest_config_for_thread(
@@ -190,7 +178,6 @@ impl ConfigManager {
             .cloud_config_bundle(CloudConfigBundleLoader::default())
             .build()
             .await?;
-        config.psp = self.psp;
         self.apply_runtime_feature_enablement(&mut config);
         self.apply_arg0_paths(&mut config);
         Ok(config)
@@ -251,8 +238,6 @@ impl ConfigManager {
                     .map(|(key, value)| (key, json_to_toml(value))),
             )
             .collect::<Vec<_>>();
-        typesafe_overrides.psp = Some(self.psp);
-
         let mut config = codex_core::config::ConfigBuilder::default()
             .codex_home(self.codex_home.clone())
             .cli_overrides(merged_cli_overrides)
@@ -261,7 +246,7 @@ impl ConfigManager {
             .harness_overrides(typesafe_overrides)
             .fallback_cwd(fallback_cwd)
             .cloud_config_bundle(self.current_cloud_config_bundle())
-            .thread_config_loader(self.current_thread_config_loader())
+            .thread_config_loader(Arc::clone(&self.thread_config_loader))
             .build()
             .await?;
         self.apply_runtime_feature_enablement(&mut config);
@@ -280,7 +265,6 @@ impl ConfigManager {
         &self,
         cwd: Option<AbsolutePathBuf>,
     ) -> std::io::Result<ConfigLayerStack> {
-        let thread_config_loader = self.current_thread_config_loader();
         load_config_layers_state(
             LOCAL_FS.as_ref(),
             &self.codex_home,
@@ -291,7 +275,7 @@ impl ConfigManager {
                 strict_config: self.strict_config,
                 cloud_config_bundle: self.current_cloud_config_bundle(),
             },
-            thread_config_loader.as_ref(),
+            self.thread_config_loader.as_ref(),
         )
         .await
     }

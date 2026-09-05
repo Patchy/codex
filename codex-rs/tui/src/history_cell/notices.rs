@@ -2,6 +2,9 @@
 
 use super::*;
 
+#[cfg_attr(not(test), allow(dead_code))]
+const RECAP_HEADING: &str = "Conversation recap";
+
 #[cfg_attr(debug_assertions, allow(dead_code))]
 #[derive(Debug)]
 pub(crate) struct UpdateAvailableHistoryCell {
@@ -87,24 +90,55 @@ pub(crate) fn new_warning_event(message: String) -> PrefixedWrappedHistoryCell {
 
 #[derive(Debug)]
 pub(crate) struct SafetyAccessBlockCell {
+    title: &'static str,
     body: &'static str,
-    trusted_access_url: &'static str,
+    actions: &'static [(&'static str, &'static str)],
 }
 
-const SAFETY_ACCESS_BLOCK_TITLE: &str = "This content can't be shown";
 const SAFETY_ACCESS_BLOCK_LEARN_MORE_URL: &str = "https://help.openai.com/en/articles/20001326";
 
 pub(crate) fn new_safety_access_block_event() -> SafetyAccessBlockCell {
     SafetyAccessBlockCell {
+        title: "This content can't be shown",
         body: "We take extra caution with requests involving biological research and applications that could pose safety risks. Eligible researchers can apply for Trusted Access.",
-        trusted_access_url: "https://www.openai.com/form/trusted-access-for-biology-research/",
+        actions: &[
+            (
+                "Trusted Access",
+                "https://chatgpt.com/r/b749fb02595e04c3007a54375f3f4374",
+            ),
+            ("Learn more", SAFETY_ACCESS_BLOCK_LEARN_MORE_URL),
+        ],
     }
 }
 
-pub(crate) fn new_cyber_policy_error_event() -> SafetyAccessBlockCell {
+pub(crate) fn new_cyber_policy_error_event(
+    notice: crate::daybreak::Notice,
+) -> SafetyAccessBlockCell {
+    use crate::daybreak::Notice;
+    let (body, actions): (_, &'static [(&str, &str)]) = match notice {
+        Notice::Apply => (
+            "We take extra care with some cybersecurity requests. If you’re doing authorized security work, apply for Daybreak to get broader access.",
+            &[
+                ("Learn more", SAFETY_ACCESS_BLOCK_LEARN_MORE_URL),
+                (
+                    "Apply for Daybreak",
+                    "https://openai.com/form/enterprise-trusted-access-for-cyber/",
+                ),
+            ],
+        ),
+        Notice::Astra => (
+            "Daybreak isn’t available for Astra. Some cybersecurity requests may still be limited.",
+            &[("Learn more", SAFETY_ACCESS_BLOCK_LEARN_MORE_URL)],
+        ),
+        Notice::Limited => (
+            "We take extra care with some cybersecurity requests.",
+            &[("Learn more", SAFETY_ACCESS_BLOCK_LEARN_MORE_URL)],
+        ),
+    };
     SafetyAccessBlockCell {
-        body: "We take extra caution with cybersecurity requests. If you’re a security professional, you may be able to apply for Trusted Access.",
-        trusted_access_url: "https://openai.com/form/enterprise-trusted-access-for-cyber/",
+        title: "This content can’t be shown",
+        body,
+        actions,
     }
 }
 
@@ -115,7 +149,7 @@ impl HistoryCell for SafetyAccessBlockCell {
 
     fn display_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
         let mut lines = vec![HyperlinkLine::new(
-            vec!["ⓘ ".cyan(), SAFETY_ACCESS_BLOCK_TITLE.bold()].into(),
+            vec!["ⓘ ".cyan(), self.title.bold()].into(),
         )];
         let body = Line::from(vec!["  ".into(), self.body.dim()]);
         let wrap_width = width.saturating_sub(2).max(1) as usize;
@@ -127,10 +161,7 @@ impl HistoryCell for SafetyAccessBlockCell {
         push_owned_lines(&wrapped, &mut wrapped_body);
         lines.extend(plain_hyperlink_lines(wrapped_body));
 
-        for (label, url) in [
-            ("Trusted Access", self.trusted_access_url),
-            ("Learn more", SAFETY_ACCESS_BLOCK_LEARN_MORE_URL),
-        ] {
+        for &(label, url) in self.actions {
             let source = crate::terminal_hyperlinks::annotate_web_urls_in_line(
                 vec![format!("  {label}: ").dim(), url.cyan().underlined()].into(),
             );
@@ -149,13 +180,13 @@ impl HistoryCell for SafetyAccessBlockCell {
     }
 
     fn raw_lines(&self) -> Vec<Line<'static>> {
-        let trusted_access_url = self.trusted_access_url;
-        vec![
-            Line::from(SAFETY_ACCESS_BLOCK_TITLE),
-            Line::from(self.body),
-            Line::from(format!("Trusted Access: {trusted_access_url}")),
-            Line::from(format!("Learn more: {SAFETY_ACCESS_BLOCK_LEARN_MORE_URL}")),
-        ]
+        let mut lines = vec![Line::from(self.title), Line::from(self.body)];
+        lines.extend(
+            self.actions
+                .iter()
+                .map(|(label, target)| Line::from(format!("{label}: {target}"))),
+        );
+        lines
     }
 
     fn transcript_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
@@ -216,4 +247,108 @@ pub(crate) fn new_error_event(message: String) -> PlainHistoryCell {
     // in terminals like Ghostty.
     let lines: Vec<Line<'static>> = vec![vec![format!("■ {message}").red()].into()];
     PlainHistoryCell { lines }
+}
+
+#[derive(Debug)]
+pub(crate) struct ThreadRecapLoadingCell {
+    start_time: Instant,
+    animations_enabled: bool,
+}
+
+impl ThreadRecapLoadingCell {
+    pub(crate) fn new(animations_enabled: bool) -> Self {
+        Self {
+            start_time: Instant::now(),
+            animations_enabled,
+        }
+    }
+}
+
+impl HistoryCell for ThreadRecapLoadingCell {
+    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        vec![
+            vec![
+                activity_indicator(
+                    Some(self.start_time),
+                    MotionMode::from_animations_enabled(self.animations_enabled),
+                    ReducedMotionIndicator::StaticBullet,
+                )
+                .unwrap_or_else(|| "•".dim()),
+                " ".into(),
+                "Generating conversation recap".bold(),
+                "…".dim(),
+            ]
+            .into(),
+        ]
+    }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        vec![Line::from("Generating conversation recap...")]
+    }
+
+    fn transcript_animation_tick(&self) -> Option<u64> {
+        if !self.animations_enabled {
+            return None;
+        }
+
+        Some((self.start_time.elapsed().as_millis() / 50) as u64)
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) struct ThreadRecapHistoryCell {
+    recap: String,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl ThreadRecapHistoryCell {
+    pub(crate) fn new(recap: String) -> Self {
+        Self { recap }
+    }
+}
+
+impl HistoryCell for ThreadRecapHistoryCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let width = usize::from(width);
+        let mut remaining_width = width;
+        let mut heading = Vec::new();
+
+        if remaining_width > 0 {
+            heading.push("─".dim());
+            remaining_width -= 1;
+        }
+        if remaining_width > 0 {
+            heading.push(" ".dim());
+            remaining_width -= 1;
+        }
+
+        let (visible_heading, _suffix, heading_width) =
+            take_prefix_by_width(RECAP_HEADING, remaining_width);
+        if !visible_heading.is_empty() {
+            heading.push(visible_heading.bold());
+            remaining_width -= heading_width;
+        }
+        if remaining_width > 0 {
+            heading.push(" ".dim());
+            remaining_width -= 1;
+        }
+        if remaining_width > 0 {
+            heading.push("─".repeat(remaining_width).dim());
+        }
+
+        let wrap_width = width.saturating_sub(2).max(1);
+        let body = raw_lines_from_source(&self.recap);
+        let wrapped = adaptive_wrap_lines(body, RtOptions::new(wrap_width));
+        let mut lines = vec![heading.into(), Line::default()];
+        lines.extend(prefix_lines(wrapped, "  ".into(), "  ".into()));
+
+        lines
+    }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        let mut lines = vec![Line::from(RECAP_HEADING)];
+        lines.extend(raw_lines_from_source(&self.recap));
+        lines
+    }
 }

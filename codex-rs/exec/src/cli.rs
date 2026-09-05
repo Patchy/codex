@@ -2,6 +2,7 @@ use clap::Args;
 use clap::FromArgMatches;
 use clap::Parser;
 use clap::ValueEnum;
+use codex_protocol::protocol::ThreadSource;
 use codex_utils_cli::CliConfigOverrides;
 use codex_utils_cli::SharedCliOptions;
 use std::path::PathBuf;
@@ -12,10 +13,6 @@ use std::path::PathBuf;
     override_usage = "codex exec [OPTIONS] [PROMPT]\n       codex exec [OPTIONS] <COMMAND> [ARGS]"
 )]
 pub struct Cli {
-    /// Process-only PSP routing selected by the parent Codex CLI.
-    #[clap(skip)]
-    pub psp: bool,
-
     /// Action to perform. If omitted, runs a new non-interactive session.
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -26,6 +23,10 @@ pub struct Cli {
 
     #[clap(flatten)]
     pub shared: ExecSharedCliOptions,
+
+    /// Source classification for newly created or forked threads.
+    #[arg(long = "thread-source", value_name = "SOURCE", global = true)]
+    pub thread_source: Option<ThreadSource>,
 
     /// Allow running Codex outside a Git repository.
     #[arg(long = "skip-git-repo-check", global = true, default_value_t = false)]
@@ -142,6 +143,7 @@ fn mark_exec_global_args(cmd: clap::Command) -> clap::Command {
             arg.global(true)
         })
         .mut_arg("bypass_hook_trust", |arg| arg.global(true))
+        .mut_arg("worktree", |arg| arg.global(true))
 }
 
 #[derive(Debug, clap::Subcommand)]

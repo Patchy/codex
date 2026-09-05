@@ -1,4 +1,5 @@
 use super::*;
+use crate::git_policy::REPOSITORY_LOCAL_GIT_ENVIRONMENT_VARIABLES;
 use crate::test_support::RecordingHttpClientSelector;
 use crate::test_support::recorded_http_client_urls;
 use pretty_assertions::assert_eq;
@@ -19,6 +20,106 @@ use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
 const TEST_CURATED_PLUGIN_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+#[cfg(unix)]
+#[test]
+fn pretrust_startup_sync_uses_installed_git_with_hostile_path() {
+    const CHILD_HOME: &str = "CODEX_TEST_CURATED_SYNC_HOME";
+    if let Some(home) = std::env::var_os(CHILD_HOME) {
+        // Call the public entry point, synchronously. The parent joins this
+        // process before checking the marker, so no detached work can escape it.
+        sync_openai_plugins_repo(
+            Path::new(&home),
+            crate::test_support::test_http_client_factory(),
+        )
+        .expect("Git-only startup sync should succeed");
+        return;
+    }
+    let fixture = tempdir().expect("fixture");
+    let source = fixture.path().join("remote");
+    let home = fixture.path().join("home");
+    let workspace = fixture.path().join("workspace");
+    let bin = workspace.join("node_modules/.bin");
+    let marker = fixture.path().join("helper-ran");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir(&home).unwrap();
+    run_git(&source, &["init", "--quiet"]);
+    for name in ["git", "git-upload-pack", "git-remote-https"] {
+        write_executable_script(
+            &bin.join(name),
+            &format!("#!/bin/sh\nprintf ran > '{}'\nexit 1\n", marker.display()),
+        );
+    }
+    let config = fixture.path().join("gitconfig");
+    std::fs::write(
+        &config,
+        format!(
+            "[url \"file://{}\"]\n insteadOf = {OPENAI_PLUGINS_GIT_URL}\n",
+            source.display()
+        ),
+    )
+    .unwrap();
+
+    for plugins in [vec!["gmail"], vec!["gmail", "linear"]] {
+        write_openai_curated_marketplace(&source, &plugins);
+        run_git(&source, &["add", "."]);
+        run_git(
+            &source,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                "update",
+            ],
+        );
+        let expected_sha = run_git(&source, &["rev-parse", "HEAD"]);
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "startup_sync::tests::pretrust_startup_sync_uses_installed_git_with_hostile_path",
+                "--nocapture",
+            ])
+            .current_dir(&workspace)
+            .env(CHILD_HOME, &home)
+            .env("PATH", &bin)
+            .env("GIT_EXEC_PATH", &bin)
+            .env("GIT_CONFIG_GLOBAL", &config)
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("HTTP_PROXY", "http://127.0.0.1:9")
+            .env("HTTPS_PROXY", "http://127.0.0.1:9")
+            .env("http_proxy", "http://127.0.0.1:9")
+            .env("https_proxy", "http://127.0.0.1:9")
+            .output()
+            .expect("join sync subprocess");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            read_curated_plugins_sha(&home),
+            Some(
+                String::from_utf8(expected_sha.stdout)
+                    .unwrap()
+                    .trim()
+                    .to_string()
+            )
+        );
+        assert!(!marker.exists(), "sync executed a workspace helper");
+        for plugin in plugins {
+            assert!(
+                curated_plugins_repo_path(&home)
+                    .join(format!("plugins/{plugin}/.codex-plugin/plugin.json"))
+                    .is_file()
+            );
+        }
+    }
+}
 
 #[tokio::test]
 async fn github_http_routes_repository_ref_and_zipball_urls() {
@@ -92,7 +193,7 @@ async fn backup_archive_routes_metadata_and_backend_supplied_download_urls() {
 
 #[test]
 fn git_command_sanitizes_ambient_repository_environment() {
-    let command = git_command(Path::new("git"));
+    let command = git_command(Path::new("git")).expect("trusted Git command");
 
     assert_eq!(
         command.get_args().collect::<Vec<_>>(),
@@ -112,6 +213,65 @@ fn git_command_sanitizes_ambient_repository_environment() {
             "{name} should be removed from startup sync Git commands"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn pretrust_git_sync_ignores_repository_local_transport_config() {
+    let fixture = tempdir().expect("tempdir");
+    let codex_home = fixture.path().join("codex-home");
+    let repository = fixture.path().join("untrusted-project");
+    let marker = fixture.path().join("transport-config-ran");
+    std::fs::create_dir_all(&codex_home).expect("create Codex home");
+    std::fs::create_dir_all(&repository).expect("create repository");
+    run_git(&repository, &["init", "--quiet"]);
+
+    let transport = repository.join("synthetic-transport.sh");
+    write_executable_script(
+        &transport,
+        &format!(
+            "#!/bin/sh\nprintf ran > '{}'\nprintf '{}\\tHEAD\\n'\n",
+            marker.display(),
+            TEST_CURATED_PLUGIN_SHA
+        ),
+    );
+    run_git(
+        &repository,
+        &["config", "--local", "protocol.ext.allow", "always"],
+    );
+    let rewrite_key = format!("url.ext::{} %S .insteadOf", transport.display());
+    run_git(
+        &repository,
+        &["config", "--local", &rewrite_key, OPENAI_PLUGINS_GIT_URL],
+    );
+
+    let global_config = fixture.path().join("global-gitconfig");
+    std::fs::write(
+        &global_config,
+        format!(
+            "[url \"file://{}/\"]\n\tinsteadOf = https://github.com/\n",
+            fixture.path().join("missing-remotes").display()
+        ),
+    )
+    .expect("write global Git config");
+    let git_wrapper = fixture.path().join("git-from-untrusted-repository.sh");
+    write_executable_script(
+        &git_wrapper,
+        &format!(
+            "#!/bin/sh\ncd '{}' || exit 1\nGIT_CONFIG_GLOBAL='{}' GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0 exec git \"$@\"\n",
+            repository.display(),
+            global_config.display()
+        ),
+    );
+
+    let err = sync_openai_plugins_repo_via_git(&codex_home, &git_wrapper)
+        .expect_err("isolated probe should use the missing global-config remote");
+
+    assert!(err.contains("git ls-remote curated plugins repo"));
+    assert!(
+        !marker.exists(),
+        "pre-trust sync must not execute repository-local transport configuration"
+    );
 }
 
 #[tokio::test]
@@ -200,6 +360,7 @@ async fn ordinary_clone_rejects_tracked_embedded_bare_repository() {
     std::fs::remove_file(&marker).expect("remove unguarded execution marker");
 
     let guarded = git_command(Path::new("git"))
+        .expect("trusted Git command")
         .args(["status", "--short"])
         .current_dir(&nested)
         .output()
@@ -229,6 +390,7 @@ async fn ordinary_clone_rejects_tracked_embedded_bare_repository() {
     );
 
     let explicit_git_dir = git_command(Path::new("git"))
+        .expect("trusted Git command")
         .arg("--git-dir")
         .arg(&nested)
         .args(["rev-parse", "--git-dir"])
@@ -874,31 +1036,6 @@ async fn sync_openai_plugins_repo_falls_back_to_http_when_git_is_unavailable() {
     assert_eq!(synced_sha, sha);
     assert_curated_gmail_repo(&repo_path);
     assert_eq!(read_curated_plugins_sha(tmp.path()).as_deref(), Some(sha));
-}
-
-#[test]
-fn apple_git_without_developer_tools_is_unavailable() {
-    assert_eq!(
-        macos_git_binary_from_path(
-            PathBuf::from("/usr/bin/git"),
-            /*apple_developer_tools_available*/ false,
-        ),
-        None
-    );
-    assert_eq!(
-        macos_git_binary_from_path(
-            PathBuf::from("/usr/bin/git"),
-            /*apple_developer_tools_available*/ true,
-        ),
-        Some(PathBuf::from("/usr/bin/git"))
-    );
-    assert_eq!(
-        macos_git_binary_from_path(
-            PathBuf::from("/opt/homebrew/bin/git"),
-            /*apple_developer_tools_available*/ false,
-        ),
-        Some(PathBuf::from("/opt/homebrew/bin/git"))
-    );
 }
 
 #[tokio::test]

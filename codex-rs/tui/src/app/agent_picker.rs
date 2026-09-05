@@ -37,6 +37,7 @@ impl App {
                         .request_typed::<ThreadListResponse>(ClientRequest::ThreadList {
                             request_id: RequestId::String(Uuid::new_v4().to_string()),
                             params: ThreadListParams {
+                                originators: None,
                                 cursor,
                                 limit: Some(AGENT_PICKER_PAGE_SIZE),
                                 sort_key: None,
@@ -45,6 +46,7 @@ impl App {
                                 source_kinds: Some(vec![ThreadSourceKind::SubAgentThreadSpawn]),
                                 archived: None,
                                 section_id: None,
+                                project_id: None,
                                 cwd: None,
                                 use_state_db_only: true,
                                 search_term: None,

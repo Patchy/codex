@@ -63,8 +63,8 @@ pub fn compose_requirements(
     compose_requirements_with_hostname_resolver(layers, crate::host_name)
 }
 
-#[cfg(test)]
-pub(super) fn compose_requirements_for_hostname(
+/// Composes requirements using an explicitly supplied execution-host hostname.
+pub fn compose_requirements_for_hostname(
     layers: impl IntoIterator<Item = RequirementsLayerEntry>,
     hostname: Option<&str>,
 ) -> Result<Option<ConfigRequirementsWithSources>, RequirementsCompositionError> {
@@ -213,6 +213,8 @@ fn populate_merged_regular_fields_with_sources(
     let ConfigRequirementsToml {
         allowed_login_methods,
         allowed_chatgpt_workspaces,
+        cli_auth_credentials_store,
+        chatgpt_base_url,
         sqlite_home,
         log_dir,
         model_catalog_json,
@@ -227,10 +229,12 @@ fn populate_merged_regular_fields_with_sources(
         remote_sandbox_config: _,
         allowed_web_search_modes,
         allow_managed_hooks_only,
+        allow_browser_and_computer_use,
         allow_appshots,
         allow_remote_control,
         computer_use,
         browser_use,
+        in_app_browser,
         windows,
         feature_requirements,
         hooks: _,
@@ -241,14 +245,18 @@ fn populate_merged_regular_fields_with_sources(
         rules: _,
         enforce_residency,
         network,
+        application,
         permissions,
         auto_review,
         models,
+        additional_developer_instructions,
         guardian_policy_config,
     } = requirements;
 
     set_sourced!(allowed_login_methods, &["allowed_login_methods"]);
     set_sourced!(allowed_chatgpt_workspaces, &["allowed_chatgpt_workspaces"]);
+    set_sourced!(cli_auth_credentials_store, &["cli_auth_credentials_store"]);
+    set_sourced!(chatgpt_base_url, &["chatgpt_base_url"]);
     set_sourced!(sqlite_home, &["sqlite_home"]);
     set_sourced!(log_dir, &["log_dir"]);
     set_sourced!(model_catalog_json, &["model_catalog_json"]);
@@ -271,11 +279,16 @@ fn populate_merged_regular_fields_with_sources(
     set_sourced!(default_permissions, &["default_permissions"]);
     set_sourced!(allowed_web_search_modes, &["allowed_web_search_modes"]);
     set_sourced!(allow_managed_hooks_only, &["allow_managed_hooks_only"]);
+    set_sourced!(
+        allow_browser_and_computer_use,
+        &["allow_browser_and_computer_use"]
+    );
     set_sourced!(allow_appshots, &["allow_appshots"]);
     set_sourced!(allow_remote_control, &["allow_remote_control"]);
     set_sourced!(auto_review, &["auto_review"]);
     set_sourced!(computer_use, &["computer_use"]);
     set_sourced!(browser_use, &["browser_use"]);
+    set_sourced!(in_app_browser, &["in_app_browser"]);
     set_sourced!(windows, &["windows"]);
     set_sourced!(feature_requirements, &["features", "feature_requirements"]);
     set_sourced!(mcp_servers, &["mcp_servers"]);
@@ -284,8 +297,13 @@ fn populate_merged_regular_fields_with_sources(
     set_sourced!(apps, &["apps"]);
     set_sourced!(enforce_residency, &["enforce_residency"]);
     set_sourced!(network, &["experimental_network"]);
+    set_sourced!(application, &["application"]);
     set_sourced!(permissions, &["permissions"]);
     set_sourced!(models, &["models"]);
+    set_sourced!(
+        additional_developer_instructions,
+        &["additional_developer_instructions"]
+    );
 
     if let Some(guardian_policy_config) =
         guardian_policy_config.filter(|value| !value.trim().is_empty())

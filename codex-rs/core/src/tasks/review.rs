@@ -28,6 +28,7 @@ use crate::session::turn_context::TurnContext;
 use crate::state::TaskKind;
 use codex_features::Feature;
 use codex_protocol::user_input::UserInput;
+use codex_thread_store::PersistContext;
 
 use super::SessionTask;
 use super::SessionTaskResult;
@@ -66,7 +67,9 @@ impl SessionTask for ReviewTask {
         for item in input {
             match item {
                 TurnInput::UserInput { mut content, .. } => user_input.append(&mut content),
-                TurnInput::ResponseItem(_) | TurnInput::InterAgentCommunication(_) => {}
+                TurnInput::ResponseItem(_)
+                | TurnInput::FunctionCallOutput(_)
+                | TurnInput::InterAgentCommunication(_) => {}
             }
         }
 
@@ -120,7 +123,7 @@ async fn start_review_conversation(
     let model = config
         .review_model
         .clone()
-        .unwrap_or_else(|| ctx.model_info.slug.clone());
+        .unwrap_or_else(|| ctx.model_info().slug.clone());
     sub_agent_config.model = Some(model);
     (run_codex_thread_one_shot(
         sub_agent_config,
@@ -269,5 +272,7 @@ pub(crate) async fn exit_review_mode(
     // Review turns can run before any regular user turn, so explicitly
     // materialize rollout persistence. Do this after emitting review output so
     // file creation + git metadata collection cannot delay client-facing items.
-    session.ensure_rollout_materialized().await;
+    session
+        .ensure_rollout_materialized(PersistContext::Standard)
+        .await;
 }

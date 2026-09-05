@@ -1,3 +1,6 @@
+use crate::TurnInputRequest;
+use crate::TurnInputSubmission;
+use crate::TurnStartOptions;
 use crate::agent::AgentStatus;
 use crate::agent::registry::AgentMetadata;
 use crate::agent::registry::AgentRegistry;
@@ -9,38 +12,48 @@ use crate::agent_communication::AgentCommunicationKind;
 use crate::codex_thread::ThreadConfigSnapshot;
 use crate::config::Config;
 use crate::config::RolloutBudgetConfig;
+use crate::context::SubagentNotification;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::rollout_budget::RolloutBudget;
 use crate::session::emit_subagent_session_started;
+use crate::session::multi_agents::ResolvedMultiAgentV2UsageHints;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::session_prefix::format_subagent_context_line;
-use crate::session_prefix::format_subagent_notification_message;
 use crate::thread_manager::ResumeThreadWithHistoryOptions;
 use crate::thread_manager::ThreadIdGenerator;
 use crate::thread_manager::ThreadManagerState;
 use crate::thread_manager::default_thread_id_generator;
 use crate::thread_rollout_truncation::truncate_rollout_to_last_n_fork_turns;
+use crate::turn_timing::now_unix_timestamp_ms;
+use arc_swap::ArcSwapOption;
+use codex_history::InitialHistory;
+use codex_history::ResumedHistory;
+use codex_history::RolloutItem;
 use codex_protocol::AgentPath;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
+use codex_protocol::items::SubAgentActivityItem;
+use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::InitialHistory;
+use codex_protocol::protocol::HasLegacyEvent;
 use codex_protocol::protocol::InterAgentCommunication;
+use codex_protocol::protocol::ItemCompletedEvent;
+use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::ResumedHistory;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnEnvironmentSelection;
+use codex_protocol::turn_input::CyberAccessProgram;
 use codex_protocol::user_input::UserInput;
 use codex_thread_store::LoadThreadHistoryParams;
 use codex_thread_store::ReadThreadParams;
@@ -51,6 +64,7 @@ use std::sync::Arc;
 use std::sync::Weak;
 use tokio::sync::watch;
 use tracing::warn;
+use uuid::Uuid;
 
 pub(crate) use self::execution::AgentExecutionGuard;
 use self::execution::AgentExecutionLimiter;
@@ -59,7 +73,9 @@ use self::residency::V2Residency;
 mod execution;
 mod legacy;
 mod residency;
+mod service_tier;
 mod spawn;
+mod user_authorization;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SpawnAgentForkMode {
@@ -73,7 +89,10 @@ pub(crate) struct SpawnAgentOptions {
     pub(crate) fork_mode: Option<SpawnAgentForkMode>,
     pub(crate) parent_thread_id: Option<ThreadId>,
     pub(crate) parent_turn_id: Option<String>,
+    pub(crate) root_turn_id: Option<String>,
     pub(crate) environments: Option<Vec<TurnEnvironmentSelection>>,
+    pub(crate) multi_agent_v2_usage_hints: Option<ResolvedMultiAgentV2UsageHints>,
+    pub(crate) cyber_access_program: Option<CyberAccessProgram>,
 }
 
 #[derive(Clone, Debug)]
@@ -97,8 +116,7 @@ pub(crate) struct ListedAgent {
 /// which keeps the registry scoped to that root thread rather than the entire `ThreadManager`.
 #[derive(Clone)]
 pub(crate) struct AgentControl {
-    /// ID shared by the whole agent control session. This means every sub-agents from a common
-    /// root share the same session ID.
+    /// session_id is equal to the root thread's ID.
     session_id: SessionId,
     /// Weak handle back to the global thread registry/state.
     /// This is `Weak` to avoid reference cycles and shadow persistence of the form
@@ -111,6 +129,8 @@ pub(crate) struct AgentControl {
     agent_execution_limiter: Arc<AgentExecutionLimiter>,
     /// Session-scoped state shared by the root thread and every cloned sub-agent control handle.
     rollout_budget: Arc<RolloutBudget>,
+    /// The user-selected root routing tier, shared by the entire agent tree.
+    root_service_tier: Arc<ArcSwapOption<String>>,
 }
 
 impl Default for AgentControl {
@@ -138,6 +158,7 @@ impl AgentControl {
             v2_residency: Arc::default(),
             agent_execution_limiter: Arc::default(),
             rollout_budget: Arc::default(),
+            root_service_tier: Arc::new(ArcSwapOption::from(None)),
         };
         if let Some(rollout_budget) = rollout_budget {
             control.rollout_budget.configure(rollout_budget);
@@ -168,28 +189,29 @@ impl AgentControl {
         &self,
         agent_id: ThreadId,
         input: Vec<UserInput>,
-        parent_turn_id: Option<String>,
+        start_options: TurnStartOptions,
     ) -> CodexResult<String> {
         let state = self.upgrade()?;
-        self.ensure_execution_capacity_for_turn_start(agent_id, /*starts_turn*/ true)
-            .await?;
-        self.send_input_after_capacity_check(agent_id, &state, input, parent_turn_id)
+        let thread = state.get_thread(agent_id).await?;
+        let result = match thread
+            .start_or_steer_turn(TurnInputRequest::user_input(input).on_start(start_options))
             .await
-    }
-
-    async fn send_input_after_capacity_check(
-        &self,
-        agent_id: ThreadId,
-        state: &Arc<ThreadManagerState>,
-        input: Vec<UserInput>,
-        parent_turn_id: Option<String>,
-    ) -> CodexResult<String> {
-        self.handle_thread_request_result(
-            agent_id,
-            state,
-            state.send_op(agent_id, input.into(), parent_turn_id).await,
-        )
-        .await
+        {
+            Ok(TurnInputSubmission::Started { turn_id }) => Ok(turn_id),
+            Ok(TurnInputSubmission::Steered { .. }) => {
+                // MAv1 exposes an opaque `submission_id` to the model. The legacy
+                // `Op::UserInput` path returned a fresh ID for every steer, while the
+                // turn-input API returns the active turn ID. Keep the tool-visible ID
+                // unique without adding a submission receipt back to Core.
+                Ok(Uuid::now_v7().to_string())
+            }
+            Ok(TurnInputSubmission::NotSubmitted { reason }) => Err(CodexErr::InvalidRequest(
+                format!("turn input was not submitted: {reason:?}"),
+            )),
+            Err(err) => Err(err),
+        };
+        self.handle_thread_request_result(agent_id, &state, result)
+            .await
     }
 
     pub(crate) async fn send_inter_agent_communication(
@@ -197,19 +219,71 @@ impl AgentControl {
         agent_id: ThreadId,
         communication: InterAgentCommunication,
         agent_communication_context: AgentCommunicationContext,
-        parent_turn_id: Option<String>,
+        start_options: TurnStartOptions,
     ) -> CodexResult<String> {
         let state = self.upgrade()?;
-        self.ensure_execution_capacity_for_turn_start(agent_id, communication.trigger_turn)
-            .await?;
+        if communication.trigger_turn {
+            let thread = state.get_thread(agent_id).await?;
+            self.ensure_execution_capacity_for_turn_start(&thread)
+                .await?;
+        }
         self.send_inter_agent_communication_after_capacity_check(
             agent_id,
             &state,
             communication,
             agent_communication_context,
-            parent_turn_id,
+            start_options,
         )
         .await
+    }
+
+    pub(crate) async fn emit_sub_agent_activity(
+        &self,
+        thread_id: ThreadId,
+        turn_id: String,
+        item: SubAgentActivityItem,
+    ) -> CodexResult<()> {
+        let state = self.upgrade()?;
+        let thread = state.get_thread(thread_id).await?;
+        let started_at_ms = now_unix_timestamp_ms();
+        let item = TurnItem::SubAgentActivity(item);
+        thread
+            .session
+            .send_event_raw(Event {
+                id: turn_id.clone(),
+                msg: EventMsg::ItemStarted(ItemStartedEvent {
+                    thread_id,
+                    turn_id: turn_id.clone(),
+                    item: item.clone(),
+                    started_at_ms,
+                }),
+            })
+            .await;
+        let completed_at_ms = now_unix_timestamp_ms();
+        let completed = ItemCompletedEvent {
+            thread_id,
+            turn_id: turn_id.clone(),
+            item,
+            started_at_ms: Some(started_at_ms),
+            completed_at_ms,
+        };
+        thread
+            .session
+            .send_event_raw(Event {
+                id: turn_id.clone(),
+                msg: EventMsg::ItemCompleted(completed.clone()),
+            })
+            .await;
+        for legacy in completed.as_legacy_events(/*show_raw_agent_reasoning*/ false) {
+            thread
+                .session
+                .send_event_raw(Event {
+                    id: turn_id.clone(),
+                    msg: legacy,
+                })
+                .await;
+        }
+        Ok(())
     }
 
     async fn send_inter_agent_communication_after_capacity_check(
@@ -218,14 +292,14 @@ impl AgentControl {
         state: &Arc<ThreadManagerState>,
         communication: InterAgentCommunication,
         context: AgentCommunicationContext,
-        parent_turn_id: Option<String>,
+        start_options: TurnStartOptions,
     ) -> CodexResult<String> {
         self.submit_inter_agent_communication(
             agent_id,
             state,
             communication,
             context,
-            parent_turn_id,
+            start_options,
         )
         .await
     }
@@ -236,11 +310,18 @@ impl AgentControl {
         state: &Arc<ThreadManagerState>,
         communication: InterAgentCommunication,
         context: AgentCommunicationContext,
-        parent_turn_id: Option<String>,
+        start_options: TurnStartOptions,
     ) -> CodexResult<String> {
         let communication_for_log =
             crate::agent_communication::logging_enabled().then(|| communication.clone());
-        let parent_turn_id = parent_turn_id.filter(|_| communication.trigger_turn);
+        let (parent_turn_id, root_turn_id) = if communication.trigger_turn {
+            (
+                start_options.parent_turn_id.clone(),
+                start_options.root_turn_id.clone(),
+            )
+        } else {
+            (None, None)
+        };
         let result = self
             .handle_thread_request_result(
                 agent_id,
@@ -248,8 +329,12 @@ impl AgentControl {
                 state
                     .send_op(
                         agent_id,
-                        Op::InterAgentCommunication { communication },
+                        Op::InterAgentCommunication {
+                            communication,
+                            start_options,
+                        },
                         parent_turn_id,
+                        root_turn_id,
                     )
                     .await,
             )
@@ -274,7 +359,12 @@ impl AgentControl {
             agent_id,
             &state,
             state
-                .send_op(agent_id, Op::Interrupt, /*parent_turn_id*/ None)
+                .send_op(
+                    agent_id,
+                    Op::Interrupt,
+                    /*parent_turn_id*/ None,
+                    /*root_turn_id*/ None,
+                )
                 .await,
         )
         .await
@@ -555,17 +645,19 @@ impl AgentControl {
                         parent_thread_id,
                         communication,
                         context,
-                        /*parent_turn_id*/ None,
+                        TurnStartOptions::default(),
                     )
                     .await;
                 return;
             }
-            let message = format_subagent_notification_message(child_reference.as_str(), &status);
             let Ok(parent_thread) = state.get_thread(parent_thread_id).await else {
                 return;
             };
             parent_thread
-                .inject_user_message_without_turn(message)
+                .inject_fragment_without_turn(SubagentNotification::new(
+                    child_reference.as_str(),
+                    status,
+                ))
                 .await;
         });
     }

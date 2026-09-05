@@ -1,4 +1,5 @@
 //! Footer and status-row presentation state for the chat composer.
+//! Owners schedule flash expiry redraws; replacing a draft clears its flash.
 
 use std::time::Instant;
 
@@ -9,8 +10,20 @@ use crate::bottom_pane::footer::FooterMode;
 use crate::bottom_pane::footer::GoalStatusIndicator;
 use crate::key_hint::KeyBinding;
 use crate::key_hint::ShortcutHint;
-#[cfg(test)]
 use std::time::Duration;
+
+impl super::ChatComposer {
+    pub(crate) fn footer_flash_delay(&self) -> Option<Duration> {
+        self.footer
+            .flash
+            .as_ref()
+            .and_then(|flash| flash.expires_at.checked_duration_since(Instant::now()))
+    }
+
+    pub(crate) fn show_footer_flash(&mut self, line: Line<'static>, duration: Duration) {
+        self.footer.show_flash(line, duration);
+    }
+}
 
 pub(super) struct FooterState {
     pub(super) quit_shortcut_expires_at: Option<Instant>,
@@ -19,7 +32,6 @@ pub(super) struct FooterState {
     pub(super) use_shift_enter_hint: bool,
     pub(super) mode: FooterMode,
     pub(super) hint_override: Option<Vec<(String, String)>>,
-    pub(super) plan_mode_nudge_visible: bool,
     pub(super) flash: Option<FooterFlash>,
     pub(super) context_window_percent: Option<i64>,
     pub(super) context_window_used_tokens: Option<i64>,
@@ -55,7 +67,6 @@ impl FooterState {
             .is_some_and(|flash| Instant::now() < flash.expires_at)
     }
 
-    #[cfg(test)]
     pub(super) fn show_flash(&mut self, line: Line<'static>, duration: Duration) {
         let expires_at = Instant::now()
             .checked_add(duration)

@@ -6,15 +6,19 @@ use crate::context::ResizedImage;
 use crate::original_image_detail::can_request_original_image_detail;
 use codex_analytics::ImageDetailSetting;
 use codex_analytics::ImagePreparationMetadata;
+use codex_context_fragments::AnnotatedContent;
+use codex_context_fragments::set_annotated_content;
+use codex_context_fragments::to_annotated_content;
 use codex_features::Feature;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::FunctionCallOutputContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_utils_image::ImageProcessingError;
 use codex_utils_image::PromptImageMode;
-use codex_utils_image::PromptImageResizeLimits;
 use codex_utils_image::load_data_url_for_prompt;
 use tracing::warn;
 
@@ -25,15 +29,6 @@ const IMAGE_TOO_LARGE_PLACEHOLDER: &str =
 const UNSUPPORTED_LOW_DETAIL_PLACEHOLDER: &str = "image content omitted because detail 'low' is not supported; use 'high', 'original', or 'auto'";
 const REMOTE_IMAGE_URL_PLACEHOLDER: &str =
     "image content omitted because remote image URLs are not supported";
-
-const HIGH_DETAIL_LIMITS: PromptImageResizeLimits = PromptImageResizeLimits {
-    max_dimension: 2048,
-    max_patches: 2_500,
-};
-const UNIFIED_IMAGE_LIMITS: PromptImageResizeLimits = PromptImageResizeLimits {
-    max_dimension: 6000,
-    max_patches: 10_000,
-};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ImagePreparationMode {
@@ -99,16 +94,40 @@ pub(crate) fn prepare_response_items(
 ) -> Vec<ImagePreparationMetadata> {
     let mut metadata = Vec::new();
     let mut prepared_items = Vec::with_capacity(items.len());
-    for mut item in std::mem::take(items) {
-        let resize_notice = match &mut item {
-            ResponseItem::Message { role, content, .. } => {
-                let resized_images = prepare_message_content(
+    let prepare_tool_output =
+        |output: &mut FunctionCallOutputPayload,
+         item_id: Option<&str>,
+         metadata: &mut Vec<ImagePreparationMetadata>| {
+            output.content_items_mut().and_then(|content| {
+                let resized_images = prepare_tool_output_content(
                     content,
                     ImageOrigin {
-                        message_role: Some(role),
+                        message_role: None,
+                        item_id,
+                    },
+                    resize_notice_mode,
+                    metadata,
+                    mode,
+                );
+                (!resized_images.is_empty()).then(|| {
+                    ImageResizeNotice::new(ImageResizeNoticeSource::ToolOutput, resized_images)
+                })
+            })
+        };
+    for mut item in std::mem::take(items) {
+        let mut annotated_content = to_annotated_content(&mut item);
+        let resize_notice = match &mut item {
+            ResponseItem::Message { role, .. } => {
+                let Some(mut content) = annotated_content.take() else {
+                    continue;
+                };
+                let resized_images = prepare_message_content(
+                    &mut content,
+                    ImageOrigin {
+                        message_role: Some(role.as_str()),
                         item_id: None,
                     },
-                    if role == "user" {
+                    if role.as_str() == "user" {
                         resize_notice_mode
                     } else {
                         ImageResizeNoticeMode::Disabled
@@ -116,30 +135,17 @@ pub(crate) fn prepare_response_items(
                     &mut metadata,
                     mode,
                 );
+                let _ = set_annotated_content(&mut item, content);
                 (!resized_images.is_empty()).then(|| {
                     ImageResizeNotice::new(ImageResizeNoticeSource::UserMessage, resized_images)
                 })
             }
             ResponseItem::FunctionCallOutput {
                 call_id, output, ..
-            }
-            | ResponseItem::CustomToolCallOutput {
+            } => prepare_tool_output(output, call_id.as_deref(), &mut metadata),
+            ResponseItem::CustomToolCallOutput {
                 call_id, output, ..
-            } => output.content_items_mut().and_then(|content| {
-                let resized_images = prepare_tool_output_content(
-                    content,
-                    ImageOrigin {
-                        message_role: None,
-                        item_id: Some(call_id),
-                    },
-                    resize_notice_mode,
-                    &mut metadata,
-                    mode,
-                );
-                (!resized_images.is_empty()).then(|| {
-                    ImageResizeNotice::new(ImageResizeNoticeSource::ToolOutput, resized_images)
-                })
-            }),
+            } => prepare_tool_output(output, Some(call_id.as_str()), &mut metadata),
             ResponseItem::AdditionalTools { .. }
             | ResponseItem::Reasoning { .. }
             | ResponseItem::AgentMessage { .. }
@@ -151,6 +157,7 @@ pub(crate) fn prepare_response_items(
             | ResponseItem::WebSearchCall { .. }
             | ResponseItem::ImageGenerationCall { .. }
             | ResponseItem::Compaction { .. }
+            | ResponseItem::ConfigurationUpdate { .. }
             | ResponseItem::CompactionTrigger { .. }
             | ResponseItem::ContextCompaction { .. }
             | ResponseItem::Other => None,
@@ -165,7 +172,7 @@ pub(crate) fn prepare_response_items(
 }
 
 fn prepare_message_content(
-    items: &mut [ContentItem],
+    items: &mut [AnnotatedContent],
     origin: ImageOrigin<'_>,
     resize_notice_mode: ImageResizeNoticeMode,
     metadata: &mut Vec<ImagePreparationMetadata>,
@@ -173,12 +180,12 @@ fn prepare_message_content(
 ) -> Vec<ResizedImage> {
     let image_count = items
         .iter()
-        .filter(|item| matches!(item, ContentItem::InputImage { .. }))
+        .filter(|item| matches!(item.content(), ContentItem::InputImage { .. }))
         .count();
     let mut image_number = 0;
     let mut resized_images = Vec::new();
     for item in items {
-        if let ContentItem::InputImage { image_url, detail } = item {
+        if let ContentItem::InputImage { image_url, detail } = item.content_mut() {
             image_number += 1;
             match prepare_image(image_url, detail, origin, metadata, mode) {
                 Ok(Some(resize)) if resize_notice_mode == ImageResizeNoticeMode::Enabled => {
@@ -194,9 +201,10 @@ fn prepare_message_content(
                 Ok(_) => {}
                 Err(error) => {
                     warn!(%error, "failed to prepare message image");
-                    *item = ContentItem::InputText {
-                        text: error.placeholder().to_string(),
-                    };
+                    *item = AnnotatedContent::input_text(
+                        error.placeholder(),
+                        ContentItemKind("images.preparation_error".to_string()),
+                    );
                 }
             }
         }
@@ -270,17 +278,23 @@ fn prepare_image(
         return Ok(None);
     }
 
-    let (effective_detail, limits) = match mode {
-        ImagePreparationMode::UnifiedBudget => (ImageDetailSetting::Original, UNIFIED_IMAGE_LIMITS),
+    let (effective_detail, image_mode) = match mode {
+        ImagePreparationMode::UnifiedBudget => (
+            ImageDetailSetting::Original,
+            PromptImageMode::ORIGINAL_DETAIL,
+        ),
         ImagePreparationMode::DetailBased => match detail {
             None | Some(ImageDetail::Auto | ImageDetail::High) => {
-                (ImageDetailSetting::High, HIGH_DETAIL_LIMITS)
+                (ImageDetailSetting::High, PromptImageMode::HIGH_DETAIL)
             }
-            Some(ImageDetail::Original) => (ImageDetailSetting::Original, UNIFIED_IMAGE_LIMITS),
+            Some(ImageDetail::Original) => (
+                ImageDetailSetting::Original,
+                PromptImageMode::ORIGINAL_DETAIL,
+            ),
             Some(ImageDetail::Low) => return Err(ImagePreparationError::UnsupportedLowDetail),
         },
     };
-    let image = load_data_url_for_prompt(image_url, PromptImageMode::ResizeWithLimits(limits))?;
+    let image = load_data_url_for_prompt(image_url, image_mode)?;
     metadata.push(ImagePreparationMetadata {
         message_role: origin.message_role.map(str::to_string),
         item_id: origin.item_id.map(str::to_string),

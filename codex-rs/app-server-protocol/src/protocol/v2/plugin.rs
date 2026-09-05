@@ -1,7 +1,5 @@
 use super::AppSummary;
 use super::HookEventName;
-use super::HookExecutionMode;
-use super::HookHandlerType;
 use super::HookSource;
 use super::HookTrustStatus;
 use crate::JsonSchema;
@@ -192,6 +190,50 @@ pub struct PluginInstalledResponse {
     pub marketplaces: Vec<PluginMarketplaceEntry>,
     #[serde(default)]
     pub marketplace_load_errors: Vec<MarketplaceLoadErrorInfo>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct PluginReconcileParams {
+    /// Optional client-provided reason recorded with the reconciliation attempt.
+    #[ts(optional = nullable)]
+    pub reason: Option<String>,
+}
+
+/// Bundle and installed-state changes observed by this pass, not a runtime-readiness
+/// acknowledgement or a cumulative diff since the client's last request. Other metadata-only
+/// changes are not listed.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct PluginReconcileResponse {
+    /// Plugins affected by bundle changes, enablement changes, or removals.
+    /// Installed-state changes compare against the previous cached snapshot, including
+    /// cached reinstalls. Removal hints survive cache cleanup failures; unchanged plugins are omitted.
+    pub changed_plugins: Vec<PluginReconcileChangedPlugin>,
+    /// Backend remote plugin IDs whose bundle or identity update failed.
+    pub failed_remote_plugin_ids: Vec<String>,
+    /// Subset of failures for which the requested bundle could not be materialized.
+    /// A previously cached version may still be available.
+    pub failed_materialization_remote_plugin_ids: Vec<String>,
+}
+
+/// Runtime categories affected by this change, not just capabilities currently present.
+/// Flags describe declarations before runtime policy filtering. Updates OR the old and new
+/// bundle flags; enablement changes and cached reinstalls use the cached bundle; removals retain
+/// the old bundle's flags.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct PluginReconcileChangedPlugin {
+    /// Local plugin ID (`name@marketplace`), matching `PluginSummary.id`.
+    pub id: String,
+    pub has_mcps: bool,
+    pub has_apps: bool,
+    pub has_hooks: bool,
+    /// Whether either bundle declares skill roots; not a validated inventory of enabled skills.
+    pub has_skills: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -438,6 +480,8 @@ pub struct SkillMetadata {
     pub path: AbsolutePathBuf,
     pub scope: SkillScope,
     pub enabled: bool,
+    /// Owning plugin ID, matching `PluginSummary.id`, when known.
+    pub plugin_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -518,17 +562,32 @@ pub struct HooksListEntry {
     pub errors: Vec<HookErrorInfo>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(tag = "handlerType", rename_all = "camelCase")]
+#[ts(tag = "handlerType", export_to = "v2/")]
+pub enum HookHandlerMetadata {
+    Command {
+        command: String,
+        #[serde(default)]
+        r#async: bool,
+    },
+    McpTool {
+        server: String,
+        tool: String,
+    },
+    Prompt {},
+    Agent {},
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct HookMetadata {
     pub key: String,
     pub event_name: HookEventName,
-    pub handler_type: HookHandlerType,
-    #[serde(default)]
-    pub execution_mode: HookExecutionMode,
+    #[serde(flatten)]
+    pub handler: HookHandlerMetadata,
     pub matcher: Option<String>,
-    pub command: Option<String>,
     pub timeout_sec: u64,
     pub status_message: Option<String>,
     /// Configured `additionalContext` spill threshold.
@@ -893,6 +952,9 @@ pub struct PluginInstallParams {
     pub marketplace_path: Option<AbsolutePathBuf>,
     #[ts(optional = nullable)]
     pub remote_marketplace_name: Option<String>,
+    /// Client-generated identifier used to correlate one installation attempt.
+    #[ts(optional = nullable)]
+    pub install_attempt_id: Option<String>,
     pub plugin_name: String,
 }
 
@@ -927,6 +989,7 @@ impl From<CoreSkillMetadata> for SkillMetadata {
             path: value.path,
             scope: value.scope.into(),
             enabled: true,
+            plugin_id: None,
         }
     }
 }

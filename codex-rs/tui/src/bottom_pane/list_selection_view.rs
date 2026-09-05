@@ -143,6 +143,8 @@ pub(crate) struct SelectionItem {
     pub is_disabled: bool,
     pub actions: Vec<SelectionAction>,
     pub dismiss_on_select: bool,
+    /// Require an explicit accept key after a direct shortcut highlights this sensitive item.
+    pub require_explicit_confirmation: bool,
     pub dismiss_parent_on_child_accept: bool,
     pub search_value: Option<String>,
     pub disabled_reason: Option<String>,
@@ -181,6 +183,8 @@ pub(crate) struct SelectionViewParams {
     /// Rendered left-column width to use for auto-sized rows.
     pub name_column_width: Option<usize>,
     pub header: Box<dyn Renderable>,
+    /// Blank rows after the header; defaults to one. Inline banners use zero.
+    pub header_gap: u16,
     pub initial_selected_idx: Option<usize>,
 
     /// Rich content rendered beside (wide terminals) or below (narrow terminals)
@@ -232,6 +236,7 @@ impl Default for SelectionViewParams {
             description_layout: SelectionDescriptionLayout::Columns,
             name_column_width: None,
             header: Box::new(()),
+            header_gap: 1,
             initial_selected_idx: None,
             side_content: Box::new(()),
             side_content_width: SideContentWidth::default(),
@@ -260,7 +265,7 @@ pub(crate) struct ListSelectionView {
     active_tab_idx: Option<usize>,
     state: ScrollState,
     completion: Option<ViewCompletion>,
-    dismiss_after_child_accept: bool,
+    pub(super) dismiss_after_child_accept: bool,
     app_event_tx: AppEventSender,
     is_searchable: bool,
     search_query: String,
@@ -271,7 +276,9 @@ pub(crate) struct ListSelectionView {
     name_column_width: Option<usize>,
     filtered_indices: Vec<usize>,
     last_selected_actual_idx: Option<usize>,
+    rendered_item_count: std::cell::Cell<usize>,
     header: Box<dyn Renderable>,
+    header_gap: u16,
     initial_selected_idx: Option<usize>,
     side_content: Box<dyn Renderable>,
     side_content_width: SideContentWidth,
@@ -406,7 +413,9 @@ impl ListSelectionView {
             name_column_width: params.name_column_width,
             filtered_indices: Vec::new(),
             last_selected_actual_idx: None,
+            rendered_item_count: std::cell::Cell::new(0),
             header,
+            header_gap: params.header_gap,
             initial_selected_idx: params.initial_selected_idx,
             side_content: params.side_content,
             side_content_width: params.side_content_width,
@@ -807,6 +816,22 @@ impl ListSelectionView {
         }
     }
 
+    fn select_shortcut(&mut self, actual_idx: usize) {
+        let previously_selected = self.selected_actual_idx();
+        self.state.selected_idx = Some(actual_idx);
+        if self
+            .active_items()
+            .get(actual_idx)
+            .is_some_and(|item| item.require_explicit_confirmation)
+        {
+            if self.selected_actual_idx() != previously_selected {
+                self.fire_selection_changed();
+            }
+        } else {
+            self.accept();
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn set_search_query(&mut self, query: String) {
         self.search_query = query;
@@ -1047,8 +1072,7 @@ impl BottomPaneView for ListSelectionView {
                         .is_some_and(|shortcut| shortcut.is_press(key_event))
                         && Self::item_is_enabled(item)
                 }) {
-                    self.state.selected_idx = Some(idx);
-                    self.accept();
+                    self.select_shortcut(idx);
                     return;
                 }
                 if let Some(idx) = c
@@ -1056,8 +1080,7 @@ impl BottomPaneView for ListSelectionView {
                     .map(|d| d as usize)
                     .and_then(|number| self.actual_idx_for_enabled_number(number))
                 {
-                    self.state.selected_idx = Some(idx);
-                    self.accept();
+                    self.select_shortcut(idx);
                 }
             }
             _ => {}
@@ -1152,7 +1175,7 @@ impl Renderable for ListSelectionView {
         let tab_height = tab_bar_height(&self.tabs, self.active_tab_idx.unwrap_or(0), inner_width);
         let mut height = header.desired_height(inner_width);
         height = height.saturating_add(tab_height + u16::from(tab_height > 0));
-        height = height.saturating_add(rows_height + 3);
+        height = height.saturating_add(rows_height + 2 + self.header_gap);
         if self.is_searchable {
             height = height.saturating_add(1);
         }
@@ -1181,6 +1204,7 @@ impl Renderable for ListSelectionView {
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.rendered_item_count.set(0);
         if area.height == 0 || area.width == 0 {
             return;
         }
@@ -1246,7 +1270,7 @@ impl Renderable for ListSelectionView {
             stacked_side_area,
         ] = Layout::vertical([
             Constraint::Max(header_height),
-            Constraint::Max(1),
+            Constraint::Max(self.header_gap),
             Constraint::Length(tab_height),
             Constraint::Length(u16::from(tab_height > 0)),
             Constraint::Length(if self.is_searchable { 1 } else { 0 }),
@@ -1300,7 +1324,7 @@ impl Renderable for ListSelectionView {
                 width: effective_rows_width.max(1),
                 height: list_area.height,
             };
-            match self.row_display {
+            let rendered_rows = match self.row_display {
                 SelectionRowDisplay::Wrapped => render_rows_with_col_width_mode(
                     render_area,
                     buf,
@@ -1320,6 +1344,7 @@ impl Renderable for ListSelectionView {
                     column_width,
                 ),
             };
+            self.rendered_item_count.set(rendered_rows.items);
         }
 
         // -- Side content (preview panel) --
@@ -1413,6 +1438,12 @@ impl Renderable for ListSelectionView {
                 hint.clone().dim().render(hint_area, buf);
             }
         }
+    }
+}
+
+impl ListSelectionView {
+    pub(crate) fn rendered_item_count(&self) -> usize {
+        self.rendered_item_count.get()
     }
 }
 

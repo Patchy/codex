@@ -15,14 +15,13 @@ sys.path.insert(0, str(SIGNING_DIRECTORY))
 import notarize_with_akv as notary  # noqa: E402
 
 CONFIGURATION = notary.NotarizationConfiguration(
-    "issuer-id",
+    "01234567-89ab-cdef-0123-456789abcdef",
     "APPLEKEY01",
     "notary-vault",
     "example-signing-key",
     "0123456789abcdef" * 2,
 )
 ENVIRONMENT = {
-    "APPLE_NOTARIZATION_ISSUER_ID": CONFIGURATION.issuer_id,
     "AZURE_KEYVAULT_NAME": CONFIGURATION.vault_name,
     "APPLE_NOTARIZATION_AKV_KEY_NAME": CONFIGURATION.vault_key_name,
 }
@@ -36,7 +35,9 @@ CREDENTIALS = {
 
 
 def response(payload):
-    return io.BytesIO(json.dumps(payload).encode() if isinstance(payload, dict) else payload)
+    return io.BytesIO(
+        json.dumps(payload).encode() if isinstance(payload, dict) else payload
+    )
 
 
 def azure_response(payload):
@@ -44,8 +45,12 @@ def azure_response(payload):
 
 
 class NotarizationTest(unittest.TestCase):
-    def test_validates_the_apple_key_tag_and_pins_its_version(self) -> None:
-        metadata = {"id": CONFIGURATION.versioned_key_id, "apple_key_id": "APPLEKEY01"}
+    def test_validates_the_apple_key_tags_and_pins_its_version(self) -> None:
+        metadata = {
+            "id": CONFIGURATION.versioned_key_id,
+            "apple_key_id": "APPLEKEY01",
+            "apple_issuer_id": CONFIGURATION.issuer_id,
+        }
         with (
             patch.dict(os.environ, ENVIRONMENT, clear=True),
             patch.object(
@@ -61,9 +66,30 @@ class NotarizationTest(unittest.TestCase):
             show.return_value = azure_response({**metadata, "apple_key_id": None})
             with self.assertRaisesRegex(notary.NotarizationError, "apple-key-id tag"):
                 notary.NotarizationConfiguration.from_environment()
-        self.assertIn('{id:key.kid,apple_key_id:tags."apple-key-id"}', show.call_args.args[0])
+            for issuer_id in (None, "", "   "):
+                with self.subTest(issuer_id=issuer_id):
+                    show.return_value = azure_response(
+                        {**metadata, "apple_issuer_id": issuer_id}
+                    )
+                    with self.assertRaisesRegex(
+                        notary.NotarizationError, "apple-issuer-id tag"
+                    ):
+                        notary.NotarizationConfiguration.from_environment()
+            show.return_value = azure_response(
+                {**metadata, "apple_issuer_id": "invalid-issuer"}
+            )
+            with self.assertRaisesRegex(notary.NotarizationError, "valid UUID"):
+                notary.NotarizationConfiguration.from_environment()
+        self.assertIn(
+            '{id:key.kid,apple_key_id:tags."apple-key-id",'
+            'apple_issuer_id:tags."apple-issuer-id"}',
+            show.call_args.args[0],
+        )
 
-        invalid_environment = {**ENVIRONMENT, "APPLE_NOTARIZATION_AKV_KEY_NAME": "../bad"}
+        invalid_environment = {
+            **ENVIRONMENT,
+            "APPLE_NOTARIZATION_AKV_KEY_NAME": "../bad",
+        }
         with (
             patch.dict(os.environ, invalid_environment, clear=True),
             self.assertRaisesRegex(notary.NotarizationError, "key name"),
@@ -76,10 +102,17 @@ class NotarizationTest(unittest.TestCase):
             "kid": CONFIGURATION.versioned_key_id,
             "value": notary.base64url_encode(signature),
         }
-        with patch.object(notary.subprocess, "run", return_value=azure_response(payload)) as sign:
+        with patch.object(
+            notary.subprocess, "run", return_value=azure_response(payload)
+        ) as sign:
             token = notary.create_apple_jwt(CONFIGURATION, issued_at=1_780_000_000)
         header, claims, encoded_signature = token.split(".")
-        self.assertEqual(json.loads(notary.base64url_decode(header))["kid"], "APPLEKEY01")
+        self.assertEqual(
+            json.loads(notary.base64url_decode(header))["kid"], "APPLEKEY01"
+        )
+        self.assertEqual(
+            json.loads(notary.base64url_decode(claims))["iss"], CONFIGURATION.issuer_id
+        )
         self.assertEqual(
             json.loads(notary.base64url_decode(claims))["scope"],
             ["/notary/v2"],
@@ -95,7 +128,11 @@ class NotarizationTest(unittest.TestCase):
 
     def test_rejects_wrong_key_versions_and_invalid_signatures(self) -> None:
         cases = (
-            (CONFIGURATION.versioned_key_id + "wrong", bytes(64), "unexpected key version"),
+            (
+                CONFIGURATION.versioned_key_id + "wrong",
+                bytes(64),
+                "unexpected key version",
+            ),
             (CONFIGURATION.versioned_key_id, b"short", "64 JOSE"),
         )
         for key_id, signature, message in cases:
@@ -123,7 +160,15 @@ class NotarizationTest(unittest.TestCase):
             response(b""),
             response({"data": {"attributes": {"status": "In Progress"}}}),
             response({"data": {"attributes": {"status": "Accepted"}}}),
-            response({"data": {"attributes": {"developerLogUrl": "https://logs.example.com/log"}}}),
+            response(
+                {
+                    "data": {
+                        "attributes": {
+                            "developerLogUrl": "https://logs.example.com/log"
+                        }
+                    }
+                }
+            ),
             response(b'{"status":"Accepted"}'),
         ]
         with tempfile.TemporaryDirectory() as directory:
@@ -135,7 +180,9 @@ class NotarizationTest(unittest.TestCase):
             output = io.StringIO()
             with (
                 patch.object(notary.subprocess, "run", return_value=signature),
-                patch.object(notary.urllib.request, "urlopen", side_effect=responses) as requests,
+                patch.object(
+                    notary.urllib.request, "urlopen", side_effect=responses
+                ) as requests,
                 patch.object(notary.time, "sleep") as sleep,
                 contextlib.redirect_stdout(output),
             ):
@@ -167,9 +214,15 @@ class NotarizationWrapperTest(unittest.TestCase):
                 "CALL_LOG": str(call_log),
             }
             for name in ("az", "python3", "rcodesign"):
-                body = "exit 0" if name == "az" else f'printf "{name} %s\\n" "$*" >> "$CALL_LOG"'
+                body = (
+                    "exit 0"
+                    if name == "az"
+                    else f'printf "{name} %s\\n" "$*" >> "$CALL_LOG"'
+                )
                 executable = tools / name
-                executable.write_text(f"#!/usr/bin/env bash\nset -euo pipefail\n{body}\n")
+                executable.write_text(
+                    f"#!/usr/bin/env bash\nset -euo pipefail\n{body}\n"
+                )
                 executable.chmod(0o755)
             for kind in ("binary", "dmg"):
                 with self.subTest(kind=kind):
@@ -177,7 +230,9 @@ class NotarizationWrapperTest(unittest.TestCase):
                     artifact.write_bytes(b"signed release artifact")
                     subprocess.run(
                         [
-                            str(SIGNING_DIRECTORY / f"notarize_macos_{kind}_with_akv.sh"),
+                            str(
+                                SIGNING_DIRECTORY / f"notarize_macos_{kind}_with_akv.sh"
+                            ),
                             f"--{kind}",
                             str(artifact),
                             "--report-dir",

@@ -81,6 +81,7 @@ impl App {
     pub(super) fn reset_history_emission_state(&mut self) {
         self.has_emitted_history_lines = false;
         self.deferred_history_lines.clear();
+        self.last_rendered_history_tail = None;
     }
 
     fn display_lines_for_history_insert(
@@ -179,6 +180,11 @@ impl App {
             retained_lines,
             self.history_line_wrap_policy(),
         );
+        if self.pending_thread_usage_history_refresh
+            && let Err(err) = self.refresh_thread_usage_history_tail(tui)
+        {
+            tracing::warn!(error = %err, "failed to refresh thread usage after initial replay");
+        }
         self.request_scrollback_history_top_up(retained_rows);
     }
 
@@ -202,8 +208,9 @@ impl App {
             return;
         }
 
-        let max_rows =
-            crate::resize_reflow_cap::resize_reflow_max_rows(self.config.terminal_resize_reflow);
+        let max_rows = crate::resize_reflow_cap::resize_reflow_max_rows(
+            self.local_settings.terminal_resize_reflow(),
+        );
         if let Some(buffer) = &mut self.initial_history_replay_buffer {
             if let Some(max_rows) = max_rows {
                 Self::buffer_initial_history_replay_display_lines(buffer, display, max_rows);
@@ -248,7 +255,9 @@ impl App {
     }
 
     fn resize_reflow_max_rows(&self) -> Option<usize> {
-        crate::resize_reflow_cap::resize_reflow_max_rows(self.config.terminal_resize_reflow)
+        crate::resize_reflow_cap::resize_reflow_max_rows(
+            self.local_settings.terminal_resize_reflow(),
+        )
     }
 
     pub(super) fn update_visible_history_rows(&mut self, screen_size: Size) {
@@ -479,6 +488,25 @@ impl App {
                 reflowed_lines,
                 self.history_line_wrap_policy(),
             );
+        }
+        self.last_rendered_history_tail =
+            self.transcript_cells
+                .last()
+                .map(|cell| super::history_ui::RenderedHistoryTail {
+                    cell: Arc::downgrade(cell),
+                    lines: cell.display_hyperlink_lines_for_mode(
+                        width,
+                        self.chat_widget.history_render_mode(),
+                    ),
+                });
+        if let Some(status_history) = self.last_thread_usage_status_cell.as_mut()
+            && let Some(cell) = status_history.cell.upgrade()
+        {
+            status_history.lines = cell
+                .display_hyperlink_lines_for_mode(width, self.chat_widget.history_render_mode());
+        }
+        if self.pending_thread_usage_history_refresh {
+            self.refresh_thread_usage_history_tail(tui)?;
         }
         self.request_scrollback_history_top_up(reflowed_rows);
 

@@ -74,7 +74,7 @@ impl ChatWidget {
         self.transcript.active_cell = Some(Box::new(history_cell::new_active_web_search_call(
             call_id,
             String::new(),
-            self.config.animations,
+            self.local_settings.tui.animations,
         )));
         self.bump_active_cell_revision();
         self.request_redraw();
@@ -192,7 +192,10 @@ impl ChatWidget {
                     self.refresh_subagent_panel();
                 }
             }
-            CollabAgentTool::SendInput | CollabAgentTool::ResumeAgent => {
+            CollabAgentTool::SendInput
+            | CollabAgentTool::ResumeAgent
+            | CollabAgentTool::SendMessage
+            | CollabAgentTool::FollowupTask => {
                 if let Some(receiver_thread_id) = first_receiver {
                     let status = agents_states
                         .get(&receiver_thread_id.to_string())
@@ -224,6 +227,14 @@ impl ChatWidget {
                     self.refresh_subagent_panel();
                 }
             }
+            CollabAgentTool::InterruptAgent => {
+                if let Some(receiver_thread_id) = first_receiver {
+                    self.subagent_panel_registry
+                        .update_status(receiver_thread_id, PanelAgentStatus::Interrupted);
+                    self.refresh_subagent_panel();
+                }
+            }
+            CollabAgentTool::ListAgents => {}
         }
     }
 
@@ -267,6 +278,12 @@ impl ChatWidget {
                         crate::subagent_panel::PanelAgentStatus::Interrupted,
                     );
                 }
+                SubAgentActivityKind::Completed => {
+                    self.subagent_panel_registry.update_status(
+                        thread_id,
+                        crate::subagent_panel::PanelAgentStatus::Completed(None),
+                    );
+                }
             }
             self.refresh_subagent_panel();
         }
@@ -305,7 +322,7 @@ impl ChatWidget {
                 tool,
                 arguments: Some(arguments),
             },
-            self.config.animations,
+            self.local_settings.tui.animations,
         )));
         self.bump_active_cell_revision();
         self.request_redraw();
@@ -318,6 +335,7 @@ impl ChatWidget {
             id,
             server,
             tool,
+            status,
             arguments,
             result,
             error,
@@ -340,7 +358,7 @@ impl ChatWidget {
                 Ok(codex_protocol::mcp::CallToolResult {
                     content: result.content,
                     structured_content: result.structured_content,
-                    is_error: Some(false),
+                    is_error: Some(status == codex_app_server_protocol::McpToolCallStatus::Failed),
                     meta: None,
                 })
             }
@@ -356,8 +374,11 @@ impl ChatWidget {
             Some(cell) if cell.call_id() == id => cell.complete(duration, result),
             _ => {
                 self.flush_active_cell();
-                let mut cell =
-                    history_cell::new_active_mcp_tool_call(id, invocation, self.config.animations);
+                let mut cell = history_cell::new_active_mcp_tool_call(
+                    id,
+                    invocation,
+                    self.local_settings.tui.animations,
+                );
                 let extra_cell = cell.complete(duration, result);
                 self.transcript.active_cell = Some(Box::new(cell));
                 extra_cell

@@ -20,7 +20,7 @@ use codex_app_server_protocol::TurnStatus;
 use codex_core::CodexThread;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::RolloutItem;
+use codex_rollout::RolloutItem;
 
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingMessageSender;
@@ -177,6 +177,8 @@ mod tests {
                 message: "first answer".to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
+                questions: None,
             })),
             RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
                 info: None,

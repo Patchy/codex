@@ -4,6 +4,12 @@ use crate::app::session_lifecycle::ThreadAttachPresentation;
 use crate::chatwidget::UserMessage;
 use codex_app_server_client::AppServerEvent;
 use codex_app_server_protocol::ModelSafetyBufferingUpdatedNotification;
+use codex_protocol::models::ManagedFileSystemPermissions;
+use codex_protocol::permissions::FileSystemAccessMode;
+use codex_protocol::permissions::FileSystemPath;
+use codex_protocol::permissions::FileSystemSandboxEntry;
+use codex_protocol::permissions::FileSystemSpecialPath;
+use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_utils_absolute_path::test_support::PathExt;
 use core_test_support::responses;
 use core_test_support::responses::ev_assistant_message;
@@ -25,12 +31,14 @@ const RETRY_PROMPT: &str = "Handle the safety-buffered request";
 const COMMITTED_STEER: &str = "Keep the accepted steer";
 const UNSENT_DRAFT: &str = "Keep this unsent draft";
 const RETRY_GOAL: &str = "Preserve this goal across the retry";
+const SAFETY_RETRY_THREAD_NAME: &str = "Safety retry source";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SafetyRetryScenario {
     Once,
     RetryTwice,
     InterruptedPrevious,
+    UnsupportedPermissions,
 }
 
 fn response_chunks(response_id: &str) -> Vec<StreamingSseChunk> {
@@ -155,9 +163,26 @@ async fn wait_for_turn_completed(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn active_turn_interrupt_is_nonblocking_and_coalesces_repeated_requests() -> Result<()> {
+    Box::pin(interrupt_after_inactive_steer(SteerSwitch::WithinTask)).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agents_overview_acknowledges_inactive_steer_before_interrupt() -> Result<()> {
+    Box::pin(interrupt_after_inactive_steer(SteerSwitch::BetweenTasks)).await
+}
+
+enum SteerSwitch {
+    WithinTask,
+    BetweenTasks,
+}
+
+async fn interrupt_after_inactive_steer(switch: SteerSwitch) -> Result<()> {
+    let via_overview = matches!(switch, SteerSwitch::BetweenTasks);
     let (chunks, release_response) =
         gated_response_chunks("interrupt-response", ev_completed("interrupt-response"));
-    let (server, _completions) = start_streaming_sse_server(vec![chunks]).await;
+    let (steered_chunks, release_steered_response) =
+        gated_response_chunks("steered-response", ev_completed("steered-response"));
+    let (server, _completions) = start_streaming_sse_server(vec![chunks, steered_chunks]).await;
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
     let codex_home = tempdir()?;
     std::fs::write(
@@ -202,18 +227,117 @@ stream_max_retries = 0
     .await?;
     while app_event_rx.try_recv().is_ok() {}
 
-    submit_prompt(&mut app, "Keep this turn running until interrupted");
+    submit_prompt(&mut app, COMMITTED_STEER);
     let turn = next_user_turn_event(&mut app_event_rx);
     app.submit_thread_op(&mut app_server, thread_id, turn)
         .await?;
     let turn_id = next_turn_started(&mut app, &mut app_server, thread_id).await;
-    drive_until_request_count(
-        &mut app,
-        &mut app_server,
-        &server,
-        /*expected_request_count*/ 1,
+    // Leave the original message's completion queued until after submitting the identical steer.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(/*secs*/ 5),
+        server.wait_for_request_count(/*count*/ 1),
     )
-    .await;
+    .await?;
+
+    let acknowledged_input = app.chat_widget.capture_thread_input_state();
+    submit_prompt(&mut app, COMMITTED_STEER);
+    let steer = next_user_turn_event(&mut app_event_rx);
+    let AppCommand::UserTurn {
+        client_user_message_id,
+        ..
+    } = &steer
+    else {
+        unreachable!("user turn");
+    };
+    let expected_client_id = client_user_message_id.clone();
+    let pending_input = app.chat_widget.capture_thread_input_state();
+    app.submit_thread_op(&mut app_server, thread_id, steer)
+        .await?;
+    let other_id = ThreadId::from_string(
+        &app_test_support::create_fake_rollout(
+            app.config.codex_home.as_path(),
+            "2025-01-05T12-00-00",
+            "2025-01-05T12:00:00Z",
+            "Other task",
+            Some(MODEL_PROVIDER_ID),
+            /*git_info*/ None,
+        )
+        .expect("materialize other task"),
+    )?;
+    let other = app_server
+        .resume_thread(
+            &app.local_settings,
+            app.config.clone(),
+            other_id,
+            crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+        )
+        .await?;
+    app.thread_event_channels.insert(
+        other_id,
+        ThreadEventChannel::new_with_session(
+            THREAD_EVENT_CHANNEL_CAPACITY,
+            other.session,
+            other.turns,
+        ),
+    );
+    // Receive the real commit while another thread is visible, with no replay capacity.
+    if via_overview {
+        Box::pin(app.select_agents_overview_thread(&mut tui, &mut app_server, other_id)).await?;
+    } else {
+        Box::pin(app.select_agent_thread(&mut tui, &mut app_server, other_id)).await?;
+        app.thread_event_channels[&thread_id]
+            .store
+            .lock()
+            .await
+            .capacity = 0;
+    }
+    assert_eq!(app.current_displayed_thread_id(), Some(other_id));
+    let mut release_response = Some(release_response);
+    loop {
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(/*secs*/ 5),
+            app_server.next_event(),
+        )
+        .await?
+        .expect("app-server remains open");
+        let committed_id = if let AppServerEvent::ServerNotification(notification) = &event
+            && let ServerNotification::ItemCompleted(item) = notification.as_ref()
+            && let ThreadItem::UserMessage {
+                content, client_id, ..
+            } = &item.item
+            && ChatWidget::user_message_display_from_inputs(content).message == COMMITTED_STEER
+        {
+            Some(client_id.clone().expect("receipt echoes the submission ID"))
+        } else {
+            None
+        };
+        app.handle_app_server_event(&app_server, event).await;
+        if let Some(client_id) = committed_id {
+            let saved_input = if via_overview {
+                assert!(!app.thread_event_channels.contains_key(&thread_id));
+                app.agents_overview.input_states.get(&thread_id).cloned()
+            } else {
+                let store = app.thread_event_channels[&thread_id].store.lock().await;
+                assert!(store.buffer.is_empty());
+                store.input_state.clone()
+            };
+            if let Some(release_response) = release_response.take() {
+                assert_ne!(client_id, expected_client_id);
+                assert_eq!(saved_input, pending_input);
+                let _ = release_response.send(());
+            } else {
+                assert_eq!(client_id, expected_client_id);
+                assert_eq!(saved_input, acknowledged_input);
+                break;
+            }
+        }
+    }
+    if via_overview {
+        Box::pin(app.select_agents_overview_thread(&mut tui, &mut app_server, thread_id)).await?;
+    } else {
+        Box::pin(app.select_agent_thread(&mut tui, &mut app_server, thread_id)).await?;
+    }
+    assert_eq!(app.active_thread_id, Some(thread_id));
 
     let interrupt = AppCommand::interrupt();
     assert!(
@@ -262,7 +386,16 @@ stream_max_retries = 0
         None
     );
 
-    let _ = release_response.send(());
+    insta::assert_snapshot!(app.chat_widget.composer_text_with_pending(), @"");
+    assert!(
+        std::iter::from_fn(|| app_event_rx.try_recv().ok())
+            .all(|event| !matches!(event, AppEvent::CodexOp(AppCommand::UserTurn { .. })))
+    );
+    let source = app_server
+        .thread_read(thread_id, /*include_turns*/ true)
+        .await?;
+    assert_eq!(user_message_count(&source, COMMITTED_STEER), 2);
+    let _ = release_steered_response.send(());
     app_server.shutdown().await?;
     server.shutdown().await;
     Ok(())
@@ -413,8 +546,13 @@ goals = true
 
     let mut tui = crate::tui::test_support::make_test_tui()?;
     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
-    let started = app_server.start_thread(&app.config).await?;
+    let mut started = app_server.start_thread(&app.config).await?;
     let source_thread_id = started.session.thread_id;
+    // Keep ordered response fixtures focused on safety retries, not background naming.
+    app_server
+        .thread_set_name(source_thread_id, SAFETY_RETRY_THREAD_NAME.to_string())
+        .await?;
+    started.session.thread_name = Some(SAFETY_RETRY_THREAD_NAME.to_string());
     app.replace_chat_widget_with_app_server_thread(
         &mut tui,
         started,
@@ -483,7 +621,7 @@ goals = true
         .expect("source goal usage should be recorded");
 
     submit_prompt(&mut app, RETRY_PROMPT);
-    let active_turn = next_user_turn_event(&mut app_event_rx);
+    let mut active_turn = next_user_turn_event(&mut app_event_rx);
     app.submit_thread_op(&mut app_server, source_thread_id, active_turn.clone())
         .await?;
     let active_turn_id = next_turn_started(&mut app, &mut app_server, source_thread_id).await;
@@ -572,18 +710,97 @@ goals = true
     app.primary_thread_id = Some(source_thread_id);
     while app_event_rx.try_recv().is_ok() {}
 
+    if scenario == SafetyRetryScenario::UnsupportedPermissions {
+        let extra_root =
+            AbsolutePathBuf::resolve_path_against_base("extra", app.config.cwd.as_path());
+        let permission_profile = PermissionProfile::Managed {
+            network: NetworkSandboxPolicy::Restricted,
+            file_system: ManagedFileSystemPermissions::Restricted {
+                entries: vec![
+                    FileSystemSandboxEntry {
+                        path: FileSystemPath::Special {
+                            value: FileSystemSpecialPath::Root,
+                        },
+                        access: FileSystemAccessMode::Read,
+                        missing_path_behavior: None,
+                    },
+                    FileSystemSandboxEntry {
+                        path: FileSystemPath::Path {
+                            path: extra_root.into(),
+                        },
+                        access: FileSystemAccessMode::Write,
+                        missing_path_behavior: None,
+                    },
+                ],
+                glob_scan_max_depth: None,
+            },
+        };
+        app.config
+            .permissions
+            .set_permission_profile(permission_profile.clone())?;
+        app.chat_widget.set_permission_profile_with_active_profile(
+            permission_profile,
+            /*active_permission_profile*/ None,
+        )?;
+        app.runtime_permission_profile_override =
+            Some(RuntimePermissionProfileOverride::from_config(&app.config));
+        if let AppCommand::UserTurn {
+            active_permission_profile,
+            ..
+        } = &mut active_turn
+        {
+            *active_permission_profile = None;
+        }
+    }
+
     Box::pin(app.retry_safety_buffered_turn(
         &mut tui,
         &mut app_server,
         SafetyBufferedRetry {
             thread_id: source_thread_id,
-            turn_id: active_turn_id,
+            turn_id: active_turn_id.clone(),
             model: FASTER_MODEL.to_string(),
             turn: active_turn,
             prompt: UserMessage::from(RETRY_PROMPT),
         },
     ))
     .await;
+
+    if scenario == SafetyRetryScenario::UnsupportedPermissions {
+        assert_eq!(app.active_thread_id, Some(source_thread_id));
+        assert_eq!(app.primary_thread_id, Some(source_thread_id));
+        assert_eq!(app.chat_widget.thread_id(), Some(source_thread_id));
+        assert!(
+            app.chat_widget
+                .can_retry_safety_buffered_turn(&active_turn_id)
+        );
+        let source = app_server
+            .thread_read(source_thread_id, /*include_turns*/ true)
+            .await?;
+        assert_eq!(
+            source.turns.last().map(|turn| &turn.status),
+            Some(&TurnStatus::InProgress)
+        );
+        let error_cell = std::iter::from_fn(|| app_event_rx.try_recv().ok())
+            .find_map(|event| match event {
+                AppEvent::InsertHistoryCell(cell) => Some(cell),
+                _ => None,
+            })
+            .expect("unsupported permissions should be added to history");
+        insta::assert_snapshot!(
+            lines_to_single_string(&error_cell.display_lines(/*width*/ 200)),
+            @"■ Failed to retry with a faster model: the selected permission profile cannot be safely represented by the legacy app-server sandbox policy; select a named or legacy-compatible permission profile"
+        );
+        if let Some(release_active_response) = release_active_response.take() {
+            let _ = release_active_response.send(());
+        }
+        let _ = release_steered_response.send(());
+        let _ = release_previous_response.send(());
+        let _ = release_retry_response.send(());
+        app_server.shutdown().await?;
+        server.shutdown().await;
+        return Ok(());
+    }
 
     let first_retry_thread_id = app.chat_widget.thread_id().expect("first retry thread id");
     if scenario == SafetyRetryScenario::RetryTwice {
@@ -622,6 +839,13 @@ goals = true
             .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let second_retry = loop {
             match app_event_rx.try_recv() {
+                Ok(event @ AppEvent::ConfirmSafetyBufferedRetry { .. }) => {
+                    Box::pin(app.handle_event(&mut tui, &mut app_server, event)).await?;
+                    app.chat_widget
+                        .handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+                    app.chat_widget
+                        .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                }
                 Ok(AppEvent::RetrySafetyBufferedTurn {
                     thread_id,
                     turn_id,
@@ -747,10 +971,10 @@ goals = true
     let expected_source_tokens = if committed_steer.is_some() { 150 } else { 50 };
     assert_eq!(source_goal.objective, RETRY_GOAL);
     assert_eq!(source_goal.tokens_used, expected_source_tokens);
-    assert_eq!(source_goal.time_used_seconds, 12);
+    assert!(source_goal.time_used_seconds >= 12);
     assert_eq!(retry_goal.objective, RETRY_GOAL);
     assert!(retry_goal.tokens_used >= expected_source_tokens);
-    assert!(retry_goal.time_used_seconds >= 12);
+    assert!(retry_goal.time_used_seconds >= source_goal.time_used_seconds);
 
     let request_bodies = server
         .requests()
@@ -887,6 +1111,17 @@ async fn safety_retry_branch_failure_preserves_unsent_draft() -> Result<()> {
         Some(UNSENT_DRAFT),
         /*committed_steer*/ None,
         SafetyRetryScenario::Once,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn safety_retry_rejects_unsupported_permissions_before_interrupting() -> Result<()> {
+    run_safety_retry(
+        /*previous_prompt*/ None,
+        /*failing_draft*/ None,
+        /*committed_steer*/ None,
+        SafetyRetryScenario::UnsupportedPermissions,
     )
     .await
 }

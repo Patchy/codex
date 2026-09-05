@@ -4,6 +4,7 @@ use std::sync::PoisonError;
 use codex_code_mode_protocol::CodeModeNestedToolCall;
 use codex_code_mode_protocol::grpc as proto;
 use codex_code_mode_protocol::host::MAX_FRAME_BYTES;
+use codex_protocol::ToolName;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use prost::Message;
@@ -99,7 +100,10 @@ impl GrpcSession {
             name: invocation.tool_name.name,
             namespace: invocation.tool_name.namespace,
         };
-        let (sequence, subscriptions) = {
+        let canonical_tool_name =
+            ToolName::new(tool_name.namespace.clone(), tool_name.name.clone())
+                .with_default_namespace();
+        let (sequence, traceparent, subscriptions) = {
             let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             let Some(execution) = state.cells.get(&cell_id) else {
                 return Err("code-mode cell closed before dispatching its tool call".to_string());
@@ -113,13 +117,21 @@ impl GrpcSession {
                 .filter(|subscription| {
                     subscription.filters.is_empty()
                         || subscription.filters.iter().any(|filter| {
-                            filter.name == tool_name.name && filter.namespace == tool_name.namespace
+                            ToolName::new(filter.namespace.clone(), filter.name.clone())
+                                .with_default_namespace()
+                                == canonical_tool_name
                         })
                 })
                 .map(|subscription| (subscription.id, subscription.sender.clone()))
                 .collect::<Vec<_>>();
-            (sequence, subscriptions)
+            (sequence, execution.traceparent.clone(), subscriptions)
         };
+        // The saved traceparent belongs to the outer execution. Prefer the runtime's
+        // per-tool span so the callback is nested under its invocation, with the
+        // execution context as a fallback when no current span context is available.
+        let traceparent = codex_otel::current_span_w3c_trace_context()
+            .and_then(|trace| trace.traceparent)
+            .or(traceparent);
         if subscriptions.is_empty() {
             return Err("no code-mode tool subscription matches the requested tool".to_string());
         }
@@ -133,6 +145,7 @@ impl GrpcSession {
             tool_kind: conversions::tool_kind(invocation.tool_kind),
             input_json,
             sequence,
+            traceparent,
         };
         if message.encoded_len() > MAX_FRAME_BYTES {
             return Err(format!(
@@ -232,73 +245,6 @@ impl GrpcSession {
             let _ = self.send_event_now(
                 proto::session_event::Event::ToolCallCancelled(proto::ToolCallCancelled {
                     invocation_id: invocation_id.to_string(),
-                }),
-                /*cell_permit*/ None,
-            );
-        }
-    }
-
-    pub(super) async fn begin_notification(
-        &self,
-        notification_id: Uuid,
-        notification: proto::Notification,
-        response: oneshot::Sender<()>,
-        cancellation: &CancellationToken,
-    ) -> Result<(), String> {
-        {
-            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            state
-                .pending_notifications
-                .insert(notification_id, response);
-            state.seen_notifications.remember(notification_id);
-        }
-        if let Err(error) = self
-            .send_event(
-                proto::session_event::Event::Notification(notification),
-                cancellation,
-            )
-            .await
-        {
-            self.state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .pending_notifications
-                .remove(&notification_id);
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    pub(super) fn acknowledge_notification(&self, notification_id: Uuid) -> Result<(), Status> {
-        let response = {
-            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            match state.pending_notifications.remove(&notification_id) {
-                Some(response) => Some(response),
-                None if state.seen_notifications.contains(&notification_id) => None,
-                None => {
-                    return Err(Status::not_found(format!(
-                        "unknown code-mode notification {notification_id}"
-                    )));
-                }
-            }
-        };
-        if let Some(response) = response {
-            let _ = response.send(());
-        }
-        Ok(())
-    }
-
-    pub(super) fn cancel_notification(&self, notification_id: Uuid) {
-        let pending = self
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .pending_notifications
-            .remove(&notification_id);
-        if pending.is_some() {
-            let _ = self.send_event_now(
-                proto::session_event::Event::NotificationCancelled(proto::NotificationCancelled {
-                    notification_id: notification_id.to_string(),
                 }),
                 /*cell_permit*/ None,
             );

@@ -565,16 +565,29 @@ fn session_configured_event(model: &str) -> ThreadSessionState {
 
 #[test]
 fn unified_exec_interaction_cell_renders_input() {
-    let cell = new_unified_exec_interaction(Some("echo hello".to_string()), "ls\npwd".to_string());
-    let lines = render_transcript(&cell);
-    assert_eq!(
-        lines,
-        vec![
-            "↳ Interacted with background terminal · echo hello",
-            "  └ ls",
-            "    pwd",
-        ],
-    );
+    let input = (1..=16).map(|line| format!("line {line}\n")).collect();
+    let cell = new_unified_exec_interaction(Some("cat".to_string()), input);
+    let lines = render_lines(&cell.display_lines(/*width*/ 80));
+    assert_eq!(lines, render_transcript(&cell));
+    insta::assert_snapshot!(lines.join("\n"), @"
+    ↳ Interacted with background terminal · cat
+      └ line 1
+        line 2
+        line 3
+        line 4
+        line 5
+        line 6
+        line 7
+        line 8
+        line 9
+        line 10
+        line 11
+        line 12
+        line 13
+        line 14
+        line 15
+        line 16
+    ");
 }
 
 #[test]
@@ -664,6 +677,7 @@ async fn session_info_uses_availability_nux_tooltip_override() {
     let config = test_config().await;
     let cell = new_session_info(
         &config,
+        &crate::local_settings::LocalSettings::from(&config),
         "gpt-5",
         &session_configured_event("gpt-5"),
         /*is_first_event*/ false,
@@ -686,6 +700,7 @@ async fn session_info_availability_nux_tooltip_snapshot() {
     config.cwd = test_path_buf("/tmp/project").abs();
     let cell = new_session_info(
         &config,
+        &crate::local_settings::LocalSettings::from(&config),
         "gpt-5",
         &session_configured_event("gpt-5"),
         /*is_first_event*/ false,
@@ -703,6 +718,7 @@ async fn session_info_first_event_suppresses_tooltips_and_nux() {
     let config = test_config().await;
     let cell = new_session_info(
         &config,
+        &crate::local_settings::LocalSettings::from(&config),
         "gpt-5",
         &session_configured_event("gpt-5"),
         /*is_first_event*/ true,
@@ -722,6 +738,7 @@ async fn session_info_hides_tooltips_when_disabled() {
     config.show_tooltips = false;
     let cell = new_session_info(
         &config,
+        &crate::local_settings::LocalSettings::from(&config),
         "gpt-5",
         &session_configured_event("gpt-5"),
         /*is_first_event*/ false,
@@ -752,7 +769,21 @@ fn ps_output_multiline_snapshot() {
 
 #[test]
 fn cyber_policy_error_event_snapshot() {
-    let cell = new_cyber_policy_error_event();
+    let cell = new_cyber_policy_error_event(crate::daybreak::Notice::Apply);
+    let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+    insta::assert_snapshot!(rendered);
+}
+
+#[test]
+fn cyber_policy_error_event_astra_snapshot() {
+    let cell = new_cyber_policy_error_event(crate::daybreak::Notice::Astra);
+    let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+    insta::assert_snapshot!(rendered);
+}
+
+#[test]
+fn cyber_policy_error_event_limited_snapshot() {
+    let cell = new_cyber_policy_error_event(crate::daybreak::Notice::Limited);
     let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
     insta::assert_snapshot!(rendered);
 }
@@ -766,7 +797,7 @@ fn safety_access_block_event_snapshot() {
 
 #[test]
 fn cyber_policy_error_event_narrow_snapshot() {
-    let cell = new_cyber_policy_error_event();
+    let cell = new_cyber_policy_error_event(crate::daybreak::Notice::Apply);
     let rendered = render_lines(&cell.display_lines(/*width*/ 36)).join("\n");
     insta::assert_snapshot!(rendered);
 }
@@ -963,7 +994,10 @@ async fn mcp_tools_output_lists_tools_for_hyphenated_server_names() {
 #[test]
 fn mcp_tools_output_from_statuses_renders_status_only_servers() {
     let statuses = vec![McpServerStatus {
+        tools_error: None,
         name: "plugin_docs".to_string(),
+        runtime_status: None,
+        plugin_id: None,
         server_info: None,
         tools: HashMap::from([(
             "lookup".to_string(),
@@ -993,7 +1027,10 @@ fn mcp_tools_output_from_statuses_renders_status_only_servers() {
 #[test]
 fn mcp_tools_output_from_statuses_renders_verbose_inventory() {
     let statuses = vec![McpServerStatus {
+        tools_error: None,
         name: "plugin_docs".to_string(),
+        runtime_status: None,
+        plugin_id: None,
         server_info: None,
         tools: HashMap::from([(
             "lookup".to_string(),
@@ -1215,6 +1252,17 @@ fn pnpm_update_available_history_cell_snapshot() {
 }
 
 #[test]
+fn vite_plus_update_available_history_cell_snapshot() {
+    let cell = UpdateAvailableHistoryCell::new(
+        "9.9.9".to_string(),
+        Some(UpdateAction::VitePlusGlobalLatest),
+    );
+    let rendered = render_lines(&cell.display_lines(/*width*/ 110)).join("\n");
+
+    insta::assert_snapshot!(rendered);
+}
+
+#[test]
 fn web_search_history_cell_without_detail_snapshot() {
     let cell = new_web_search_call("call-1".to_string(), String::new(), WebSearchAction::Other);
     let rendered = render_lines(&cell.display_lines(/*width*/ 64)).join("\n");
@@ -1301,6 +1349,97 @@ fn active_mcp_tool_call_snapshot() {
 }
 
 #[test]
+fn code_mode_tool_call_uses_title_and_preserves_full_transcript() {
+    let output = format!("{} transcript tail", "0123456789".repeat(20));
+    let mut cell = new_active_mcp_tool_call(
+        "call-code-mode".into(),
+        McpInvocation {
+            server: "node_repl".into(),
+            tool: "js".into(),
+            arguments: Some(json!({
+                "title": "Inspect Spotify workspace",
+                "code": "await tools.exec_command({ cmd: 'git status' })",
+            })),
+        },
+        /*animations_enabled*/ false,
+    );
+    cell.complete(
+        Duration::ZERO,
+        Ok(CallToolResult {
+            content: vec![
+                text_block("Script completed\nWall time 0.1 seconds\nOutput:\n"),
+                text_block(
+                    &json!({"chunk_id": "chunk-1", "output": output, "exit_code": 0}).to_string(),
+                ),
+            ],
+            is_error: None,
+            structured_content: None,
+            meta: None,
+        }),
+    );
+
+    let history = render_lines(&cell.display_lines(/*width*/ 40)).join("\n");
+    let transcript = render_lines(&cell.transcript_lines(/*width*/ 180)).join("\n");
+    insta::assert_snapshot!(format!("history:\n{history}\n\ntranscript:\n{transcript}"), @r#"
+    history:
+    • Called Inspect Spotify workspace
+      └ 012345678901234567890123456789012345
+            67890123456789012345678901234567
+            89012345678901234567890123456789
+            01234567890123456789012345678901
+            23456789012345678901234567890123
+            45678901...
+
+    transcript:
+    • Called node_repl.js({"title":"Inspect Spotify workspace","code":"await tools.exec_command({ cmd: 'git status' })"})
+      └ Script completed
+        Wall time 0.1 seconds
+        Output:
+        {"chunk_id":"chunk-
+            1","output":"012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678
+            90123456789012345678901234567890123456789 transcript tail","exit_code":0}
+    "#);
+}
+
+#[test]
+fn code_mode_tool_call_preserves_failure_details() {
+    let mut cell = new_active_mcp_tool_call(
+        "call-code-mode-failed".into(),
+        McpInvocation {
+            server: "node_repl".into(),
+            tool: "js".into(),
+            arguments: Some(json!({"title": "Inspect workspace", "code": "throw Error('denied')"})),
+        },
+        /*animations_enabled*/ false,
+    );
+    cell.complete(
+        Duration::ZERO,
+        Ok(CallToolResult {
+            content: vec![text_block("Script failed\nOutput:\npermission denied")],
+            is_error: Some(true),
+            structured_content: None,
+            meta: None,
+        }),
+    );
+
+    let history = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+    let transcript = render_lines(&cell.transcript_lines(/*width*/ 120)).join("\n");
+    insta::assert_snapshot!(format!("history:\n{history}\n\ntranscript:\n{transcript}"), @r#"
+    history:
+    • Called Inspect workspace
+      └ Script failed
+        Output:
+        permission denied
+
+    transcript:
+    • Called node_repl.js({"title":"Inspect workspace","code":"throw Error('denied')"})
+      └ Script failed
+        Output:
+        permission denied
+    "#);
+}
+
+#[test]
 fn mcp_inventory_loading_snapshot() {
     let cell = new_mcp_inventory_loading(/*animations_enabled*/ true);
     let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
@@ -1316,6 +1455,14 @@ fn mcp_inventory_loading_without_animations_is_stable() {
 
     assert_eq!(first, second);
     assert_eq!(first, vec!["• Loading MCP inventory…".to_string()]);
+}
+
+#[test]
+fn thread_recap_loading_without_animations_snapshot() {
+    let cell = ThreadRecapLoadingCell::new(/*animations_enabled*/ false);
+    let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+
+    insta::assert_snapshot!(rendered, @"• Generating conversation recap…");
 }
 
 #[test]
@@ -2133,6 +2280,61 @@ fn user_history_cell_wraps_and_prefixes_each_line_snapshot() {
 }
 
 #[test]
+fn user_history_cell_wraps_long_urls_inside_the_message_gutter() {
+    let url = "https://example.test/forwarded/threads/10930?page=1&search=&filter=all&queue=customer_support_unprocessed&sort=latest_desc&forwardedScope=all";
+    let message = format!(
+        "Skip tests.\n\nI just reprocessed\n{url}\ncan you check where we are with it?\n\n[Image #1]"
+    );
+    let image_start = message.find("[Image #1]").unwrap();
+    let cell = UserHistoryCell {
+        message,
+        text_elements: vec![TextElement::new(
+            (image_start..image_start + "[Image #1]".len()).into(),
+            Some("[Image #1]".to_string()),
+        )],
+        local_image_paths: Vec::new(),
+        remote_image_urls: Vec::new(),
+    };
+    let width = 64;
+    let hyperlink_lines = cell.display_hyperlink_lines(width);
+
+    assert!(
+        hyperlink_lines
+            .iter()
+            .all(|line| line.width() <= usize::from(width)),
+        "every user-message row must fit its viewport: {hyperlink_lines:?}"
+    );
+
+    let linked_rows = hyperlink_lines
+        .iter()
+        .filter(|line| !line.hyperlinks.is_empty())
+        .collect::<Vec<_>>();
+    assert!(linked_rows.len() > 1, "expected the long URL to wrap");
+    assert!(
+        linked_rows.iter().all(|line| {
+            line.line
+                .spans
+                .first()
+                .is_some_and(|span| span.content == "  ")
+        }),
+        "wrapped URL rows must retain the user-message gutter: {linked_rows:?}"
+    );
+    assert!(
+        linked_rows.iter().all(|line| {
+            line.hyperlinks
+                .iter()
+                .all(|hyperlink| hyperlink.destination == url)
+        }),
+        "each wrapped URL fragment must preserve the complete clickable destination"
+    );
+
+    insta::assert_snapshot!(
+        "user_history_cell_wraps_long_urls_inside_the_message_gutter",
+        render_lines(&cell.display_lines(width)).join("\n")
+    );
+}
+
+#[test]
 fn user_history_cell_renders_remote_image_urls() {
     let cell = UserHistoryCell {
         message: "describe these".to_string(),
@@ -2271,7 +2473,7 @@ fn render_uses_wrapping_for_long_url_like_line() {
         .map(|y| {
             (0..area.width)
                 .map(|x| {
-                    let symbol = buf[(x, y)].symbol();
+                    let symbol = crate::terminal_hyperlinks::strip_osc8(buf[(x, y)].symbol());
                     if symbol.is_empty() {
                         ' '
                     } else {
@@ -2282,10 +2484,22 @@ fn render_uses_wrapping_for_long_url_like_line() {
         })
         .collect::<Vec<_>>();
     let rendered_blob = rendered.join("\n");
+    let rendered_url = rendered
+        .iter()
+        .filter(|row| !row.trim().is_empty())
+        .enumerate()
+        .map(|(index, row)| {
+            if index == 0 {
+                row.strip_prefix("› ").unwrap().trim()
+            } else {
+                row.trim()
+            }
+        })
+        .collect::<String>();
 
-    assert!(
-        rendered_blob.contains("session_id=abc123"),
-        "expected URL tail to be visible after wrapping, got:\n{rendered_blob}"
+    assert_eq!(
+        rendered_url, url,
+        "wrapped URL must preserve every character"
     );
 
     let non_empty_rows = rendered.iter().filter(|row| !row.trim().is_empty()).count() as u16;

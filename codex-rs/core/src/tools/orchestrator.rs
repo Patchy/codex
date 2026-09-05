@@ -6,15 +6,16 @@ simple sequence for any ToolRuntime: approval → select sandbox → attempt →
 retry with an escalated sandbox strategy on denial (no re‑approval thanks to
 caching).
 */
+use crate::config::NetworkProxySpec;
+use crate::guardian::GuardianReviewContext;
 use crate::network_policy_decision::network_approval_context_from_payload;
 use crate::tools::approvals::ApprovalContext;
 use crate::tools::flat_tool_name;
 use crate::tools::network_approval::ActiveNetworkApproval;
 use crate::tools::network_approval::DeferredNetworkApproval;
-use crate::tools::network_approval::NetworkApprovalMode;
+use crate::tools::network_approval::NetworkApprovalSpec;
 use crate::tools::network_approval::begin_network_approval;
 use crate::tools::network_approval::finish_deferred_network_approval;
-use crate::tools::network_approval::finish_immediate_network_approval;
 use crate::tools::sandboxing::ExecApprovalRequirement;
 use crate::tools::sandboxing::SandboxAttempt;
 use crate::tools::sandboxing::SandboxOverride;
@@ -32,12 +33,11 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ReviewDecision;
 use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxType;
+use codex_sandboxing::policy_transforms::effective_network_sandbox_policy;
 use std::sync::Arc;
 use std::time::Instant;
 
-pub(crate) struct ToolOrchestrator {
-    sandbox: SandboxManager,
-}
+pub(crate) struct ToolOrchestrator;
 
 pub(crate) struct OrchestratorRunResult<Out> {
     pub output: Out,
@@ -46,9 +46,7 @@ pub(crate) struct OrchestratorRunResult<Out> {
 
 impl ToolOrchestrator {
     pub fn new() -> Self {
-        Self {
-            sandbox: SandboxManager::new(),
-        }
+        Self
     }
 
     async fn run_attempt<Rq, Out, T>(
@@ -56,16 +54,16 @@ impl ToolOrchestrator {
         req: &Rq,
         tool_ctx: &ToolCtx,
         attempt: &SandboxAttempt<'_>,
-        managed_network_active: bool,
+        network_approval_spec: Option<NetworkApprovalSpec>,
     ) -> (Result<Out, ToolError>, Option<DeferredNetworkApproval>)
     where
         T: ToolRuntime<Rq, Out>,
     {
         let network_approval = match begin_network_approval(
             &tool_ctx.session,
-            &tool_ctx.step_context.turn.sub_id,
-            managed_network_active,
-            tool.network_approval_spec(req, tool_ctx),
+            &tool_ctx.step_context.turn,
+            attempt.enforce_managed_network,
+            network_approval_spec,
         )
         .await
         {
@@ -76,6 +74,7 @@ impl ToolOrchestrator {
         let attempt_tool_ctx = ToolCtx {
             session: tool_ctx.session.clone(),
             step_context: Arc::clone(&tool_ctx.step_context),
+            cancellation_token: tool_ctx.cancellation_token.clone(),
             call_id: tool_ctx.call_id.clone(),
             tool_name: tool_ctx.tool_name.clone(),
         };
@@ -107,28 +106,16 @@ impl ToolOrchestrator {
             return (run_result, None);
         };
 
-        match network_approval.mode() {
-            NetworkApprovalMode::Immediate => {
-                let finalize_result =
-                    finish_immediate_network_approval(&tool_ctx.session, network_approval).await;
-                if let Err(err) = finalize_result {
-                    return (Err(err), None);
-                }
-                (run_result, None)
+        let deferred = network_approval.into_deferred();
+        if run_result.is_err() {
+            let finalize_result =
+                finish_deferred_network_approval(&tool_ctx.session, deferred).await;
+            if let Err(err) = finalize_result {
+                return (Err(err), None);
             }
-            NetworkApprovalMode::Deferred => {
-                let deferred = network_approval.into_deferred();
-                if run_result.is_err() {
-                    let finalize_result =
-                        finish_deferred_network_approval(&tool_ctx.session, deferred).await;
-                    if let Err(err) = finalize_result {
-                        return (Err(err), None);
-                    }
-                    return (run_result, None);
-                }
-                (run_result, deferred)
-            }
+            return (run_result, None);
         }
+        (run_result, deferred)
     }
 
     pub async fn run<Rq, Out, T>(
@@ -136,20 +123,44 @@ impl ToolOrchestrator {
         tool: &mut T,
         req: &Rq,
         tool_ctx: &ToolCtx,
-        turn_ctx: &crate::session::turn_context::TurnContext,
-        approval_policy: AskForApproval,
     ) -> Result<OrchestratorRunResult<Out>, ToolError>
     where
         T: ToolRuntime<Rq, Out>,
     {
+        let turn_ctx = tool_ctx.step_context.turn.as_ref();
+        let approval_policy = tool_ctx.step_context.settings.approval_policy();
         let otel = turn_ctx.session_telemetry.clone();
         let otel_tn = flat_tool_name(&tool_ctx.tool_name).into_owned();
         let otel_ci = &tool_ctx.call_id;
-        let strict_auto_review = tool_ctx.session.strict_auto_review_enabled_for_turn().await;
+        let strict_auto_review = tool_ctx
+            .session
+            .active_turn_context_and_strict_auto_review()
+            .await
+            .is_some_and(|(_, _, strict_auto_review)| strict_auto_review);
         // 1) Approval
         let mut already_approved = false;
 
         let environment = tool.turn_environment(req);
+        let sandbox_manager = SandboxManager::new();
+        #[cfg(target_os = "macos")]
+        let sandbox_manager = sandbox_manager.with_allowed_symlinked_codex_home(
+            environment
+                .environment
+                .local_runtime_paths()
+                .and_then(|paths| paths.allowed_symlinked_codex_home.clone()),
+        );
+        let sandbox_config = environment.config();
+        let owner_network_policy = sandbox_config.network_policy.is_some();
+        if owner_network_policy
+            && tool
+                .sandbox_permissions(req)
+                .requires_escalated_permissions()
+        {
+            return Err(ToolError::Rejected(
+                "attachment-owned network policy cannot be bypassed by sandbox escalation"
+                    .to_string(),
+            ));
+        }
         let workspace_roots = environment.workspace_roots();
         let executor_managed_process_sandbox = tool.uses_executor_managed_process_sandbox(req);
         let permission_profile = environment.permission_profile();
@@ -172,7 +183,8 @@ impl ToolOrchestrator {
                             ToolError::Rejected(format!("could not prepare approval action: {err}"))
                         })?;
                     let approval_ctx = ApprovalContext {
-                        step_context: Arc::clone(&tool_ctx.step_context),
+                        review_context: GuardianReviewContext::from(&tool_ctx.step_context),
+                        cancellation_token: Some(tool_ctx.cancellation_token.clone()),
                         call_id: tool_ctx.call_id.clone(),
                         tool_name: tool_ctx.tool_name.clone(),
                         strict_auto_review,
@@ -187,10 +199,10 @@ impl ToolOrchestrator {
                     already_approved = true;
                 } else {
                     otel.tool_decision(
-                        &otel_tn,
+                        &tool_ctx.tool_name,
                         otel_ci,
                         &ReviewDecision::Approved,
-                        ToolDecisionSource::Config,
+                        Some(ToolDecisionSource::Config),
                     );
                 }
             }
@@ -204,7 +216,8 @@ impl ToolOrchestrator {
                         ToolError::Rejected(format!("could not prepare approval action: {err}"))
                     })?;
                 let approval_ctx = ApprovalContext {
-                    step_context: Arc::clone(&tool_ctx.step_context),
+                    review_context: GuardianReviewContext::from(&tool_ctx.step_context),
+                    cancellation_token: Some(tool_ctx.cancellation_token.clone()),
                     call_id: tool_ctx.call_id.clone(),
                     tool_name: tool_ctx.tool_name.clone(),
                     strict_auto_review,
@@ -221,34 +234,57 @@ impl ToolOrchestrator {
         }
 
         // 2) First attempt under the selected sandbox.
-        let sandbox_override = sandbox_override_for_first_attempt(
-            tool.sandbox_permissions(req),
-            &requirement,
-            &file_system_sandbox_policy,
-        );
-        let managed_network_active = turn_ctx.network.is_some();
+        let unsandboxed_allowed =
+            !owner_network_policy && unsandboxed_execution_allowed(&file_system_sandbox_policy);
+        let sandbox_override = if unsandboxed_allowed {
+            sandbox_override_for_first_attempt(
+                tool.sandbox_permissions(req),
+                &requirement,
+                &file_system_sandbox_policy,
+            )
+        } else {
+            SandboxOverride::NoOverride
+        };
+        let network_approval_spec = tool.network_approval_spec(req, tool_ctx);
+        // Offline owner attachments stay offline unless approved command permissions grant
+        // networking. Existing enabled controller proxies remain independently authoritative.
+        let managed_network_active = if owner_network_policy {
+            turn_ctx
+                .config
+                .permissions
+                .network
+                .as_ref()
+                .is_some_and(NetworkProxySpec::enabled)
+                || network_approval_spec.as_ref().is_some_and(|spec| {
+                    effective_network_sandbox_policy(
+                        permission_profile.network_sandbox_policy(),
+                        spec.trigger.additional_permissions.as_ref(),
+                    )
+                    .is_enabled()
+                })
+        } else {
+            turn_ctx.network.is_some()
+        };
         let sandbox_preference = tool.sandbox_preference();
         let sandbox_requested = match sandbox_override {
             SandboxOverride::BypassSandboxFirstAttempt => false,
-            SandboxOverride::NoOverride => self.sandbox.should_sandbox(
+            SandboxOverride::NoOverride => sandbox_manager.should_sandbox(
                 &permissions,
                 sandbox_preference,
                 managed_network_active,
             ),
         };
         let initial_sandbox = if sandbox_requested && !executor_managed_process_sandbox {
-            self.sandbox.select_initial(
+            sandbox_manager.select_initial(
                 &permissions,
                 sandbox_preference,
-                turn_ctx.windows_sandbox_level,
+                sandbox_config.windows_sandbox_level,
                 managed_network_active,
             )
         } else {
             SandboxType::None
         };
 
-        // Platform-specific flag gating is handled by SandboxManager::select_initial.
-        let use_legacy_landlock = turn_ctx.config.features.use_legacy_landlock();
         let sandbox_policy_cwd = tool
             .sandbox_cwd(req)
             .cloned()
@@ -259,29 +295,20 @@ impl ToolOrchestrator {
             permissions: &permissions,
             exec_server_permissions: permission_profile,
             enforce_managed_network: managed_network_active,
-            manager: &self.sandbox,
+            manager: &sandbox_manager,
             sandbox_cwd: &sandbox_policy_cwd,
             workspace_roots,
             codex_linux_sandbox_exe: turn_ctx.config.codex_linux_sandbox_exe.as_ref(),
-            use_legacy_landlock,
-            windows_sandbox_level: turn_ctx.windows_sandbox_level,
-            windows_sandbox_private_desktop: turn_ctx
-                .config
-                .permissions
-                .windows_sandbox_private_desktop,
+            use_legacy_landlock: sandbox_config.use_legacy_landlock,
+            windows_sandbox_level: sandbox_config.windows_sandbox_level,
+            windows_sandbox_private_desktop: sandbox_config.windows_sandbox_private_desktop,
             network_denial_cancellation_token: None,
             network_proxy: None,
         };
 
         let initial_attempt_start = Instant::now();
-        let (first_result, first_deferred_network_approval) = Self::run_attempt(
-            tool,
-            req,
-            tool_ctx,
-            &initial_attempt,
-            managed_network_active,
-        )
-        .await;
+        let (first_result, first_deferred_network_approval) =
+            Self::run_attempt(tool, req, tool_ctx, &initial_attempt, network_approval_spec).await;
         let initial_duration = initial_attempt_start.elapsed();
         match first_result {
             Ok(out) => {
@@ -336,8 +363,6 @@ impl ToolOrchestrator {
                     );
                     return Err(ToolError::Codex(err));
                 }
-                let unsandboxed_allowed =
-                    unsandboxed_execution_allowed(&file_system_sandbox_policy);
                 // Under `Never` or `OnRequest`, do not retry without sandbox;
                 // surface a concise sandbox denial that preserves the
                 // original output.
@@ -400,7 +425,8 @@ impl ToolOrchestrator {
                             ToolError::Rejected(format!("could not prepare approval action: {err}"))
                         })?;
                     let approval_ctx = ApprovalContext {
-                        step_context: Arc::clone(&tool_ctx.step_context),
+                        review_context: GuardianReviewContext::from(&tool_ctx.step_context),
+                        cancellation_token: Some(tool_ctx.cancellation_token.clone()),
                         call_id: tool_ctx.call_id.clone(),
                         tool_name: tool_ctx.tool_name.clone(),
                         strict_auto_review,
@@ -416,17 +442,17 @@ impl ToolOrchestrator {
                 }
 
                 let retry_sandbox_requested = !unsandboxed_allowed
-                    && self.sandbox.should_sandbox(
+                    && sandbox_manager.should_sandbox(
                         &permissions,
                         sandbox_preference,
                         managed_network_active,
                     );
                 let retry_sandbox = if retry_sandbox_requested && !executor_managed_process_sandbox
                 {
-                    self.sandbox.select_initial(
+                    sandbox_manager.select_initial(
                         &permissions,
                         sandbox_preference,
-                        turn_ctx.windows_sandbox_level,
+                        sandbox_config.windows_sandbox_level,
                         managed_network_active,
                     )
                 } else {
@@ -443,24 +469,22 @@ impl ToolOrchestrator {
                     permissions: &permissions,
                     exec_server_permissions: permission_profile,
                     enforce_managed_network: managed_network_active,
-                    manager: &self.sandbox,
+                    manager: &sandbox_manager,
                     sandbox_cwd: &sandbox_policy_cwd,
                     workspace_roots,
                     codex_linux_sandbox_exe: retry_codex_linux_sandbox_exe,
-                    use_legacy_landlock,
-                    windows_sandbox_level: turn_ctx.windows_sandbox_level,
-                    windows_sandbox_private_desktop: turn_ctx
-                        .config
-                        .permissions
-                        .windows_sandbox_private_desktop,
+                    use_legacy_landlock: sandbox_config.use_legacy_landlock,
+                    windows_sandbox_level: sandbox_config.windows_sandbox_level,
+                    windows_sandbox_private_desktop: sandbox_config.windows_sandbox_private_desktop,
                     network_denial_cancellation_token: None,
                     network_proxy: None,
                 };
 
                 // Second attempt.
+                let network_approval_spec = tool.network_approval_spec(req, tool_ctx);
                 let escalated_attempt_start = Instant::now();
                 let (retry_result, retry_deferred_network_approval) =
-                    Self::run_attempt(tool, req, tool_ctx, &retry_attempt, managed_network_active)
+                    Self::run_attempt(tool, req, tool_ctx, &retry_attempt, network_approval_spec)
                         .await;
                 let escalated_duration = escalated_attempt_start.elapsed();
                 match retry_result {

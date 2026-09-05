@@ -6,8 +6,11 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
 use codex_core::StartThreadOptions;
+use codex_core::TurnInputRequest;
 use codex_core::config::Config;
+use codex_core::config::Constrained;
 use codex_core::config::CurrentTimeReminderConfig;
+use codex_core::context::NodeReplReviewEvidence;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::ToolCallOutcome;
@@ -20,6 +23,10 @@ use codex_features::CurrentTimeSource;
 use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_models_manager::bundled_models_response;
+use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
 use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
@@ -27,12 +34,16 @@ use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
 use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ImageDetail;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ToolMode;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use codex_tools::FreeformTool;
 use codex_tools::FreeformToolFormat;
@@ -64,6 +75,7 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::namespace_child_tool;
 use core_test_support::responses::sse;
 use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_sandbox;
 use core_test_support::skip_if_wine_exec;
 use core_test_support::stdio_server_bin;
 use core_test_support::test_codex::TestCodex;
@@ -76,11 +88,16 @@ use core_test_support::wait_for_mcp_server;
 use image::DynamicImage;
 use image::GenericImageView;
 use image::ImageBuffer;
+use image::ImageDecoder;
+use image::ImageEncoder;
+use image::ImageFormat;
+use image::ImageReader;
 use image::Rgba;
+use image::codecs::png::PngEncoder;
+use image::metadata::Orientation;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::fs;
 use std::io::Cursor;
 use std::path::Path;
@@ -277,16 +294,10 @@ async fn run_unavailable_code_mode_turn(
     .await;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "list available tools".to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "list available tools".to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
 
     let mut warnings = Vec::new();
@@ -373,7 +384,7 @@ async fn missing_process_host_keeps_code_mode_only_and_fails_closed() -> Result<
     assert!(
         tools
             .iter()
-            .all(|name| { !matches!(name.as_str(), "shell" | "shell_command" | "exec_command") }),
+            .all(|name| !matches!(name.as_str(), "shell" | "exec_command")),
         "code-mode-only must never expose direct shell tools: {tools:?}"
     );
     let (output, _) = custom_tool_output_body_and_success(&request, "call-1");
@@ -905,6 +916,7 @@ async fn code_mode_excludes_mcp_servers_using_their_configured_identity() -> Res
                         serde_json::from_value(serde_json::json!({
                             "command": rmcp_test_server_bin,
                             "environment_id": environment_id,
+                            "cwd": config.cwd,
                             "omit_tools_from": omit_tools_from,
                         }))
                         .expect("test MCP server config should be valid"),
@@ -1139,6 +1151,7 @@ async fn mcp_code_mode_exclusion_does_not_change_direct_mode_tool_exposure() -> 
                         serde_json::from_value(serde_json::json!({
                             "command": rmcp_test_server_bin,
                             "environment_id": environment_id,
+                            "cwd": config.cwd,
                             "omit_tools_from": omit_tools_from,
                         }))
                         .expect("test MCP server config should be valid"),
@@ -1194,19 +1207,128 @@ async fn mcp_code_mode_exclusion_does_not_change_direct_mode_tool_exposure() -> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[test_case(false, false, false; "disabled")]
+#[test_case(true, false, false; "completed")]
+#[test_case(true, true, false; "yielded")]
+#[test_case(true, false, true; "oversized")]
+async fn code_mode_tool_call_completeness_is_private_and_opt_in(
+    metadata_enabled: bool,
+    yielded: bool,
+    oversized: bool,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let code = if oversized {
+        r#"
+const args = { barrier: { id: "", participants: 1 } };
+args.barrier.id = "x".repeat(8192 - JSON.stringify(args).length);
+for (let index = 0; index < 4; index++) await tools.test_sync_tool(args);
+text("done");
+yield_control();
+await new Promise(() => {});
+"#
+    } else if yielded {
+        r#"await tools.test_sync_tool({}); text("done"); yield_control(); await new Promise(() => {});"#
+    } else {
+        r#"await tools.test_sync_tool({}); text("done");"#
+    };
+    // run_code_mode_turn_with_config enables this feature; production keeps it off by default.
+    let (test, follow_up) =
+        run_code_mode_turn_with_config(&server, "Record a nested tool call", code, move |config| {
+            if !metadata_enabled {
+                config
+                    .features
+                    .disable(Feature::ExecutedToolCallMetadata)
+                    .expect("tool call metadata should be disabled");
+            }
+            if oversized {
+                let _ = config.features.disable(Feature::RemoteCompactionV2);
+            }
+        })
+        .await?;
+
+    let request = follow_up.single_request();
+    let first_output = request.custom_tool_call_output("call-1");
+    let metadata = &first_output["internal_chat_message_metadata_passthrough"];
+    let calls = serde_json::json!([{ "name": "test_sync_tool", "arguments": {} }]);
+    let complete = Value::Bool(true);
+    if oversized {
+        assert!(
+            metadata["executed_tool_calls"]
+                .as_array()
+                .is_some_and(|calls| calls.iter().any(|call| call["arguments"]
+                    .get("_codex_executed_tool_call_truncated")
+                    .is_some()))
+        );
+    } else {
+        assert_eq!(
+            metadata.get("executed_tool_calls"),
+            metadata_enabled.then_some(&calls),
+        );
+    }
+    assert_eq!(
+        metadata.get("tool_calls_complete"),
+        (metadata_enabled && !yielded && !oversized).then_some(&complete),
+    );
+    assert_eq!(
+        metadata.get("cell_id").and_then(Value::as_str),
+        metadata_enabled.then_some("call-1"),
+    );
+    if yielded || oversized {
+        let first_items = custom_tool_output_items(&request, "call-1");
+        let cell_id = extract_running_cell_id(text_item(&first_items, /*index*/ 0));
+
+        if oversized {
+            responses::mount_compact_user_history_with_summary_once(&server, "compacted history")
+                .await;
+            test.codex.submit(Op::Compact).await?;
+            wait_for_event(&test.codex, |event| {
+                matches!(event, EventMsg::TurnComplete(_))
+            })
+            .await;
+
+            let wait = responses::mount_function_call_agent_response(
+                &server,
+                "call-2",
+                &serde_json::to_string(&serde_json::json!({
+                    "cell_id": cell_id,
+                    "terminate": true,
+                }))?,
+                "wait",
+            )
+            .await;
+            test.submit_turn("Finish the compacted cell").await?;
+            let final_request = wait.completion.single_request();
+            assert!(
+                final_request
+                    .input()
+                    .iter()
+                    .all(|item| item["call_id"] != "call-1")
+            );
+            assert!(
+                final_request.function_call_output("call-2")
+                    ["internal_chat_message_metadata_passthrough"]
+                    .get("tool_calls_complete")
+                    .is_none()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_only_guides_all_tools_search_and_calls_deferred_app_tools() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
     let apps_server = AppsTestServer::mount_searchable(&server).await?;
-    let resp_mock = responses::mount_sse_once(
-        &server,
-        sse(vec![
-            ev_response_created("resp-1"),
-            ev_custom_tool_call(
-                "call-1",
-                "exec",
-                r#"
+    let originating_item_id = "ctc_code_mode_origin";
+    let mut exec_call = ev_custom_tool_call(
+        "call-1",
+        "exec",
+        r#"
 const tool = ALL_TOOLS.find(
   ({ name }) => name === "mcp__codex_apps__calendar_timezone_option_99"
 );
@@ -1221,7 +1343,13 @@ if (!tool) {
   }));
 }
 "#,
-            ),
+    );
+    exec_call["item"]["id"] = serde_json::json!(originating_item_id);
+    let resp_mock = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            exec_call,
             ev_completed("resp-1"),
         ]),
     )
@@ -1314,6 +1442,13 @@ if (!tool) {
             "isError": false,
             "text": "called calendar_timezone_option_99 for  at  with ",
         })
+    );
+    let apps_tool_calls = recorded_apps_tool_calls(&server).await;
+    assert!(
+        apps_tool_calls.iter().any(|call| {
+            call.pointer("/params/_meta/itemId") == Some(&serde_json::json!(originating_item_id))
+        }),
+        "the nested MCP call should inherit its code cell's originating Responses item"
     );
 
     Ok(())
@@ -1463,11 +1598,36 @@ text(output.output);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_update_plan_nested_tool_result_is_empty_object() -> Result<()> {
+async fn code_mode_does_not_expose_update_plan_by_default() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
     let (_test, second_mock) = run_code_mode_turn(
+        &server,
+        "inspect the available tools",
+        r#"
+text(JSON.stringify({
+  callable: typeof tools.update_plan === "function",
+  listed: ALL_TOOLS.some(({ name }) => name === "update_plan"),
+}));
+"#,
+    )
+    .await?;
+
+    let (output, _) = custom_tool_output_body_and_success(&second_mock.single_request(), "call-1");
+    assert_eq!(
+        serde_json::from_str::<Value>(&output)?,
+        serde_json::json!({ "callable": false, "listed": false })
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_update_plan_nested_tool_result_is_empty_object() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let (_test, second_mock) = run_code_mode_turn_with_config(
         &server,
         "use exec to run update_plan",
         r#"
@@ -1476,6 +1636,7 @@ const result = await tools.update_plan({
 });
 text(JSON.stringify(result));
 "#,
+        |config| config.update_plan_enabled = true,
     )
     .await?;
 
@@ -1588,6 +1749,7 @@ async fn code_mode_nested_tool_calls_can_run_in_parallel() -> Result<()> {
         .with_model("test-gpt-5.1-codex")
         .with_config(move |config| {
             let _ = config.features.enable(Feature::CodeMode);
+            let _ = config.features.enable(Feature::ExecutedToolCallMetadata);
         });
     let test = builder.build(&server).await?;
 
@@ -2054,13 +2216,16 @@ try {
     .await?;
 
     let request = second_mock.single_request();
+    let metadata =
+        &request.custom_tool_call_output("call-1")["internal_chat_message_metadata_passthrough"];
     assert_eq!(
-        request.custom_tool_call_output("call-1")["internal_chat_message_metadata_passthrough"]["executed_tool_calls"],
+        metadata["executed_tool_calls"],
         serde_json::json!([
             {"name": "exec_command", "arguments": {}},
         ]),
         "failed nested tool attempts remain private request metadata",
     );
+    assert_eq!(metadata["tool_calls_complete"], Value::Bool(true));
     let (output, success) = custom_tool_output_body_and_success(&request, "call-1");
     assert_ne!(
         success,
@@ -2135,16 +2300,10 @@ async fn code_mode_wait_timeout_reconnects_on_next_exec() -> Result<()> {
     .completion;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "wait for the stalled cell".to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "wait for the stalled cell".to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event_match(&test.codex, |event| match event {
         EventMsg::RawResponseItem(raw) => match &raw.item {
@@ -2213,15 +2372,45 @@ async fn code_mode_wait_timeout_reconnects_on_next_exec() -> Result<()> {
     Ok(())
 }
 
+#[derive(Default)]
+struct GuardianTicketObserver {
+    tickets: Mutex<Vec<(String, Option<String>)>>,
+    wait_started: tokio::sync::Notify,
+}
+
+impl ToolLifecycleContributor for GuardianTicketObserver {
+    fn on_tool_start<'a>(&'a self, input: ToolStartInput<'a>) -> ToolLifecycleFuture<'a> {
+        Box::pin(async move {
+            if matches!(input.tool_name.name.as_str(), "exec_command" | "wait") {
+                self.tickets.lock().unwrap().push((
+                    input.tool_name.name.clone(),
+                    input
+                        .turn_store
+                        .get::<codex_protocol::guardian_ticket::GuardianTicket>()
+                        .map(|ticket| ticket.as_str().to_owned()),
+                ));
+                if input.tool_name.name == "wait" {
+                    self.wait_started.notify_one();
+                }
+            }
+        })
+    }
+}
+
 #[cfg_attr(windows, ignore = "no exec_command on Windows")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_yield_and_resume_with_wait() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
-    let mut builder = test_codex().with_config(move |config| {
-        let _ = config.features.enable(Feature::CodeMode);
-    });
+    let observer = Arc::new(GuardianTicketObserver::default());
+    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+    extensions.tool_lifecycle_contributor(observer.clone());
+    let mut builder = test_codex()
+        .with_extensions(Arc::new(extensions.build()))
+        .with_config(move |config| {
+            let _ = config.features.enable(Feature::CodeMode);
+        });
     let test = builder.build(&server).await?;
     let phase_2_gate = test.workspace_path("code-mode-phase-2.ready");
     let phase_3_gate = test.workspace_path("code-mode-phase-3.ready");
@@ -2233,16 +2422,16 @@ async fn code_mode_can_yield_and_resume_with_wait() -> Result<()> {
 text("phase 1");
 yield_control();
 {phase_2_wait}
-text("phase 2");
+text((await tools.exec_command({{cmd: "printf 'phase 2'"}})).output);
 {phase_3_wait}
-text("phase 3");
+text((await tools.exec_command({{cmd: "printf 'phase 3'"}})).output);
 "#
     );
 
     responses::mount_sse_once(
         &server,
         sse(vec![
-            ev_response_created("resp-1"),
+            serde_json::json!({"type": "response.created", "response": {"id": "resp-1", "headers": {"x-codex-guardian-ticket": "p".repeat(43)}}}),
             ev_custom_tool_call("call-1", "exec", &code),
             ev_completed("resp-1"),
         ]),
@@ -2275,7 +2464,7 @@ text("phase 3");
     responses::mount_sse_once(
         &server,
         sse(vec![
-            ev_response_created("resp-3"),
+            serde_json::json!({"type": "response.created", "response": {"id": "resp-3", "headers": {"x-codex-guardian-ticket": "q".repeat(43)}}}),
             responses::ev_function_call(
                 "call-2",
                 "wait",
@@ -2297,8 +2486,11 @@ text("phase 3");
     )
     .await;
 
-    fs::write(&phase_2_gate, "ready")?;
-    test.submit_turn("wait again").await?;
+    tokio::try_join!(test.submit_turn("wait again"), async {
+        observer.wait_started.notified().await;
+        fs::write(&phase_2_gate, "ready")?;
+        anyhow::Ok(())
+    })?;
 
     let second_request = second_completion.single_request();
     let second_items = function_tool_output_items(&second_request, "call-2");
@@ -2319,7 +2511,7 @@ text("phase 3");
     responses::mount_sse_once(
         &server,
         sse(vec![
-            ev_response_created("resp-5"),
+            serde_json::json!({"type": "response.created", "response": {"id": "resp-5", "headers": {"x-codex-guardian-ticket": "r".repeat(43)}}}),
             responses::ev_function_call(
                 "call-3",
                 "wait",
@@ -2341,8 +2533,11 @@ text("phase 3");
     )
     .await;
 
-    fs::write(&phase_3_gate, "ready")?;
-    test.submit_turn("wait for completion").await?;
+    tokio::try_join!(test.submit_turn("wait for completion"), async {
+        observer.wait_started.notified().await;
+        fs::write(&phase_3_gate, "ready")?;
+        anyhow::Ok(())
+    })?;
 
     let third_request = third_completion.single_request();
     let third_items = function_tool_output_items(&third_request, "call-3");
@@ -2356,6 +2551,26 @@ text("phase 3");
     );
     assert_eq!(text_item(&third_items, /*index*/ 1), "phase 3");
 
+    let observed = observer.tickets.lock().unwrap();
+    let mut nested_tickets = observed
+        .iter()
+        .filter(|(tool, _)| tool == "exec_command")
+        .filter_map(|(_, ticket)| ticket.clone())
+        .skip_while(|ticket| ticket != &"q".repeat(43))
+        .collect::<Vec<_>>();
+    nested_tickets.dedup();
+    assert_eq!(nested_tickets, vec!["q".repeat(43), "r".repeat(43)]);
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|(tool, _)| tool == "wait")
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![
+            ("wait".to_owned(), Some("q".repeat(43))),
+            ("wait".to_owned(), Some("r".repeat(43))),
+        ]
+    );
     Ok(())
 }
 
@@ -2464,6 +2679,7 @@ async fn code_mode_can_run_multiple_yielded_sessions() -> Result<()> {
     let server = responses::start_mock_server().await;
     let mut builder = test_codex().with_config(move |config| {
         let _ = config.features.enable(Feature::CodeMode);
+        let _ = config.features.enable(Feature::ExecutedToolCallMetadata);
     });
     let test = builder.build(&server).await?;
     let session_a_gate = test.workspace_path("code-mode-session-a.ready");
@@ -2473,6 +2689,7 @@ async fn code_mode_can_run_multiple_yielded_sessions() -> Result<()> {
 
     let session_a_code = format!(
         r#"
+await tools.exec_command({{ cmd: "printf cell-a" }});
 text("session a start");
 yield_control();
 {session_a_wait}
@@ -2481,6 +2698,7 @@ text("session a done");
     );
     let session_b_code = format!(
         r#"
+await tools.exec_command({{ cmd: "printf cell-b" }});
 text("session b start");
 yield_control();
 {session_b_wait}
@@ -2551,7 +2769,7 @@ text("session b done");
                 "wait",
                 &serde_json::to_string(&serde_json::json!({
                     "cell_id": session_a_id.clone(),
-                    "yield_time_ms": 1_000,
+                    "yield_time_ms": 5_000,
                 }))?,
             ),
             ev_completed("resp-5"),
@@ -2591,7 +2809,7 @@ text("session b done");
                 "wait",
                 &serde_json::to_string(&serde_json::json!({
                     "cell_id": session_b_id.clone(),
-                    "yield_time_ms": 1_000,
+                    "yield_time_ms": 5_000,
                 }))?,
             ),
             ev_completed("resp-7"),
@@ -2620,6 +2838,44 @@ text("session b done");
         text_item(&fourth_items, /*index*/ 0),
     );
     assert_eq!(text_item(&fourth_items, /*index*/ 1), "session b done");
+    for (output, originating_call_id, expected_command) in [
+        (
+            first_request.custom_tool_call_output("call-1"),
+            "call-1",
+            Some("printf cell-a"),
+        ),
+        (
+            second_request.custom_tool_call_output("call-2"),
+            "call-2",
+            Some("printf cell-b"),
+        ),
+        (third_request.function_call_output("call-3"), "call-1", None),
+        (
+            fourth_request.function_call_output("call-4"),
+            "call-2",
+            None,
+        ),
+    ] {
+        let metadata = &output["internal_chat_message_metadata_passthrough"];
+        assert_eq!(metadata["cell_id"], serde_json::json!(originating_call_id));
+        assert_eq!(
+            metadata.get("tool_calls_complete").and_then(Value::as_bool),
+            expected_command.is_none().then_some(true),
+        );
+        assert_eq!(
+            metadata
+                .get("executed_tool_calls")
+                .and_then(Value::as_array)
+                .and_then(|calls| {
+                    calls.iter().find_map(|call| {
+                        call["arguments"]["cmd"]
+                            .as_str()
+                            .filter(|command| command.starts_with("printf cell-"))
+                    })
+                }),
+            expected_command,
+        );
+    }
 
     Ok(())
 }
@@ -3319,6 +3575,7 @@ async fn code_mode_interrupt_terminates_active_cells_and_nested_tools() -> Resul
         .with_config(|config| {
             let _ = config.features.enable(Feature::CodeMode);
             let _ = config.features.enable(Feature::CodeModeInterrupt);
+            let _ = config.features.enable(Feature::ExecutedToolCallMetadata);
         });
     let test = builder.build_with_auto_env(&server).await?;
 
@@ -3381,16 +3638,10 @@ async fn code_mode_interrupt_terminates_active_cells_and_nested_tools() -> Resul
     .await;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "start a long-running nested tool".to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "start a long-running nested tool".to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     let active_cell_id = tokio::time::timeout(Duration::from_secs(10), started_rx).await??;
 
@@ -3445,6 +3696,12 @@ async fn code_mode_interrupt_terminates_active_cells_and_nested_tools() -> Resul
     test.submit_turn("verify interrupted cells and reuse their session")
         .await?;
     let requests = recovery.requests();
+    let metadata = &requests[0].custom_tool_call_output("call-interrupted")["internal_chat_message_metadata_passthrough"];
+    assert_eq!(
+        metadata["executed_tool_calls"],
+        serde_json::json!([{"name": "test_sync_tool", "arguments": {"sleep_after_ms": 60_000}}]),
+    );
+    assert_eq!(metadata["tool_calls_complete"], Value::Bool(true));
     let background_output = function_tool_output_items(&requests[1], "call-wait-background");
     assert!(text_item(&background_output, /*index*/ 1).contains("not found"));
     let active_output = function_tool_output_items(&requests[2], "call-wait-active");
@@ -3556,36 +3813,6 @@ Total\ output\ lines:\ 1\n
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_can_output_serialized_text_via_global_helper() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = responses::start_mock_server().await;
-    let (_test, second_mock) = run_code_mode_turn(
-        &server,
-        "use exec to return structured text",
-        r#"
-text({ json: true });
-"#,
-    )
-    .await?;
-
-    let req = second_mock.single_request();
-    let (output, success) = custom_tool_output_body_and_success(&req, "call-1");
-    eprintln!(
-        "hidden dynamic tool raw output: {}",
-        req.custom_tool_call_output("call-1")
-    );
-    assert_ne!(
-        success,
-        Some(false),
-        "exec call failed unexpectedly: {output}"
-    );
-    assert_eq!(output, r#"{"json":true}"#);
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_resume_after_set_timeout() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -3622,7 +3849,6 @@ async fn code_mode_notify_injects_additional_exec_tool_output_into_active_contex
         "use exec notify helper",
         r#"
 notify("code_mode_notify_marker");
-await tools.test_sync_tool({});
 text("done");
 "#,
     )
@@ -3688,82 +3914,83 @@ text("after");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_surfaces_text_stringify_errors() -> Result<()> {
+async fn code_mode_omits_short_audio_and_preserves_other_output() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
-    let server = responses::start_mock_server().await;
-    let (_test, second_mock) = run_code_mode_turn(
-        &server,
-        "use exec to return circular text",
+    let [short_audio_url, valid_audio_url] = [120_u32, 600].map(|frames| {
+        let sample_rate = 24_000_u32;
+        let data_size = frames * 2;
+        let mut wav = b"RIFF".to_vec();
+        wav.extend_from_slice(&(36 + data_size).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        wav.extend_from_slice(&2_u16.to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_size.to_le_bytes());
+        wav.resize(44 + data_size as usize, /*value*/ 0);
+        format!("data:audio/wav;base64,{}", BASE64_STANDARD.encode(wav))
+    });
+    let code = format!(
         r#"
-const circular = {};
-circular.self = circular;
-text(circular);
+text("before");
+audio({short_audio_url:?});
+text("between");
+audio({valid_audio_url:?});
+text("after");
 "#,
-    )
-    .await?;
-
-    let req = second_mock.single_request();
-    let items = custom_tool_output_items(&req, "call-1");
-    let (_, success) = req
-        .custom_tool_call_output_content_and_success("call-1")
-        .expect("custom tool output should be present");
-    assert_ne!(
-        success,
-        Some(true),
-        "circular stringify unexpectedly succeeded"
     );
-    assert_eq!(items.len(), 2);
-    assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script failed\nWall time \d+\.\d seconds\nOutput:\n\z"
-        ),
-        text_item(&items, /*index*/ 0),
-    );
-    assert!(text_item(&items, /*index*/ 1).contains("Script error:"));
-    assert!(text_item(&items, /*index*/ 1).contains("Converting circular structure to JSON"));
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_can_output_images_via_global_helper() -> Result<()> {
-    skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
-    let (_test, second_mock) = run_code_mode_turn(
+    let mut builder = test_codex()
+        .with_model_info_override("gpt-5.4", |model| {
+            model.input_modalities.push(InputModality::Audio);
+        })
+        .with_config(|config| {
+            let _ = config.features.enable(Feature::CodeMode);
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    responses::mount_sse_once(
         &server,
-        "use exec to return images",
-        r#"
-image("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==");
-"#,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_custom_tool_call("call-1", "exec", &code),
+            ev_completed("resp-1"),
+        ]),
     )
-    .await?;
+    .await;
+    let second_mock = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+
+    test.submit_turn("use exec to return short and valid audio with text")
+        .await?;
 
     let req = second_mock.single_request();
     let items = custom_tool_output_items(&req, "call-1");
     let (_, success) = custom_tool_output_body_and_success(&req, "call-1");
-    assert_ne!(
-        success,
-        Some(false),
-        "code_mode image output failed unexpectedly"
-    );
-    assert_eq!(items.len(), 2);
-    assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script completed\nWall time \d+\.\d seconds\nOutput:\n\z"
-        ),
-        text_item(&items, /*index*/ 0),
-    );
+    assert_ne!(success, Some(false));
     assert_eq!(
-        items[1],
-        serde_json::json!({
-            "type": "input_image",
-            "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
-            "detail": "high"
-        }),
+        &items[1..],
+        &[
+            serde_json::json!({ "type": "input_text", "text": "before" }),
+            serde_json::json!({
+                "type": "input_text",
+                "text": "Audio output omitted because the clip is shorter than 25 ms; use a longer clip."
+            }),
+            serde_json::json!({ "type": "input_text", "text": "between" }),
+            serde_json::json!({ "type": "input_audio", "audio_url": valid_audio_url }),
+            serde_json::json!({ "type": "input_text", "text": "after" }),
+        ]
     );
 
     Ok(())
@@ -3956,83 +4183,47 @@ async fn code_mode_unified_image_budget_preserves_legacy_contract_for_unsupporte
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_image_helper_rejects_remote_url() -> Result<()> {
+async fn code_mode_view_image_rejects_invalid_file_without_exposing_contents() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
+    const INVALID_IMAGE_CONTENTS: &str = "private-file-contents-must-not-be-exposed";
+
     let server = responses::start_mock_server().await;
-    let (_test, second_mock) = run_code_mode_turn(
+    let builder = test_codex()
+        .with_model("gpt-5.4")
+        .with_config(|config| {
+            let _ = config.features.enable(Feature::CodeMode);
+        })
+        .with_workspace_setup(|cwd, _fs| async move {
+            fs::write(
+                cwd.join("not-an-image.txt").as_path(),
+                INVALID_IMAGE_CONTENTS,
+            )?;
+            Ok(())
+        });
+    let (_test, second_mock) = run_code_mode_turn_with_builder(
         &server,
-        "use exec to return a remote image",
-        r#"image("https://example.com/image.jpg");"#,
+        "use exec to call view_image on a non-image file",
+        r#"await tools.view_image({ path: "not-an-image.txt" });"#,
+        builder,
     )
     .await?;
 
-    let req = second_mock.single_request();
-    let items = custom_tool_output_items(&req, "call-1");
-    let (_, success) = custom_tool_output_body_and_success(&req, "call-1");
+    let request = second_mock.single_request();
+    let (output, success) = custom_tool_output_body_and_success(&request, "call-1");
     assert_ne!(
         success,
         Some(true),
-        "code_mode remote image URL unexpectedly succeeded"
+        "code-mode view_image unexpectedly accepted a non-image file"
     );
-    assert_eq!(items.len(), 2);
-    assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script failed\nWall time \d+\.\d seconds\nOutput:\n\z"
-        ),
-        text_item(&items, /*index*/ 0),
+    assert!(
+        output.contains("unable to process image: invalid or unsupported image data"),
+        "unexpected code-mode failure: {output}"
     );
-    assert_eq!(
-        text_item(&items, /*index*/ 1),
-        concat!(
-            "Script error:\n",
-            "Tool call failed: remote image URLs are not supported in tool outputs. ",
-            "Pass a base64 data URI instead"
-        )
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_image_helper_rejects_invalid_image_output() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = responses::start_mock_server().await;
-    let (_test, second_mock) = run_code_mode_turn(
-        &server,
-        "use exec to return an image",
-        r#"
-const s = "Error executing tool exec: Expected at least one message to convert to CallToolResult";
-image(s.trim(), "original");
-"#,
-    )
-    .await?;
-
-    let req = second_mock.single_request();
-    let items = custom_tool_output_items(&req, "call-1");
-    let (_, success) = custom_tool_output_body_and_success(&req, "call-1");
-    assert_ne!(
-        success,
-        Some(true),
-        "code_mode invalid image output unexpectedly succeeded"
-    );
-    assert_eq!(items.len(), 2);
-    assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script failed\nWall time \d+\.\d seconds\nOutput:\n\z"
-        ),
-        text_item(&items, /*index*/ 0),
-    );
-    assert_eq!(
-        text_item(&items, /*index*/ 1),
-        concat!(
-            "Script error:\n",
-            "Tool call failed: invalid image output. ",
-            "Pass a base64 data URI instead"
-        )
+    let model_visible_output = serde_json::to_string(&request.custom_tool_call_output("call-1"))?;
+    assert!(
+        !model_visible_output.contains(INVALID_IMAGE_CONTENTS),
+        "invalid file contents leaked into model-visible output: {model_visible_output}"
     );
 
     Ok(())
@@ -4057,11 +4248,26 @@ async fn code_mode_can_use_view_image_result_with_image_helper(
         });
     let test = builder.build(&server).await?;
 
-    let image_bytes = BASE64_STANDARD.decode(
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+    let image = ImageBuffer::from_pixel(
+        /*width*/ 2,
+        /*height*/ 1,
+        Rgba([255u8, 0, 0, 255]),
+    );
+    let rotate_90_exif = vec![
+        0x49, 0x49, 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x12, 0x01, 0x03, 0x00, 0x01,
+        0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    let mut image_bytes = Vec::new();
+    let mut encoder = PngEncoder::new(&mut image_bytes);
+    encoder.set_exif_metadata(rotate_90_exif.clone())?;
+    encoder.write_image(
+        image.as_raw(),
+        image.width(),
+        image.height(),
+        image::ColorType::Rgba8.into(),
     )?;
     let image_path = test.cwd_path().join("code_mode_view_image.png");
-    fs::write(&image_path, image_bytes)?;
+    fs::write(&image_path, &image_bytes)?;
 
     let image_path_json = serde_json::to_string(&image_path.to_string_lossy().to_string())?;
     let expected_output_keys = if unified_image_budget {
@@ -4129,6 +4335,21 @@ image(out);
         .and_then(Value::as_str)
         .expect("image helper should emit an input_image item with image_url");
     assert!(emitted_image_url.starts_with("data:image/png;base64,"));
+    let (_, emitted_image_base64) = emitted_image_url
+        .split_once(',')
+        .expect("emitted image should contain a data URL prefix");
+    let emitted_image_bytes = BASE64_STANDARD.decode(emitted_image_base64)?;
+    assert_eq!(emitted_image_bytes, image_bytes);
+    let mut decoder = ImageReader::with_format(Cursor::new(&emitted_image_bytes), ImageFormat::Png)
+        .into_decoder()?;
+    assert_eq!(
+        (
+            decoder.dimensions(),
+            decoder.orientation()?,
+            decoder.exif_metadata()?
+        ),
+        ((2, 1), Orientation::Rotate90, Some(rotate_90_exif))
+    );
     assert_eq!(
         items[1].get("detail").and_then(Value::as_str),
         Some("original")
@@ -4272,6 +4493,533 @@ contentLength=0"
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[test_case("node_repl"; "node_repl")]
+#[test_case("cua_repl"; "cua_repl")]
+async fn code_mode_node_repl_screenshots_can_be_captured_without_guardian_transcript_flags(
+    repl_server: &'static str,
+) -> Result<()> {
+    skip_if_wine_exec!(
+        Ok(()),
+        "requires a Windows test_stdio_server in the Wine-exec environment"
+    );
+    skip_if_no_network!(Ok(()));
+
+    const SCREENSHOT: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+    let server = responses::start_mock_server().await;
+    let mcp_server_bin = remote_aware_stdio_server_bin()?;
+    let mut builder = test_codex().with_config(move |config| {
+        config
+            .features
+            .enable(Feature::CodeMode)
+            .expect("enable Code Mode");
+        let mcp = serde_json::from_value(serde_json::json!({
+            "command": mcp_server_bin,
+            "environment_id": remote_aware_environment_id(),
+            "cwd": config.cwd,
+            "env": { "MCP_TEST_ENABLE_NODE_REPL_JS": "1" },
+            "omit_tools_from": ["deferred"],
+        }))
+        .expect("valid REPL MCP server config");
+        config
+            .mcp_servers
+            .set(HashMap::from([(repl_server.to_owned(), mcp)]))
+            .expect("configure REPL MCP server");
+    });
+    let test = builder.build_with_auto_env(&server).await?;
+    core_test_support::wait_for_mcp_server(&test.codex, repl_server).await?;
+    let evidence = test
+        .codex
+        .thread_extension_data()
+        .get_or_init(NodeReplReviewEvidence::default);
+    evidence.enable_image_capture();
+
+    let response_mock = responses::mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_custom_tool_call(
+                    "node-repl-image",
+                    "exec",
+                    &r#"for (let index = 0; index < 2; index++) await tools.mcp__node_repl__js({ code: 'await nodeRepl.emitImage(await tab.screenshot())' });"#
+                        .replace("node_repl", repl_server),
+                ),
+                ev_completed("response-node-repl"),
+            ]),
+            sse(vec![ev_completed("response-done")]),
+        ],
+    )
+    .await;
+    test.submit_text_turn("capture a computer-use screenshot")
+        .await?;
+
+    assert_eq!(
+        evidence.images(),
+        vec![ContentItem::InputImage {
+            image_url: SCREENSHOT.to_owned(),
+            detail: Some(ImageDetail::Low),
+        }]
+    );
+    let parent_request = response_mock
+        .requests()
+        .pop()
+        .expect("parent turn should complete");
+    assert!(!serde_json::to_string(&parent_request.input())?.contains(SCREENSHOT));
+
+    Ok(())
+}
+
+#[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[test_case("node_repl"; "node_repl")]
+#[test_case("cua_repl"; "cua_repl")]
+async fn code_mode_node_repl_image_flag_without_enhanced_stays_disabled(
+    repl_server: &'static str,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_sandbox!(Ok(()));
+    skip_if_wine_exec!(
+        Ok(()),
+        "Guardian approval actions require host-native paths"
+    );
+
+    let server = responses::start_mock_server().await;
+    let mcp_server_bin = remote_aware_stdio_server_bin()?;
+    let mut builder = test_codex()
+        .with_model_info_override("gpt-5.5", |model| {
+            model.node_repl_auto_review_required = false;
+        })
+        .with_config(move |config| {
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+            config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+            config
+                .features
+                .enable(Feature::CodeMode)
+                .expect("enable Code Mode");
+            config
+                .features
+                .set_enabled(
+                    Feature::GuardianEnhancedNodeReplTranscripts,
+                    /*enabled*/ false,
+                )
+                .expect("disable enhanced Guardian transcripts");
+            config
+                .features
+                .enable(Feature::GuardianNodeReplTranscriptImages)
+                .expect("enable Guardian transcript images");
+            let mcp = serde_json::from_value(serde_json::json!({
+                "command": mcp_server_bin,
+                "environment_id": remote_aware_environment_id(),
+                "cwd": config.cwd,
+                "env": { "MCP_TEST_ENABLE_NODE_REPL_JS": "1" },
+                "omit_tools_from": ["deferred"],
+            }))
+            .expect("valid REPL MCP server config");
+            config
+                .mcp_servers
+                .set(HashMap::from([(repl_server.to_owned(), mcp)]))
+                .expect("configure REPL MCP server");
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    wait_for_mcp_server(&test.codex, repl_server).await?;
+
+    let code = r#"
+await tools.mcp__node_repl__js({ code: 'await nodeRepl.emitImage(await tab.screenshot())' });
+await tools.exec_command({ cmd: "true", sandbox_permissions: "require_escalated", justification: "review" });
+"#
+    .replace("node_repl", repl_server);
+    let response_mock = responses::mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_custom_tool_call("code-mode-call", "exec", &code),
+                ev_completed("resp-parent"),
+            ]),
+            sse(vec![
+                ev_assistant_message("guardian", r#"{"outcome":"allow"}"#),
+                ev_completed("resp-guardian"),
+            ]),
+            sse(vec![ev_completed("resp-done")]),
+        ],
+    )
+    .await;
+    test.submit_text_turn(&format!("review a nested {repl_server} screenshot"))
+        .await?;
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 3);
+    let guardian_request = requests
+        .iter()
+        .find(|request| {
+            request.body_json()["client_metadata"]["x-openai-subagent"].as_str() == Some("guardian")
+        })
+        .expect("the shell command should trigger Guardian review");
+    assert!(guardian_request.message_input_image_urls("user").is_empty());
+    let guardian_text = guardian_request.message_input_texts("user").concat();
+    let parent_input = serde_json::to_string(&requests.last().unwrap().input())?;
+    for marker in [
+        "guardian-visible-before-image",
+        "guardian-visible-after-image",
+        "data:image/png;base64,",
+    ] {
+        assert!(!guardian_text.contains(marker));
+        assert!(!parent_input.contains(marker));
+    }
+
+    Ok(())
+}
+
+#[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[test_case("node_repl", false, false, false, None; "disabled")]
+#[test_case("node_repl", true, false, false, None; "manually_enabled_text_only")]
+#[test_case("node_repl", true, true, false, None; "manually_enabled_multimodal")]
+#[test_case("node_repl", false, false, true, None; "required_model_forces_multimodal")]
+#[test_case("node_repl", true, true, false, Some("unsupported"); "text_fallback_without_image_support")]
+#[test_case("node_repl", true, true, false, Some("unbounded"); "text_fallback_without_context_bound")]
+#[test_case("node_repl", true, true, false, Some("small"); "text_fallback_with_insufficient_context")]
+#[test_case("node_repl", true, true, false, Some("large_prompt"); "images_resume_after_prompt_pressure")]
+#[test_case("node_repl", true, true, false, Some("buffered"); "multimodal_reviewer_preserves_model_owned_fallback_buffer")]
+#[test_case("node_repl", true, true, false, Some("rollover"); "multimodal_reviewer_rollover_replays_evidence")]
+#[test_case("cua_repl", false, false, false, None; "cua_disabled")]
+#[test_case("cua_repl", true, false, false, None; "cua_manually_enabled_text_only")]
+#[test_case("cua_repl", true, true, false, None; "cua_manually_enabled_multimodal")]
+#[test_case("cua_repl", false, false, true, None; "cua_required_model_forces_multimodal")]
+#[test_case("cua_repl", true, true, false, Some("unsupported"); "cua_text_fallback_without_image_support")]
+#[test_case("cua_repl", true, true, false, Some("unbounded"); "cua_text_fallback_without_context_bound")]
+#[test_case("cua_repl", true, true, false, Some("small"); "cua_text_fallback_with_insufficient_context")]
+#[test_case("cua_repl", true, true, false, Some("large_prompt"); "cua_images_resume_after_prompt_pressure")]
+async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
+    repl_server: &'static str,
+    enhanced_transcripts: bool,
+    transcript_images: bool,
+    auto_review_required: bool,
+    reviewer_constraint: Option<&'static str>,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_sandbox!(Ok(()));
+    skip_if_wine_exec!(
+        Ok(()),
+        "Guardian approval actions require host-native paths"
+    );
+    const NODE_REPL_DOM_MIDDLE: &str = "guardian-visible-dom-middle";
+    const DIRECT_NODE_REPL_MIDDLE: &str = "direct-node-repl-visible-middle";
+    const DIRECT_UNRELATED_MIDDLE: &str = "direct-unrelated-hidden-middle";
+    const OTHER_NODE_REPL_RESULT: &str = "ECHOING: guardian-visible-other-tool-result";
+    const UNRELATED_RESULT: &str = "ECHOING: guardian-hidden-unrelated-result";
+    const PRIVATE_IMAGE: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+    let server = responses::start_mock_server().await;
+    let mcp_server_bin = remote_aware_stdio_server_bin()?;
+    let reviewer_rollover = reviewer_constraint == Some("rollover");
+    let reviewer_token_budget = matches!(reviewer_constraint, Some("buffered" | "rollover"));
+    let check_detail = enhanced_transcripts && transcript_images && reviewer_constraint.is_none();
+    let mut large_image = Cursor::new(Vec::new());
+    if check_detail {
+        DynamicImage::new_rgba8(/*w*/ 2049, /*h*/ 32)
+            .write_to(&mut large_image, ImageFormat::Png)?;
+    }
+    let mut builder = test_codex()
+        .with_model_info_override("gpt-5.5", move |model| {
+            model.node_repl_auto_review_required = auto_review_required
+        })
+        .with_config(move |config| {
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+            config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+            if reviewer_constraint.is_some_and(|value| value != "large_prompt") || check_detail {
+                let reviewer = config
+                    .model_catalog
+                    .as_mut()
+                    .expect("bundled model catalog")
+                    .models
+                    .iter_mut()
+                    .find(|model| model.slug == "gpt-5.6-luna")
+                    .expect("API-key Guardian reviewer");
+                if reviewer_token_budget {
+                    reviewer.context_window = Some(100_000);
+                    reviewer.max_context_window = Some(100_000);
+                    reviewer.auto_compact_token_limit = Some(50_000);
+                } else if check_detail {
+                    reviewer.use_responses_lite = false;
+                } else if reviewer_constraint == Some("unsupported") {
+                    reviewer.input_modalities =
+                        vec![codex_protocol::openai_models::InputModality::Text];
+                } else {
+                    reviewer.context_window =
+                        (reviewer_constraint == Some("small")).then_some(10_000);
+                    reviewer.max_context_window = reviewer.context_window;
+                }
+            }
+            config
+                .features
+                .enable(Feature::CodeMode)
+                .expect("enable Code Mode");
+            if reviewer_token_budget {
+                config
+                    .features
+                    .enable(Feature::TokenBudget)
+                    .expect("enable token budget");
+            }
+            config
+                .features
+                .set_enabled(
+                    Feature::GuardianEnhancedNodeReplTranscripts,
+                    enhanced_transcripts,
+                )
+                .expect("configure enhanced transcripts");
+            config
+                .features
+                .set_enabled(Feature::GuardianNodeReplTranscriptImages, transcript_images)
+                .expect("configure Guardian transcript images");
+            let mcp: McpServerConfig = serde_json::from_value(serde_json::json!({
+                "command": mcp_server_bin,
+                "environment_id": remote_aware_environment_id(),
+                "cwd": config.cwd,
+                "env": {
+                    "MCP_TEST_ENABLE_NODE_REPL_JS": "1",
+                    "MCP_TEST_IMAGE_DATA_URL": format!("data:image/png;base64,{}", BASE64_STANDARD.encode(large_image.into_inner())),
+                    "MCP_TEST_OVERSIZED_INVALID_IMAGE": u8::from(!core_test_support::is_remote_test_environment()).to_string()
+                },
+                "omit_tools_from": ["deferred"],
+            }))
+            .expect("valid MCP server config");
+            config
+                .mcp_servers
+                .set(
+                    [repl_server.to_owned(), format!("{repl_server}_")]
+                        .into_iter()
+                        .map(|name| (name, mcp.clone()))
+                        .collect(),
+                )
+                .expect("configure MCP servers");
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    wait_for_mcp_server(&test.codex, repl_server).await?;
+    let images_enabled = auto_review_required || (enhanced_transcripts && transcript_images);
+    let reviewer_images =
+        images_enabled && (reviewer_constraint.is_none() || reviewer_token_budget);
+    let snapshot_padding = if images_enabled && reviewer_constraint != Some("large_prompt") {
+        2_500
+    } else {
+        10_000
+    };
+    let padding = "a".repeat(snapshot_padding);
+    let snapshot_args = |marker| {
+        let padding = if check_detail && marker == DIRECT_NODE_REPL_MIDDLE {
+            ""
+        } else {
+            padding.as_str()
+        };
+        serde_json::json!({
+            "message": format!("{padding}{marker}{padding}"),
+        })
+        .to_string()
+    };
+
+    let code = r#"
+await tools.mcp__node_repl_echo({ message: "guardian-hidden-unrelated-result" });
+await tools.mcp__node_repl__js({ code: 'nodeRepl.fail()' });
+await tools.mcp__node_repl__js({ code: `nodeRepl.write(${JSON.stringify("a".repeat(SNAPSHOT_PADDING) + ["guardian-visible", "dom-middle"].join("-") + "b".repeat(SNAPSHOT_PADDING))})` });
+await tools.mcp__node_repl__echo({ message: ["guardian-visible-other-", "tool-result"].join("") });
+await tools.mcp__node_repl__encrypted_output({});
+await tools.mcp__node_repl__js({ code: 'nodeRepl.empty()' });
+await tools.mcp__node_repl__js({ code: 'await nodeRepl.emitImage(await tab.screenshot())' });
+if (LARGE_IMAGE) await tools.mcp__node_repl__image_scenario({ scenario: "invalid_image_bytes_then_image" });
+await tools.exec_command({ cmd: "true", sandbox_permissions: "require_escalated", justification: "review" });
+if (!REVIEWER_ROLLOVER) await tools.mcp__node_repl__js({ code: 'await nodeRepl.emitImage(await tab.screenshot())' });
+if (LARGE_IMAGE) await tools.mcp__node_repl__image({});
+await tools.exec_command({ cmd: "printf second", sandbox_permissions: "require_escalated", justification: "review again" });
+"#
+    .replace("node_repl", repl_server)
+    .replace("SNAPSHOT_PADDING", &snapshot_padding.to_string())
+    .replace("REVIEWER_ROLLOVER", &reviewer_rollover.to_string())
+    .replace("LARGE_IMAGE", &check_detail.to_string());
+    let response_mock = responses::mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                responses::ev_function_call_with_namespace(
+                    "node-repl-call",
+                    &format!("mcp__{repl_server}"),
+                    "echo",
+                    &snapshot_args(DIRECT_NODE_REPL_MIDDLE),
+                ),
+                ev_completed("resp-node-repl"),
+            ]),
+            sse(vec![
+                responses::ev_function_call_with_namespace(
+                    "unrelated-call",
+                    &format!("mcp__{repl_server}_"),
+                    "echo",
+                    &snapshot_args(DIRECT_UNRELATED_MIDDLE),
+                ),
+                ev_completed("resp-unrelated"),
+            ]),
+            sse(vec![
+                ev_custom_tool_call("code-mode-call", "exec", &code),
+                ev_completed("resp-parent"),
+            ]),
+            sse(vec![
+                ev_assistant_message("guardian", r#"{"outcome":"allow"}"#),
+                if reviewer_token_budget {
+                    responses::ev_completed_with_tokens(
+                        "resp-guardian",
+                        /*total_tokens*/ if reviewer_rollover { 70_000 } else { 60_000 },
+                    )
+                } else {
+                    ev_completed("resp-guardian")
+                },
+            ]),
+            sse(vec![
+                ev_assistant_message("guardian-again", r#"{"outcome":"allow"}"#),
+                ev_completed("resp-guardian-again"),
+            ]),
+            sse(vec![ev_completed("resp-done")]),
+        ],
+    )
+    .await;
+    test.submit_text_turn(&format!("review a nested {repl_server} tool response"))
+        .await?;
+    let requests = response_mock.requests();
+    let guardian_requests = requests
+        .iter()
+        .filter(|request| {
+            request.body_json()["client_metadata"]["x-openai-subagent"].as_str() == Some("guardian")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(guardian_requests.len(), 2);
+    let guardian_text = guardian_requests[0].message_input_texts("user").concat();
+    let evidence_enabled = enhanced_transcripts || auto_review_required;
+    assert_eq!(
+        guardian_text.contains(&format!("tool={repl_server}.js")),
+        evidence_enabled,
+        "private evidence must identify its originating REPL server"
+    );
+    for included in [
+        DIRECT_NODE_REPL_MIDDLE,
+        NODE_REPL_DOM_MIDDLE,
+        OTHER_NODE_REPL_RESULT,
+        "Lookup completed",
+        "<completed without visible text>",
+        "guardian-visible-before-image",
+        "guardian-visible-after-image",
+    ] {
+        assert_eq!(
+            guardian_text.contains(included),
+            evidence_enabled,
+            "unexpected Guardian evidence visibility for {included}"
+        );
+    }
+    let guardian_request = guardian_requests[0];
+    let reviewer_image_urls = guardian_request.message_input_image_urls("user");
+    let expected_images = usize::from(reviewer_images) + usize::from(check_detail);
+    assert_eq!(reviewer_image_urls.len(), expected_images);
+    if reviewer_images {
+        assert_eq!(reviewer_image_urls[0], PRIVATE_IMAGE);
+        let reviewer_user_content = guardian_request
+            .inputs_of_type("message")
+            .into_iter()
+            .filter(|item| item.get("role").and_then(Value::as_str) == Some("user"))
+            .filter_map(|item| item.get("content").and_then(Value::as_array).cloned())
+            .flatten()
+            .collect::<Vec<_>>();
+        let image_index = reviewer_user_content
+            .iter()
+            .position(|item| item.get("image_url").and_then(Value::as_str) == Some(PRIVATE_IMAGE))
+            .expect("private reviewer image should be present");
+        if check_detail {
+            assert_eq!(reviewer_user_content[image_index]["detail"], "high");
+            let payload = reviewer_image_urls[1].split_once(',').unwrap().1;
+            let dimensions =
+                image::load_from_memory(&BASE64_STANDARD.decode(payload)?)?.dimensions();
+            assert_eq!(dimensions, (2048, 32));
+        }
+        for (index, marker) in [(image_index - 1, "before"), (image_index + 1, "after")] {
+            let text = reviewer_user_content[index]["text"].as_str().unwrap();
+            assert!(text.contains(marker));
+        }
+    }
+    for excluded in [
+        DIRECT_UNRELATED_MIDDLE,
+        UNRELATED_RESULT,
+        "guardian-hidden-failed-result",
+        "gAAAA-test",
+        "guardian-hidden-ui-preview",
+        "guardian-hidden-structured-override",
+    ] {
+        assert!(
+            !guardian_text.contains(excluded),
+            "protected, failed, unrelated, or duplicate evidence leaked: {excluded}"
+        );
+    }
+    assert_eq!(
+        guardian_requests[1]
+            .message_input_texts("user")
+            .concat()
+            .matches(NODE_REPL_DOM_MIDDLE)
+            .count(),
+        usize::from(evidence_enabled),
+        "a reused Guardian session must not append the same evidence twice"
+    );
+    assert_eq!(
+        guardian_requests[1].message_input_image_urls("user"),
+        if reviewer_constraint == Some("large_prompt") {
+            vec![PRIVATE_IMAGE.to_string()]
+        } else {
+            reviewer_image_urls
+        }
+    );
+    if reviewer_rollover {
+        let second_request = guardian_requests[1];
+        let second_prompt = second_request
+            .message_input_text_groups("user")
+            .last()
+            .expect("post-rollover Guardian review prompt")
+            .join("");
+        assert!(second_prompt.contains(">>> TRANSCRIPT START\n"));
+        assert!(!second_prompt.contains(">>> TRANSCRIPT DELTA START\n"));
+        assert!(second_prompt.contains(NODE_REPL_DOM_MIDDLE));
+        assert_eq!(
+            second_request.message_input_image_urls("user"),
+            vec![PRIVATE_IMAGE.to_string()],
+            "browser screenshots must be replayed into the fresh reviewer window"
+        );
+        assert!(
+            second_request
+                .message_input_texts("developer")
+                .iter()
+                .any(|text| text.contains("Previous context window id:")),
+            "Guardian should roll over before rebuilding browser evidence"
+        );
+    } else if reviewer_token_budget {
+        let second_request = guardian_requests[1];
+        let second_prompt = second_request
+            .message_input_text_groups("user")
+            .last()
+            .expect("buffered Guardian review prompt")
+            .join("");
+        assert!(second_prompt.contains(">>> TRANSCRIPT DELTA START\n"));
+        assert!(
+            second_request
+                .message_input_texts("developer")
+                .iter()
+                .all(|text| !text.contains("Previous context window id:")),
+            "Guardian should preserve the reviewer model's fallback buffer before rolling over"
+        );
+    }
+    let parent_request = requests.last().expect("parent turn should complete");
+    let parent_input = serde_json::to_string(&parent_request.input())?;
+    assert!(!parent_input.contains("data:image/png;base64,"));
+    assert!(!parent_input.contains("guardian-visible-before-image"));
+    assert!(!parent_input.contains("guardian-visible-after-image"));
+    assert!(
+        !parent_input.contains(NODE_REPL_DOM_MIDDLE)
+            && !parent_input.contains(OTHER_NODE_REPL_RESULT)
+            && !parent_input.contains(UNRELATED_RESULT),
+        "nested MCP responses leaked into parent model history: {parent_input}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_only_can_call_mcp_tool() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -4396,7 +5144,7 @@ impl ToolContributor for NamespacedCustomTool {
         &self,
         _session_store: &ExtensionData,
         _thread_store: &ExtensionData,
-    ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>> {
+    ) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
         Vec::new()
     }
 
@@ -4405,7 +5153,7 @@ impl ToolContributor for NamespacedCustomTool {
         _session_store: &ExtensionData,
         _thread_store: &ExtensionData,
         _step_store: &ExtensionData,
-    ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>> {
+    ) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
         vec![Arc::new(Self {
             generation: self.generations.fetch_add(1, Ordering::Relaxed) + 1,
             generations: Arc::clone(&self.generations),
@@ -4413,7 +5161,7 @@ impl ToolContributor for NamespacedCustomTool {
     }
 }
 
-impl ToolExecutor<ToolCall> for NamespacedCustomTool {
+impl<'call> ToolExecutor<ToolCall<'call>> for NamespacedCustomTool {
     fn tool_name(&self) -> ToolName {
         ToolName::namespaced("editor", "apply_patch")
     }
@@ -4435,7 +5183,10 @@ impl ToolExecutor<ToolCall> for NamespacedCustomTool {
         })
     }
 
-    fn handle(&self, call: ToolCall) -> ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, call: ToolCall<'call>) -> ToolExecutorFuture<'a>
+    where
+        'call: 'a,
+    {
         Box::pin(async move {
             let ToolPayload::Custom { input } = call.payload else {
                 return Err(FunctionCallError::Fatal(
@@ -4610,7 +5361,7 @@ text(JSON.stringify({
     assert_eq!(
         parsed,
         serde_json::json!({
-            "hasExecCommand": !cfg!(windows),
+            "hasExecCommand": true,
             "hasNamespacedEcho": true,
         })
     );
@@ -4643,118 +5394,6 @@ text(`echo=${result.structuredContent.echo}`);
         "exec normalized rmcp tool call failed unexpectedly: {output}"
     );
     assert_eq!(output, "echo=ECHOING: ping");
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_lists_global_scope_items() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = responses::start_mock_server().await;
-    let code = r#"
-text(JSON.stringify(Object.getOwnPropertyNames(globalThis).sort()));
-"#;
-
-    let (_test, second_mock) =
-        run_code_mode_turn_with_rmcp(&server, "use exec to inspect global scope", code).await?;
-
-    let req = second_mock.single_request();
-    let (output, success) = custom_tool_output_body_and_success(&req, "call-1");
-    assert_ne!(
-        success,
-        Some(false),
-        "exec global scope inspection failed unexpectedly: {output}"
-    );
-    let globals = serde_json::from_str::<Vec<String>>(&output)?;
-    let globals = globals.into_iter().collect::<HashSet<_>>();
-    let expected = [
-        "AggregateError",
-        "ALL_TOOLS",
-        "Array",
-        "ArrayBuffer",
-        "AsyncDisposableStack",
-        "BigInt",
-        "BigInt64Array",
-        "BigUint64Array",
-        "Boolean",
-        "clearTimeout",
-        "DataView",
-        "Date",
-        "DisposableStack",
-        "Error",
-        "EvalError",
-        "FinalizationRegistry",
-        "Float16Array",
-        "Float32Array",
-        "Float64Array",
-        "Function",
-        "Infinity",
-        "Int16Array",
-        "Int32Array",
-        "Int8Array",
-        "Intl",
-        "Iterator",
-        "JSON",
-        "Map",
-        "Math",
-        "NaN",
-        "Number",
-        "Object",
-        "Promise",
-        "Proxy",
-        "RangeError",
-        "ReferenceError",
-        "Reflect",
-        "RegExp",
-        "Set",
-        "String",
-        "SuppressedError",
-        "Symbol",
-        "SyntaxError",
-        "Temporal",
-        "TypeError",
-        "URIError",
-        "Uint16Array",
-        "Uint32Array",
-        "Uint8Array",
-        "Uint8ClampedArray",
-        "WeakMap",
-        "WeakRef",
-        "WeakSet",
-        "__codexContentItems",
-        "add_content",
-        "audio",
-        "decodeURI",
-        "decodeURIComponent",
-        "encodeURI",
-        "encodeURIComponent",
-        "escape",
-        "exit",
-        "eval",
-        "generatedImage",
-        "globalThis",
-        "image",
-        "isFinite",
-        "isNaN",
-        "load",
-        "notify",
-        "parseFloat",
-        "parseInt",
-        "setTimeout",
-        "store",
-        "text",
-        "tools",
-        "undefined",
-        "unescape",
-        "yield_control",
-    ];
-    for g in &globals {
-        assert!(
-            expected.contains(&g.as_str()),
-            "unexpected global {g} in {globals:?}"
-        );
-    }
 
     Ok(())
 }
@@ -4888,8 +5527,7 @@ async fn code_mode_uses_the_first_dynamic_tool_for_a_normalized_name() -> Result
         test.codex = new_thread.thread;
         test.session_configured = new_thread.session_configured;
 
-        let first_mock = responses::mount_sse_once(
-            &server,
+        let first_response = if use_responses_lite {
             sse(vec![
                 ev_response_created("resp-1"),
                 ev_custom_tool_call(
@@ -4907,31 +5545,39 @@ text(JSON.stringify({
 "#,
                 ),
                 ev_completed("resp-1"),
-            ]),
-        )
-        .await;
-        let second_mock = responses::mount_sse_once(
-            &server,
+            ])
+        } else {
             sse(vec![
                 ev_assistant_message("msg-1", "done"),
-                ev_completed("resp-2"),
-            ]),
-        )
-        .await;
+                ev_completed("resp-1"),
+            ])
+        };
+        let first_mock = responses::mount_sse_once(&server, first_response).await;
+        let second_mock = if use_responses_lite {
+            Some(
+                responses::mount_sse_once(
+                    &server,
+                    sse(vec![
+                        ev_assistant_message("msg-1", "done"),
+                        ev_completed("resp-2"),
+                    ]),
+                )
+                .await,
+            )
+        } else {
+            None
+        };
 
         let cwd = test.config.cwd.clone();
         let (sandbox_policy, permission_profile) =
             turn_permission_fields(PermissionProfile::Disabled, cwd.as_path());
         test.codex
-            .submit(Op::UserInput {
-                items: vec![UserInput::Text {
+            .start_or_steer_turn(
+                TurnInputRequest::user_input(vec![UserInput::Text {
                     text: "inspect and call normalized dynamic tools".to_string(),
                     text_elements: Vec::new(),
-                }],
-                final_output_json_schema: None,
-                responsesapi_client_metadata: None,
-                additional_context: Default::default(),
-                thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                }])
+                .with_thread_settings(ThreadSettingsOverrides {
                     environments: Some(codex_protocol::protocol::TurnEnvironmentSelections::new(
                         cwd,
                         Vec::new(),
@@ -4939,17 +5585,17 @@ text(JSON.stringify({
                     approval_policy: Some(AskForApproval::Never),
                     sandbox_policy: Some(sandbox_policy),
                     permission_profile,
-                    collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                        mode: codex_protocol::config_types::ModeKind::Default,
-                        settings: codex_protocol::config_types::Settings {
+                    collaboration_mode: Some(CollaborationMode {
+                        mode: ModeKind::Default,
+                        settings: Settings {
                             model: test.session_configured.model.clone(),
                             reasoning_effort: None,
                             developer_instructions: None,
                         },
                     }),
                     ..Default::default()
-                },
-            })
+                }),
+            )
             .await?;
 
         let turn_id = wait_for_event_match(&test.codex, |event| match event {
@@ -4957,25 +5603,27 @@ text(JSON.stringify({
             _ => None,
         })
         .await;
-        let request = wait_for_event_match(&test.codex, |event| match event {
-            EventMsg::DynamicToolCallRequest(request) => Some(request.clone()),
-            _ => None,
-        })
-        .await;
-        assert_eq!(request.namespace, None);
-        assert_eq!(request.tool, "foo-bar");
-        assert_eq!(request.arguments, serde_json::json!({}));
-        test.codex
-            .submit(Op::DynamicToolResponse {
-                id: request.call_id,
-                response: DynamicToolResponse {
-                    content_items: vec![DynamicToolCallOutputContentItem::InputText {
-                        text: "first-winner".to_string(),
-                    }],
-                    success: true,
-                },
+        if use_responses_lite {
+            let request = wait_for_event_match(&test.codex, |event| match event {
+                EventMsg::DynamicToolCallRequest(request) => Some(request.clone()),
+                _ => None,
             })
-            .await?;
+            .await;
+            assert_eq!(request.namespace, None);
+            assert_eq!(request.tool, "foo-bar");
+            assert_eq!(request.arguments, serde_json::json!({}));
+            test.codex
+                .submit(Op::DynamicToolResponse {
+                    id: request.call_id,
+                    response: DynamicToolResponse {
+                        content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                            text: "first-winner".to_string(),
+                        }],
+                        success: true,
+                    },
+                })
+                .await?;
+        }
         wait_for_event(&test.codex, |event| match event {
             EventMsg::TurnComplete(event) => event.turn_id == turn_id,
             _ => false,
@@ -5055,19 +5703,104 @@ text(JSON.stringify({
         assert!(!exec_description.contains("First normalized dynamic tool."));
         assert!(!exec_description.contains("Shadowed normalized dynamic tool."));
 
-        let request = second_mock.single_request();
-        let output = custom_tool_output_last_non_empty_text(&request, "call-1")
-            .expect("code mode should return normalized tool metadata");
-        let result: Value = serde_json::from_str(&output)?;
-        assert_eq!(result["count"], serde_json::json!(1));
-        assert_eq!(result["name"], serde_json::json!("foo_bar"));
-        assert_eq!(result["output"], serde_json::json!("first-winner"));
-        let description = result["description"]
-            .as_str()
-            .expect("the winning tool should have a description");
-        assert!(description.contains("First normalized dynamic tool."));
-        assert!(!description.contains("Shadowed normalized dynamic tool."));
+        if let Some(second_mock) = second_mock {
+            let request = second_mock.single_request();
+            let output = custom_tool_output_last_non_empty_text(&request, "call-1")
+                .expect("code mode should return normalized tool metadata");
+            let result: Value = serde_json::from_str(&output)?;
+            assert_eq!(result["count"], serde_json::json!(1));
+            assert_eq!(result["name"], serde_json::json!("foo_bar"));
+            assert_eq!(result["output"], serde_json::json!("first-winner"));
+            let description = result["description"]
+                .as_str()
+                .expect("the winning tool should have a description");
+            assert!(description.contains("First normalized dynamic tool."));
+            assert!(!description.contains("Shadowed normalized dynamic tool."));
+        }
     }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_renders_local_refs_in_outbound_exec_description() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let response = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::CodeModeOnly)
+            .expect("code mode only should be enabled");
+    });
+    let base_test = builder.build_with_auto_env(&server).await?;
+    let new_thread = base_test
+        .thread_manager
+        .start_thread(StartThreadOptions {
+            dynamic_tools: vec![DynamicToolSpec::Function(DynamicToolFunctionSpec {
+                name: "boolean_search".to_string(),
+                description: "Search with nested Boolean clauses.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "clauses": {
+                            "type": "array",
+                            "items": { "$ref": "#/$defs/Clause" }
+                        }
+                    },
+                    "$defs": {
+                        "Clause": {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "oneOf": [
+                                        { "type": "string" },
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "clauses": {
+                                                    "type": "array",
+                                                    "items": { "$ref": "#/$defs/Clause" }
+                                                }
+                                            }
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }),
+                defer_loading: false,
+            })],
+            ..StartThreadOptions::new(base_test.config.clone())
+        })
+        .await?;
+    let mut test = base_test;
+    test.codex = new_thread.thread;
+    test.session_configured = new_thread.session_configured;
+
+    test.submit_turn("inspect the tool schema").await?;
+
+    let body = response.single_request().body_json();
+    let exec_description = body["tools"]
+        .as_array()
+        .expect("request should contain tools")
+        .iter()
+        .find_map(|tool| {
+            (tool["name"].as_str() == Some("exec"))
+                .then(|| tool["description"].as_str())
+                .flatten()
+        })
+        .expect("Code Mode exec should remain available");
+    assert!(exec_description.contains("query?: string | { clauses?: Array<"));
 
     Ok(())
 }
@@ -5146,15 +5879,12 @@ text(
         turn_permission_fields(PermissionProfile::Disabled, cwd.as_path());
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "use exec to inspect and call hidden tools".into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(codex_protocol::protocol::TurnEnvironmentSelections::new(
                     cwd,
                     Vec::new(),
@@ -5162,17 +5892,17 @@ text(
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
-                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                    mode: codex_protocol::config_types::ModeKind::Default,
-                    settings: codex_protocol::config_types::Settings {
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
                         model: test.session_configured.model.clone(),
                         reasoning_effort: None,
                         developer_instructions: None,
                     },
                 }),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
 
     let turn_id = wait_for_event_match(&test.codex, |event| match event {
@@ -5246,6 +5976,7 @@ async fn code_mode_excludes_configured_nested_tool_namespaces() -> Result<()> {
 
     let server = responses::start_mock_server().await;
     let mut builder = test_codex().with_config(|config| {
+        config.update_plan_enabled = true;
         let _ = config.features.enable(Feature::CodeMode);
         config.code_mode.excluded_tool_namespaces = vec!["excluded".to_string()];
     });
@@ -5348,6 +6079,7 @@ async fn code_mode_omits_configured_mcp_server_tools() -> Result<()> {
             model.supports_search_tool = false;
         })
         .with_config(move |config| {
+            config.update_plan_enabled = true;
             let _ = config.features.enable(Feature::CodeMode);
             let mut servers = config.mcp_servers.get().clone();
             servers.insert(
@@ -5355,6 +6087,7 @@ async fn code_mode_omits_configured_mcp_server_tools() -> Result<()> {
                 serde_json::from_value(serde_json::json!({
                     "command": rmcp_test_server_bin,
                     "environment_id": environment_id,
+                    "cwd": config.cwd,
                     "omit_tools_from": ["code_mode"],
                 }))
                 .expect("test MCP server config should be valid"),
@@ -5446,6 +6179,7 @@ async fn code_mode_only_keeps_mcp_tools_direct_when_nested_exposure_is_omitted()
                 serde_json::from_value(serde_json::json!({
                     "command": rmcp_test_server_bin,
                     "environment_id": environment_id,
+                    "cwd": config.cwd,
                     "omit_tools_from": ["code_mode"],
                 }))
                 .expect("test MCP server config should be valid"),
@@ -5539,6 +6273,7 @@ async fn code_mode_only_can_call_mcp_tools_hidden_from_direct_and_deferred_expos
                 serde_json::from_value(serde_json::json!({
                     "command": rmcp_test_server_bin,
                     "environment_id": environment_id,
+                    "cwd": config.cwd,
                     "omit_tools_from": ["direct", "deferred"],
                     "supports_parallel_tool_calls": true,
                 }))
