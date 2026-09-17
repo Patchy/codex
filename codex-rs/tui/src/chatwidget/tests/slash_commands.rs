@@ -79,21 +79,6 @@ fn recall_latest_after_clearing(chat: &mut ChatWidget) -> String {
     chat.bottom_pane.composer_text()
 }
 
-fn dispatch_usage_and_expect_refresh(
-    chat: &mut ChatWidget,
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
-) -> u64 {
-    chat.dispatch_command_with_args(SlashCommand::Usage, "daily".to_string(), Vec::new());
-    expect_token_activity_refresh(rx)
-}
-
-fn expect_token_activity_refresh(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>) -> u64 {
-    match rx.try_recv() {
-        Ok(AppEvent::RefreshTokenActivity { request_id }) => request_id,
-        other => panic!("expected token activity refresh request, got {other:?}"),
-    }
-}
-
 fn next_add_to_history_event(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>) -> String {
     loop {
         match rx.try_recv() {
@@ -122,8 +107,8 @@ fn next_copy_selection(
 
 #[tokio::test]
 async fn service_tier_commands_lowercase_catalog_names() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
-    let mut preset = get_available_model(&chat, "gpt-5.4");
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
+    let mut preset = get_available_model(&chat, "gpt-5.5");
     let expected_description = preset
         .service_tiers
         .iter()
@@ -621,7 +606,7 @@ async fn queued_inline_rename_does_not_drain_again_before_turn_started() {
 
 #[tokio::test]
 async fn queued_unknown_slash_reports_error_when_dequeued() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());
     handle_turn_started(&mut chat, "turn-1");
 
@@ -642,6 +627,24 @@ async fn queued_unknown_slash_reports_error_when_dequeued() {
         "expected delayed slash error, got {rendered:?}"
     );
     assert!(chat.input_queue.queued_user_messages.is_empty());
+
+    chat.set_feature_enabled(Feature::Worktrees, /*enabled*/ true);
+    chat.set_local_worktree_operations(/*enabled*/ false);
+    let drain = chat.submit_queued_slash_prompt(UserMessage::from("/worktree extra").into());
+    assert_matches!(drain, QueueDrain::Continue);
+    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+    assert!(drain_insert_history(&mut rx).iter().any(|lines| {
+        lines_to_single_string(lines).contains("Unrecognized command '/worktree'")
+    }));
+
+    chat.set_local_worktree_operations(/*enabled*/ true);
+    let non_git = tempfile::tempdir().unwrap();
+    chat.config.cwd = non_git.path().to_path_buf().abs();
+    let drain = chat.submit_queued_slash_prompt(UserMessage::from("/worktree").into());
+    assert_matches!(drain, QueueDrain::Continue);
+    assert!(drain_insert_history(&mut rx).iter().any(|lines| {
+        lines_to_single_string(lines).contains("Managed worktrees require a local Git repository.")
+    }));
 }
 
 #[tokio::test]
@@ -1402,6 +1405,24 @@ async fn usage_command_with_invalid_view_reports_usage_snapshot() {
 }
 
 #[tokio::test]
+async fn usage_views_open_the_requested_summary_mode() {
+    use crate::analytics::TokenActivityView;
+    for (argument, expected) in [
+        ("daily", TokenActivityView::Daily),
+        ("weekly", TokenActivityView::Weekly),
+        ("cumulative", TokenActivityView::Cumulative),
+    ] {
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+        set_chatgpt_auth(&mut chat);
+        chat.dispatch_command_with_args(SlashCommand::Usage, argument.to_string(), Vec::new());
+        match rx.try_recv().unwrap() {
+            AppEvent::OpenAnalytics { view } => assert_eq!(view, Some(expected)),
+            other => panic!("expected Analytics, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn usage_command_runs_with_backend_auth_without_chatgpt_account_flag() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.update_account_state(
@@ -1411,7 +1432,12 @@ async fn usage_command_runs_with_backend_auth_without_chatgpt_account_flag() {
 
     chat.dispatch_command_with_args(SlashCommand::Usage, "daily".to_string(), Vec::new());
 
-    assert_matches!(rx.try_recv(), Ok(AppEvent::RefreshTokenActivity { .. }));
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::OpenAnalytics {
+            view: Some(crate::analytics::TokenActivityView::Daily)
+        })
+    );
     assert!(!chat.has_chatgpt_account());
 }
 
@@ -1427,310 +1453,14 @@ async fn usage_command_runs_with_backend_auth_from_widget_init() {
 
     chat.dispatch_command_with_args(SlashCommand::Usage, "daily".to_string(), Vec::new());
 
-    assert_matches!(rx.try_recv(), Ok(AppEvent::RefreshTokenActivity { .. }));
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::OpenAnalytics {
+            view: Some(crate::analytics::TokenActivityView::Daily)
+        })
+    );
     assert!(!chat.has_chatgpt_account());
     assert!(chat.has_codex_backend_auth());
-}
-
-#[tokio::test]
-async fn clearing_pending_token_activity_refreshes_discards_late_result() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    set_chatgpt_auth(&mut chat);
-
-    let request_id = dispatch_usage_and_expect_refresh(&mut chat, &mut rx);
-    assert_eq!(
-        chat.pending_token_activity_output()
-            .map(|cell| lines_to_single_string(&cell.display_lines(u16::MAX))),
-        Some("/usage daily\n\n Token activity\n   Loading...\n".to_string()),
-    );
-    assert_eq!(
-        chat.active_cell_transcript_lines(u16::MAX)
-            .map(|lines| lines_to_single_string(&lines)),
-        Some("/usage daily\n\n Token activity\n   Loading...\n".to_string()),
-    );
-
-    chat.clear_pending_token_activity_refreshes();
-
-    assert!(
-        !chat.finish_token_activity_refresh(
-            request_id,
-            Err("stale token activity result".to_string()),
-        )
-    );
-}
-
-#[tokio::test]
-async fn account_state_change_discards_pending_token_activity_refresh() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    set_chatgpt_auth(&mut chat);
-
-    let request_id = dispatch_usage_and_expect_refresh(&mut chat, &mut rx);
-    assert!(chat.pending_token_activity_output().is_some());
-
-    chat.update_account_state(
-        Some(crate::status::StatusAccountDisplay::ChatGpt {
-            email: Some("new-account@example.com".to_string()),
-            plan: None,
-        }),
-        /*plan_type*/ None,
-        /*has_chatgpt_account*/ true,
-        /*has_codex_backend_auth*/ true,
-    );
-
-    assert!(chat.pending_token_activity_output().is_none());
-    assert!(
-        !chat.finish_token_activity_refresh(
-            request_id,
-            Err("stale token activity result".to_string()),
-        )
-    );
-}
-
-#[tokio::test]
-async fn pending_token_activity_refresh_renders_above_composer_snapshot() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    set_chatgpt_auth(&mut chat);
-
-    dispatch_usage_and_expect_refresh(&mut chat, &mut rx);
-
-    let width: u16 = 80;
-    let height = chat.desired_height(width);
-    let backend = VT100Backend::new(width, height);
-    let mut term = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
-    term.set_viewport_area(Rect::new(/*x*/ 0, /*y*/ 0, width, height));
-    term.draw(|f| {
-        chat.render(f.area(), f.buffer_mut());
-    })
-    .unwrap();
-    assert_chatwidget_snapshot!(
-        "pending_token_activity_refresh_renders_above_composer_snapshot",
-        normalize_snapshot_paths(term.backend().vt100().screen().contents())
-    );
-}
-
-#[tokio::test]
-async fn completed_token_activity_refresh_returns_one_history_cell() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    set_chatgpt_auth(&mut chat);
-
-    let request_id = dispatch_usage_and_expect_refresh(&mut chat, &mut rx);
-    assert!(chat.pending_token_activity_output().is_some());
-
-    assert!(
-        chat.finish_token_activity_refresh(
-            request_id,
-            Err("token activity unavailable".to_string()),
-        )
-    );
-    assert!(chat.pending_token_activity_output().is_some());
-    let cell = chat
-        .take_completed_token_activity_output()
-        .expect("completed token activity cell");
-
-    assert!(chat.pending_token_activity_output().is_none());
-    assert_eq!(
-        lines_to_single_string(&cell.display_lines(u16::MAX)),
-        "/usage daily\n\n Token activity\n   Token activity unavailable\n",
-    );
-}
-
-#[tokio::test]
-async fn completed_token_activity_refresh_waits_for_active_stream() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    set_chatgpt_auth(&mut chat);
-
-    let request_id = dispatch_usage_and_expect_refresh(&mut chat, &mut rx);
-    chat.on_agent_message_delta("partial response".to_string());
-    assert!(chat.usage_history_insertion_blocked());
-
-    assert!(
-        chat.finish_token_activity_refresh(
-            request_id,
-            Err("token activity unavailable".to_string()),
-        )
-    );
-    assert_eq!(
-        chat.pending_token_activity_output()
-            .map(|cell| lines_to_single_string(&cell.display_lines(u16::MAX))),
-        Some("/usage daily\n\n Token activity\n   Token activity unavailable\n".to_string()),
-    );
-
-    chat.finalize_turn();
-    assert!(!chat.usage_history_insertion_blocked());
-    assert!(
-        std::iter::from_fn(|| rx.try_recv().ok())
-            .any(|event| matches!(event, AppEvent::CommitPendingUsageOutputAfterStreamShutdown))
-    );
-    assert!(chat.take_completed_token_activity_output().is_some());
-}
-
-#[tokio::test]
-async fn completed_token_activity_refresh_waits_for_queued_stream_consolidation() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    set_chatgpt_auth(&mut chat);
-
-    let request_id = dispatch_usage_and_expect_refresh(&mut chat, &mut rx);
-    chat.on_agent_message_delta("partial response".to_string());
-    chat.finalize_completed_assistant_message(/*message*/ None);
-    assert!(chat.pending_stream_consolidations > 0);
-
-    assert!(
-        chat.finish_token_activity_refresh(
-            request_id,
-            Err("token activity unavailable".to_string()),
-        )
-    );
-    assert!(chat.usage_history_insertion_blocked());
-
-    chat.note_stream_consolidation_completed();
-
-    assert!(!chat.usage_history_insertion_blocked());
-}
-
-#[tokio::test]
-async fn completed_token_activity_refresh_waits_for_active_history_cell() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    set_chatgpt_auth(&mut chat);
-
-    let request_id = dispatch_usage_and_expect_refresh(&mut chat, &mut rx);
-    chat.transcript.active_cell = Some(Box::new(PlainHistoryCell::new(vec![Line::from(
-        "active tool",
-    )])));
-    assert!(
-        chat.finish_token_activity_refresh(
-            request_id,
-            Err("token activity unavailable".to_string()),
-        )
-    );
-    assert!(chat.usage_history_insertion_blocked());
-
-    chat.flush_active_cell();
-
-    assert_matches!(rx.try_recv(), Ok(AppEvent::InsertHistoryCell(_)));
-    assert_matches!(rx.try_recv(), Ok(AppEvent::CommitPendingUsageOutput));
-}
-
-#[tokio::test]
-async fn completed_token_activity_refresh_waits_for_active_hook() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    set_chatgpt_auth(&mut chat);
-    handle_hook_started(
-        &mut chat,
-        hook_run(
-            "post-tool-use:0:/tmp/hooks.json",
-            codex_app_server_protocol::HookEventName::PostToolUse,
-            codex_app_server_protocol::HookRunStatus::Running,
-            "checking output policy",
-            Vec::new(),
-        ),
-    );
-
-    let request_id = dispatch_usage_and_expect_refresh(&mut chat, &mut rx);
-    assert!(
-        chat.finish_token_activity_refresh(
-            request_id,
-            Err("token activity unavailable".to_string()),
-        )
-    );
-    assert!(chat.usage_history_insertion_blocked());
-
-    handle_hook_completed(
-        &mut chat,
-        hook_run(
-            "post-tool-use:0:/tmp/hooks.json",
-            codex_app_server_protocol::HookEventName::PostToolUse,
-            codex_app_server_protocol::HookRunStatus::Completed,
-            "checking output policy",
-            vec![codex_app_server_protocol::HookOutputEntry {
-                kind: codex_app_server_protocol::HookOutputEntryKind::Context,
-                text: "hook context".to_string(),
-            }],
-        ),
-    );
-
-    assert_matches!(rx.try_recv(), Ok(AppEvent::CommitPendingUsageOutput));
-}
-
-#[tokio::test]
-async fn completed_token_activity_refresh_retries_after_plan_item_completion() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    set_chatgpt_auth(&mut chat);
-
-    let request_id = dispatch_usage_and_expect_refresh(&mut chat, &mut rx);
-    let mut controller = crate::streaming::controller::PlanStreamController::new(
-        /*width*/ None,
-        &chat.config.cwd,
-        chat.history_render_mode(),
-    );
-    controller.push("Plan details");
-    chat.plan_stream_controller = Some(controller);
-    assert!(
-        chat.finish_token_activity_refresh(
-            request_id,
-            Err("token activity unavailable".to_string()),
-        )
-    );
-
-    chat.on_plan_item_completed("Plan details".to_string());
-
-    assert!(
-        std::iter::from_fn(|| rx.try_recv().ok())
-            .any(|event| matches!(event, AppEvent::CommitPendingUsageOutputAfterStreamShutdown))
-    );
-}
-
-#[tokio::test]
-async fn pending_token_activity_refresh_keeps_composer_visible_in_short_viewport() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    set_chatgpt_auth(&mut chat);
-    chat.transcript.active_cell = Some(Box::new(PlainHistoryCell::new(
-        std::iter::repeat_n(Line::from("active output"), /*n*/ 20).collect(),
-    )));
-
-    dispatch_usage_and_expect_refresh(&mut chat, &mut rx);
-
-    let width: u16 = 80;
-    let height: u16 = 8;
-    let backend = VT100Backend::new(width, height);
-    let mut term = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
-    term.set_viewport_area(Rect::new(/*x*/ 0, /*y*/ 0, width, height));
-    term.draw(|f| {
-        chat.render(f.area(), f.buffer_mut());
-    })
-    .unwrap();
-
-    assert!(
-        term.backend()
-            .vt100()
-            .screen()
-            .contents()
-            .contains("Ask Codex to do anything")
-    );
-}
-
-#[tokio::test]
-async fn repeated_token_activity_refreshes_keep_only_latest_card() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    set_chatgpt_auth(&mut chat);
-
-    let first_request_id = dispatch_usage_and_expect_refresh(&mut chat, &mut rx);
-
-    chat.dispatch_command_with_args(SlashCommand::Usage, "weekly".to_string(), Vec::new());
-    let second_request_id = expect_token_activity_refresh(&mut rx);
-
-    assert_eq!(
-        chat.pending_token_activity_output()
-            .map(|cell| lines_to_single_string(&cell.display_lines(u16::MAX))),
-        Some("/usage weekly\n\n Token activity\n   Loading...\n".to_string()),
-    );
-    assert!(!chat.finish_token_activity_refresh(
-        first_request_id,
-        Err("stale token activity result".to_string()),
-    ));
-    assert!(chat.finish_token_activity_refresh(
-        second_request_id,
-        Err("token activity unavailable".to_string()),
-    ));
 }
 
 #[tokio::test]
@@ -1819,6 +1549,40 @@ async fn slash_copy_state_tracks_turn_complete_final_reply() {
     assert_eq!(
         chat.last_agent_markdown_text(),
         Some("Final reply **markdown**")
+    );
+}
+
+#[tokio::test]
+async fn slash_copy_picker_uses_completed_commentary_during_active_turn() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    complete_turn_with_message(&mut chat, "turn-1", Some("Previous final response"));
+    handle_turn_started(&mut chat, "active");
+    let commentary = "Here is the command:\n\n```sh\necho current\n```";
+    let current_thread_id = chat.thread_id.map(|id| id.to_string()).unwrap_or_default();
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: current_thread_id,
+            turn_id: "active".to_string(),
+            completed_at_ms: 0,
+            item: AppServerThreadItem::AgentMessage {
+                id: "active-commentary".to_string(),
+                text: commentary.to_string(),
+                phase: Some(MessagePhase::Commentary),
+                memory_citation: None,
+                delivery: None,
+                questions: None,
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+    while rx.try_recv().is_ok() {}
+
+    chat.dispatch_command(SlashCommand::Copy);
+    insta::assert_snapshot!(render_bottom_popup(&chat, /*width*/ 80));
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+    assert_eq!(
+        next_copy_selection(&mut rx),
+        (commentary.to_string(), "Whole response".to_string(),)
     );
 }
 
@@ -2012,6 +1776,175 @@ async fn slash_copy_picker_previews_whole_response_code_blocks_and_blockquotes()
         assert!(popup.contains(expected), "expected {expected:?} in {popup}");
     }
     assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
+}
+
+#[tokio::test]
+async fn slash_copy_picker_copies_status_fields_and_preserves_source_after_copying() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
+    let session_id = "00000000-0000-0000-0000-000000000123";
+    chat.thread_id = Some(ThreadId::from_string(session_id).expect("valid thread ID"));
+    chat.thread_name = Some("Clipboard example".to_string());
+    chat.config.cwd = test_path_buf("/workspace").abs();
+    let directory = chat.config.cwd.display().to_string();
+    chat.dispatch_command(SlashCommand::Status);
+    drain_insert_history(&mut rx);
+
+    // The picker must copy the status that was displayed, not newer widget settings.
+    chat.config.cwd = test_path_buf("/another-workspace").abs();
+    chat.thread_name = Some("New name".to_string());
+    chat.dispatch_command(SlashCommand::Copy);
+    assert_chatwidget_snapshot!(
+        "slash_copy_picker_status_fields",
+        render_bottom_popup(&chat, /*width*/ 100)
+            .replace(&directory, "[[workspace]]")
+            .replace(crate::version::CODEX_CLI_VERSION, "VERSION"),
+    );
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let (whole_status, label) = next_copy_selection(&mut rx);
+    assert_eq!(label, "Whole status");
+    assert_chatwidget_snapshot!(
+        "slash_copy_whole_status",
+        whole_status
+            .replace(&directory, "[[workspace]]")
+            .replace(crate::version::CODEX_CLI_VERSION, "VERSION"),
+    );
+    let expected = [
+        ("Whole status", whole_status.as_str()),
+        ("Model", "gpt-5.5"),
+        ("Directory", directory.as_str()),
+        ("Thread name", "Clipboard example"),
+        ("Session ID", session_id),
+    ];
+    for (index, (label, value)) in expected.into_iter().enumerate() {
+        chat.dispatch_command(SlashCommand::Copy);
+        let shortcut =
+            char::from_digit((index + 1) as u32, /*radix*/ 10).expect("numeric shortcut");
+        chat.handle_key_event(KeyEvent::new(KeyCode::Char(shortcut), KeyModifiers::NONE));
+        assert_eq!(
+            next_copy_selection(&mut rx),
+            (value.to_string(), label.to_string())
+        );
+        chat.copy_selection_with(value, label, |text| {
+            assert_eq!(text, value);
+            Ok(None)
+        });
+        drain_insert_history(&mut rx);
+        assert!(chat.bottom_pane.no_modal_or_popup_active());
+    }
+    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+}
+
+#[tokio::test]
+async fn slash_copy_status_omits_missing_fields_and_copies_full_directory() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    chat.config.cwd = test_path_buf(&format!("/workspace/{}", "nested/".repeat(/*n*/ 20))).abs();
+    let directory = chat.config.cwd.display().to_string();
+    chat.thread_name = Some(String::new());
+    chat.dispatch_command(SlashCommand::Status);
+    drain_insert_history(&mut rx);
+
+    chat.dispatch_command(SlashCommand::Copy);
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(popup.contains("2. Model"));
+    assert!(popup.contains("3. Directory"));
+    assert!(!popup.contains("Thread name"));
+    assert!(!popup.contains("Session ID"));
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+    assert_eq!(
+        next_copy_selection(&mut rx),
+        (directory, "Directory".to_string())
+    );
+}
+
+#[tokio::test]
+async fn slash_copy_status_yields_to_later_turns_and_commands_even_after_refresh() {
+    enum NextTurn {
+        Response,
+        UserTurn,
+        Command,
+        InlineCommand,
+        RejectedInlineCommand,
+        ServiceTier,
+        ShellCommand,
+    }
+    for next in [
+        NextTurn::Response,
+        NextTurn::UserTurn,
+        NextTurn::Command,
+        NextTurn::InlineCommand,
+        NextTurn::RejectedInlineCommand,
+        NextTurn::ServiceTier,
+        NextTurn::ShellCommand,
+    ] {
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+        chat.thread_id = Some(ThreadId::new());
+        complete_turn_with_message(&mut chat, "turn-1", Some("Original reply"));
+        set_chatgpt_auth(&mut chat);
+        chat.dispatch_command(SlashCommand::Status);
+        drain_insert_history(&mut rx);
+        chat.dispatch_command(SlashCommand::Copy);
+        assert!(render_bottom_popup(&chat, /*width*/ 80).contains("1. Whole status"));
+        chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        drain_insert_history(&mut rx);
+
+        match next {
+            NextTurn::Response => {
+                complete_turn_with_message(&mut chat, "turn-2", Some("Next reply"))
+            }
+            NextTurn::UserTurn => chat.submit_user_message(UserMessage::from("Next question")),
+            NextTurn::Command => chat.dispatch_command(SlashCommand::Pwd),
+            NextTurn::InlineCommand => chat.dispatch_command_with_args(
+                SlashCommand::Rename,
+                "Renamed thread".to_string(),
+                Vec::new(),
+            ),
+            NextTurn::RejectedInlineCommand => {
+                handle_turn_started(&mut chat, "turn-2");
+                chat.dispatch_command_with_args(SlashCommand::Cd, "/tmp".to_string(), Vec::new());
+            }
+            NextTurn::ServiceTier => chat.handle_service_tier_command_dispatch(fast_tier_command()),
+            NextTurn::ShellCommand => chat.submit_user_message(UserMessage::from("!echo hello")),
+        }
+        chat.finish_status_rate_limit_refresh(/*request_id*/ 0, Vec::new());
+        drain_insert_history(&mut rx);
+        chat.dispatch_command(SlashCommand::Copy);
+        chat.handle_key_event(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        let expected = if matches!(next, NextTurn::Response) {
+            "Next reply"
+        } else {
+            "Original reply"
+        };
+        assert_eq!(
+            next_copy_selection(&mut rx),
+            (expected.to_string(), "Whole response".to_string())
+        );
+    }
+}
+
+#[tokio::test]
+async fn slash_copy_status_yields_to_queued_commands_after_queued_status() {
+    for command in ["/rename Queued rename", "!echo hello"] {
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+        chat.thread_id = Some(ThreadId::new());
+        handle_turn_started(&mut chat, "turn-1");
+        queue_composer_text_with_tab(&mut chat, "/status");
+        queue_composer_text_with_tab(&mut chat, command);
+        complete_turn_with_message(&mut chat, "turn-1", Some("Original reply"));
+        let history = drain_insert_history(&mut rx);
+        assert!(
+            history
+                .iter()
+                .any(|lines| lines_to_single_string(lines).contains("/status"))
+        );
+        assert!(chat.input_queue.queued_user_messages.is_empty());
+
+        chat.dispatch_command(SlashCommand::Copy);
+        chat.handle_key_event(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        assert_eq!(
+            next_copy_selection(&mut rx),
+            ("Original reply".to_string(), "Whole response".to_string())
+        );
+    }
 }
 
 #[tokio::test]
@@ -2247,7 +2180,7 @@ async fn slash_export_opens_destination_picker() {
     }
     chat.add_error_message("Copy failed: clipboard unavailable".to_string());
     chat.add_error_message("Export failed: missing parent".to_string());
-    let cells = drain_insert_history(&mut rx);
+    let cells = drain_insert_history_normalized(&mut rx);
     assert_chatwidget_snapshot!(
         "slash_export_completion_message",
         cells
@@ -2432,7 +2365,7 @@ async fn copy_shortcut_can_be_remapped() {
 }
 
 #[tokio::test]
-async fn slash_copy_stores_clipboard_lease_and_preserves_it_on_failure() {
+async fn slash_copy_preserves_native_lease_after_terminal_copy_or_failure() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.transcript.last_agent_markdown = Some("copy me".to_string());
 
@@ -2449,6 +2382,11 @@ async fn slash_copy_stores_clipboard_lease_and_preserves_it_on_failure() {
         rendered.contains("Copied last message to clipboard"),
         "expected success message, got {rendered:?}"
     );
+
+    chat.copy_last_agent_markdown_with(|_| Ok(None));
+    assert!(chat.clipboard_lease.is_some());
+    let rendered = lines_to_single_string(&drain_insert_history(&mut rx)[0]);
+    assert!(rendered.contains("Copied last message to clipboard"));
 
     chat.copy_last_agent_markdown_with(|markdown| {
         assert_eq!(markdown, "copy me");
@@ -2471,6 +2409,11 @@ async fn slash_copy_stores_clipboard_lease_and_preserves_it_on_failure() {
     assert!(chat.clipboard_lease.is_some());
     let rendered = lines_to_single_string(&drain_insert_history(&mut rx)[0]);
     assert!(rendered.contains("Copied python code to clipboard"));
+
+    chat.copy_selection_with("terminal copy", "code", |_| Ok(None));
+    assert!(chat.clipboard_lease.is_some());
+    let rendered = lines_to_single_string(&drain_insert_history(&mut rx)[0]);
+    assert!(rendered.contains("Copied code to clipboard"));
 
     chat.copy_selection_with("print('blocked')\n", "python code", |content| {
         assert_eq!(content, "print('blocked')\n");
@@ -2885,20 +2828,32 @@ async fn slash_archive_confirmation_requests_current_thread_archive() {
 
 #[tokio::test]
 async fn slash_delete_confirmation_requests_current_thread_delete() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-
-    chat.dispatch_command(SlashCommand::Delete);
-
-    assert!(chat.bottom_pane.has_active_view());
-    assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
-
-    let popup = render_bottom_popup(&chat, /*width*/ 80);
-    assert_chatwidget_snapshot!("slash_delete_confirmation_popup", popup);
-
-    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
-    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
-
-    assert_matches!(rx.try_recv(), Ok(AppEvent::DeleteCurrentThread));
+    let endpoint = crate::resolve_remote_addr("ws://127.0.0.1:4500").unwrap();
+    for target in [
+        crate::AppServerTarget::Embedded,
+        crate::AppServerTarget::LocalDaemon {
+            allow_embedded_fallback: true,
+            endpoint: endpoint.clone(),
+        },
+        crate::AppServerTarget::Remote { endpoint },
+    ] {
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+        chat.remote_connection = crate::status::remote_connection::remote_connection_status_value(
+            &target, /*server_version*/ None,
+        );
+        chat.dispatch_command(SlashCommand::Delete);
+        assert!(chat.bottom_pane.has_active_view());
+        assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
+        let popup = render_bottom_popup(&chat, /*width*/ 80);
+        if matches!(target, crate::AppServerTarget::Embedded) {
+            assert_chatwidget_snapshot!("slash_delete_confirmation_popup", popup);
+        } else {
+            assert_chatwidget_snapshot!("slash_delete_confirmation_command_center", popup);
+        }
+        chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+        chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_matches!(rx.try_recv(), Ok(AppEvent::DeleteCurrentThread));
+    }
 }
 
 #[tokio::test]
@@ -3361,6 +3316,39 @@ async fn user_turn_carries_service_tier_after_fast_toggle() {
             ..
         } if service_tier == ServiceTier::Fast.request_value() => {}
         other => panic!("expected Op::UserTurn with fast service tier, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn user_turn_preserves_flex_without_catalog_support() {
+    for fast_mode_enabled in [false, true] {
+        let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+        chat.thread_id = Some(ThreadId::new());
+        set_chatgpt_auth(&mut chat);
+        let mut models = chat.model_catalog.try_list_models().expect("test catalog");
+        for model in &mut models {
+            model.service_tiers.clear();
+            model.default_service_tier = None;
+        }
+        chat.model_catalog = std::sync::Arc::new(ModelCatalog::new(models));
+        chat.set_feature_enabled(Feature::FastMode, fast_mode_enabled);
+        chat.set_service_tier(Some(ServiceTier::Flex.request_value().to_string()));
+
+        assert_eq!(
+            chat.current_service_tier(),
+            Some(ServiceTier::Flex.request_value())
+        );
+        chat.bottom_pane
+            .set_composer_text("hello".to_string(), Vec::new(), Vec::new());
+        chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+        let Op::UserTurn { service_tier, .. } = next_submit_op(&mut op_rx) else {
+            panic!("expected a user turn");
+        };
+        assert_eq!(
+            service_tier,
+            Some(Some(ServiceTier::Flex.request_value().to_string()))
+        );
     }
 }
 

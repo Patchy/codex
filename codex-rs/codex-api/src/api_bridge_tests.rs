@@ -52,21 +52,29 @@ fn map_api_error_preserves_retry_delay() {
 }
 
 #[test]
-fn map_api_error_maps_server_overloaded_from_503_body() {
-    let body = serde_json::json!({
-        "error": {
-            "code": "server_is_overloaded"
-        }
-    })
-    .to_string();
-    let err = map_api_error(ApiError::Transport(TransportError::Http {
-        status: http::StatusCode::SERVICE_UNAVAILABLE,
-        url: Some("http://example.com/v1/responses".to_string()),
-        headers: None,
-        body: Some(body),
-    }));
-
-    assert!(matches!(err.details(), CodexErrorDetails::ServerOverloaded));
+fn map_api_error_distinguishes_capacity_from_slow_down() {
+    for (code, expected, retryable) in [
+        (
+            "server_is_overloaded",
+            CodexErrorInfo::ServerOverloaded,
+            false,
+        ),
+        ("slow_down", CodexErrorInfo::RateLimitExceeded, true),
+        ("unknown_error", CodexErrorInfo::Other, true),
+    ] {
+        let err = map_api_error(ApiError::Transport(TransportError::Http {
+            status: http::StatusCode::SERVICE_UNAVAILABLE,
+            url: None,
+            headers: None,
+            body: Some(
+                serde_json::json!({"error": {"code": code, "message": "retry later"}}).to_string(),
+            ),
+        }));
+        assert_eq!(
+            (err.to_codex_protocol_error(), err.is_retryable()),
+            (expected, retryable)
+        );
+    }
 }
 
 #[test]
@@ -320,6 +328,36 @@ fn map_api_error_keeps_unknown_400_errors_generic() {
         panic!("expected CodexErrorDetails::InvalidRequest, got {err:?}");
     };
     assert_eq!(message, &body);
+}
+
+#[test]
+fn map_api_error_distinguishes_http_quota_errors_from_rate_limits() {
+    for error in [
+        serde_json::json!({"type": "insufficient_quota"}),
+        serde_json::json!({"code": "insufficient_quota"}),
+        serde_json::json!({"code": "credit_balance_exhausted"}),
+        serde_json::json!({"code": "organization_spend_limit_exceeded"}),
+        serde_json::json!({"code": "project_spend_limit_exceeded"}),
+        serde_json::json!({"code": "organization_usage_limit_exceeded"}),
+        serde_json::json!({"type": "rate_limit_error", "code": "rate_limit_exceeded"}),
+        serde_json::json!({"type": "rate_limit_error", "code": "slow_down"}),
+    ] {
+        let expected = if error["type"] == "rate_limit_error" {
+            CodexErrorInfo::ResponseTooManyFailedAttempts {
+                http_status_code: Some(429),
+            }
+        } else {
+            CodexErrorInfo::UsageLimitExceeded
+        };
+        let err = map_api_error(ApiError::Transport(TransportError::Http {
+            status: http::StatusCode::TOO_MANY_REQUESTS,
+            url: None,
+            headers: None,
+            body: Some(serde_json::json!({"error": error}).to_string()),
+        }));
+
+        assert_eq!(err.to_codex_protocol_error(), expected, "{error}");
+    }
 }
 
 #[test]

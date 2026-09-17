@@ -552,12 +552,7 @@ async fn execute_verified_patch(
 ) -> Result<String, FunctionCallError> {
     let cwd = action.cwd.clone();
     let sandbox_context = turn_environment.sandbox_context(/*additional_permissions*/ None);
-    let Some(policy_context) = file_system_sandbox_policy_context_for_cwd(&sandbox_context, &cwd)
-    else {
-        return Err(FunctionCallError::RespondToModel(
-            "apply_patch requires an executor cwd".to_string(),
-        ));
-    };
+    let policy_context = file_system_sandbox_policy_context_for_cwd(&sandbox_context, &cwd);
     let sandbox_route = if turn_environment.environment.is_remote() {
         PatchSandboxRoute::ExecutorManaged
     } else {
@@ -589,6 +584,7 @@ async fn execute_verified_patch(
     let event_ctx = ToolEventCtx::new(
         tool_ctx.session.as_ref(),
         tool_ctx.step_context.turn.as_ref(),
+        &tool_ctx.step_context.settings.model_info,
         &tool_ctx.call_id,
         tracker,
     );
@@ -616,6 +612,7 @@ async fn execute_verified_patch(
     let event_ctx = ToolEventCtx::new(
         tool_ctx.session.as_ref(),
         tool_ctx.step_context.turn.as_ref(),
+        &tool_ctx.step_context.settings.model_info,
         &tool_ctx.call_id,
         tracker,
     );

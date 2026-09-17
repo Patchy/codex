@@ -1,5 +1,6 @@
 use crate::FeatureConfig;
 use crate::FeatureToml;
+use codex_network_proxy::CredentialProviderConfig;
 use codex_protocol::openai_models::ReasoningEffort;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -126,9 +127,13 @@ pub struct GuardianV2ReviewScopeConfigToml {
 pub struct GuardianV2ConfigToml {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
-    /// Route Guardian review and classification through the unmetered Codex endpoints.
+    /// Legacy setting retained for config compatibility; the backend now controls Guardian billing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub free_guardian: Option<bool>,
+    /// Use thread-owned context for sync and async Guardian. Defaults to false.
+    /// Independent of the Guardian v2 `enabled` toggle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_context: Option<bool>,
     /// Persist reviewed actions and risk scores to rollout files for debugging.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub persist_scores: Option<bool>,
@@ -474,6 +479,8 @@ pub struct NetworkProxyConfigToml {
     pub allow_local_binding: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential_broker: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<BTreeMap<String, CredentialProviderConfig>>,
 }
 
 impl FeatureConfig for NetworkProxyConfigToml {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::context::GuardianContextMode;
 
 use super::tests::build_world_state_from_turn_context;
 use super::tests::make_session_and_context;
@@ -17,6 +18,7 @@ use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::SessionContextWindow;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
+use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::protocol::WorldStateItem;
 use codex_protocol::security_risk::SecurityRiskScore;
 use codex_rollout::ModelContextScan;
@@ -28,6 +30,78 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use test_case::test_case;
 use uuid::Uuid;
+
+#[tokio::test]
+async fn sender_context_follows_its_delivery_through_checkpoint_and_rollback() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    session.guardian_context_mode = GuardianContextMode::ThreadOwned;
+    let mut live = ContextManager::with_guardian_context_mode(
+        GuardianContextMode::ThreadOwned,
+        &SessionSource::default(),
+    );
+    let mut items = Vec::new();
+    let mut snapshots = Vec::new();
+    for index in 0..2 {
+        // A and then B are accepted before either is consumed.
+        let acceptance_order = Some(live.reserve_input_order());
+        let steer_order = Some(live.reserve_input_order());
+        let snapshot = codex_history::SenderUserMessages {
+            receiver_turn_id: format!("turn-{index}"),
+            receiver_message_id: format!("delivery-{index}"),
+            text: format!("Sender context {index}"),
+        };
+        let input = [
+            ResponseItemEnvelope {
+                item: serde_json::from_value::<ResponseItem>(json!({
+                    "type": "function_call_output", "id": snapshot.receiver_message_id,
+                    "name": "send_message_to_thread", "namespace": "codex_app", "output": "Inspect."
+                }))
+                .unwrap(),
+                metadata: Some(codex_history::CodexHarnessMetadata {
+                    user_input_order: acceptance_order,
+                    sender_user_messages: Some(Box::new(snapshot.clone())),
+                    ..Default::default()
+                }),
+            },
+            ResponseItemEnvelope {
+                item: user_message("Later user steer B."),
+                metadata: Some(codex_history::CodexHarnessMetadata {
+                    user_input_order: steer_order,
+                    ..Default::default()
+                }),
+            },
+        ];
+        live.record_annotated_items(&input, turn_context.model_info().truncation_policy.into());
+        items.extend(input.into_iter().map(RolloutItem::ResponseItem));
+        snapshots.push(snapshot);
+    }
+    let mut checkpoint: CompactedItem =
+        serde_json::from_value(json!({"message": "compacted"})).unwrap();
+    checkpoint.replacement_history = Some(live.annotated_items().to_vec());
+    checkpoint.retained_context = Some(live.retained_context().clone());
+    let mut checkpointed = items.clone();
+    checkpointed.push(RolloutItem::Compacted(checkpoint));
+    for (num_turns, expected) in [(1, &snapshots[1]), (2, &snapshots[0])] {
+        let mut rolled_back = live.clone();
+        rolled_back.drop_last_n_user_turns(num_turns);
+        assert_eq!(
+            rolled_back.retained_context().sender_user_messages(),
+            Some(expected)
+        );
+        for history in [items.clone(), checkpointed.clone()] {
+            let mut history: Vec<RolloutItem> =
+                serde_json::from_value(serde_json::to_value(history).unwrap()).unwrap();
+            history.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+                ThreadRolledBackEvent { num_turns },
+            )));
+            let replayed = session
+                .reconstruct_history_from_rollout(&turn_context, &history)
+                .await;
+            assert_eq!(replayed.retained_context, *rolled_back.retained_context());
+            assert_eq!(replayed.history, rolled_back.annotated_items());
+        }
+    }
+}
 
 macro_rules! object {
     ($value:tt) => {
@@ -94,6 +168,7 @@ fn completed_user_turn_rollout(
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: turn_id.clone(),
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),
@@ -266,6 +341,7 @@ async fn record_initial_history_resumed_bare_turn_context_does_not_hydrate_previ
     let previous_context_item = TurnContextItem {
         turn_id: Some(turn_context.sub_id.clone()),
         root_turn_id: None,
+        disabled_plugin_ids: None,
         #[allow(deprecated)]
         cwd: turn_context.cwd.clone(),
         workspace_roots: None,
@@ -316,6 +392,7 @@ async fn record_initial_history_resumed_hydrates_previous_turn_settings_from_lif
     let mut previous_context_item = TurnContextItem {
         turn_id: Some(turn_context.sub_id.clone()),
         root_turn_id: None,
+        disabled_plugin_ids: None,
         #[allow(deprecated)]
         cwd: turn_context.cwd.clone(),
         workspace_roots: None,
@@ -349,6 +426,7 @@ async fn record_initial_history_resumed_hydrates_previous_turn_settings_from_lif
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: turn_id.clone(),
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),
@@ -421,6 +499,7 @@ async fn reconstruct_history_rollback_keeps_history_and_metadata_in_sync_for_com
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: first_turn_id.clone(),
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),
@@ -457,6 +536,7 @@ async fn reconstruct_history_rollback_keeps_history_and_metadata_in_sync_for_com
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: rolled_back_turn_id.clone(),
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),
@@ -541,6 +621,7 @@ async fn reconstruct_history_rollback_keeps_history_and_metadata_in_sync_for_inc
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: first_turn_id.clone(),
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),
@@ -574,6 +655,7 @@ async fn reconstruct_history_rollback_keeps_history_and_metadata_in_sync_for_inc
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: incomplete_turn_id,
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),
@@ -640,6 +722,7 @@ async fn reconstruct_history_rollback_skips_non_user_turns_for_history_and_metad
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: first_turn_id.clone(),
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),
@@ -673,6 +756,7 @@ async fn reconstruct_history_rollback_skips_non_user_turns_for_history_and_metad
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: second_turn_id.clone(),
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),
@@ -705,6 +789,7 @@ async fn reconstruct_history_rollback_skips_non_user_turns_for_history_and_metad
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: standalone_turn_id.clone(),
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),
@@ -777,6 +862,7 @@ async fn reconstruct_history_rollback_counts_inter_agent_assistant_turns() {
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: first_turn_id.clone(),
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),
@@ -810,6 +896,7 @@ async fn reconstruct_history_rollback_counts_inter_agent_assistant_turns() {
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: assistant_turn_id.clone(),
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),
@@ -874,6 +961,7 @@ async fn reconstruct_history_rollback_clears_history_and_metadata_when_exceeding
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: only_turn_id.clone(),
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),
@@ -931,6 +1019,7 @@ async fn record_initial_history_resumed_rollback_skips_only_user_turns() {
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: user_turn_id.clone(),
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),
@@ -963,6 +1052,7 @@ async fn record_initial_history_resumed_rollback_skips_only_user_turns() {
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: standalone_turn_id.clone(),
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),
@@ -1011,6 +1101,7 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: previous_turn_id.clone(),
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),
@@ -1042,6 +1133,7 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: incomplete_turn_id,
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),
@@ -1553,6 +1645,7 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_clear
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: current_turn_id.clone(),
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),
@@ -1598,6 +1691,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
     let previous_context_item = TurnContextItem {
         turn_id: Some(turn_context.sub_id.clone()),
         root_turn_id: Some("root-turn".to_string()),
+        disabled_plugin_ids: None,
         #[allow(deprecated)]
         cwd: turn_context.cwd.clone(),
         workspace_roots: None,
@@ -1629,6 +1723,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: previous_turn_id.clone(),
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),
@@ -1695,6 +1790,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
         serde_json::to_value(Some(TurnContextItem {
             turn_id: Some(turn_context.sub_id.clone()),
             root_turn_id: Some("root-turn".to_string()),
+            disabled_plugin_ids: None,
             #[allow(deprecated)]
             cwd: turn_context.cwd.clone(),
             workspace_roots: None,
@@ -1730,6 +1826,7 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
     let previous_context_item = TurnContextItem {
         turn_id: Some(turn_context.sub_id.clone()),
         root_turn_id: None,
+        disabled_plugin_ids: None,
         #[allow(deprecated)]
         cwd: turn_context.cwd.clone(),
         workspace_roots: None,
@@ -1763,6 +1860,7 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: previous_turn_id.clone(),
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),
@@ -1794,6 +1892,7 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: aborted_turn_id,
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),
@@ -1868,6 +1967,7 @@ async fn record_initial_history_resumed_unmatched_abort_preserves_active_turn_fo
     let current_context_item = TurnContextItem {
         turn_id: Some(current_turn_id.clone()),
         root_turn_id: None,
+        disabled_plugin_ids: None,
         #[allow(deprecated)]
         cwd: turn_context.cwd.clone(),
         workspace_roots: None,
@@ -1896,6 +1996,7 @@ async fn record_initial_history_resumed_unmatched_abort_preserves_active_turn_fo
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: previous_turn_id.clone(),
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),
@@ -1927,6 +2028,7 @@ async fn record_initial_history_resumed_unmatched_abort_preserves_active_turn_fo
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: current_turn_id.clone(),
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),
@@ -1998,6 +2100,7 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
     let previous_context_item = TurnContextItem {
         turn_id: Some(turn_context.sub_id.clone()),
         root_turn_id: None,
+        disabled_plugin_ids: None,
         #[allow(deprecated)]
         cwd: turn_context.cwd.clone(),
         workspace_roots: None,
@@ -2031,6 +2134,7 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: previous_turn_id.clone(),
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),
@@ -2062,6 +2166,7 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: incomplete_turn_id,
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),
@@ -2125,6 +2230,7 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_preserves_turn_
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: current_turn_id,
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),
@@ -2176,6 +2282,7 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
     let previous_context_item = TurnContextItem {
         turn_id: Some(turn_context.sub_id.clone()),
         root_turn_id: None,
+        disabled_plugin_ids: None,
         #[allow(deprecated)]
         cwd: turn_context.cwd.clone(),
         workspace_roots: None,
@@ -2210,6 +2317,7 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: previous_turn_id.clone(),
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),
@@ -2241,6 +2349,7 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: compacted_incomplete_turn_id,
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),
@@ -2275,6 +2384,7 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: replacing_turn_id,
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),

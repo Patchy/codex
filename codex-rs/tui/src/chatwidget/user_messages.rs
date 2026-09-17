@@ -14,11 +14,13 @@ use std::path::PathBuf;
 use crate::bottom_pane::LocalImageAttachment;
 use crate::bottom_pane::MentionBinding;
 use crate::bottom_pane::QueuedInputAction;
+use codex_app_server_protocol::ImageReference;
 use codex_app_server_protocol::TextElement as AppServerTextElement;
 use codex_app_server_protocol::UserInput;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::models::local_image_label_text;
+use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::user_input::ByteRange;
 use codex_protocol::user_input::TextElement;
 use codex_utils_plugins::mention_syntax::PLUGIN_TEXT_MENTION_SIGIL;
@@ -58,11 +60,18 @@ pub(super) enum ShellEscapePolicy {
     Disallow,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum UserMessageSource {
+    Prompt,
+    QuestionAnswer,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct QueuedUserMessage {
     pub(super) user_message: UserMessage,
     pub(super) action: QueuedInputAction,
     pub(super) pending_pastes: Vec<(String, String)>,
+    pub(super) source: UserMessageSource,
 }
 
 impl QueuedUserMessage {
@@ -71,6 +80,7 @@ impl QueuedUserMessage {
             user_message,
             action,
             pending_pastes: Vec::new(),
+            source: UserMessageSource::Prompt,
         }
     }
 
@@ -125,8 +135,10 @@ pub(crate) struct ThreadInputState {
     pub(crate) questions: Option<crate::bottom_pane::QuestionState>,
     pub(super) composer: Option<ThreadComposerState>,
     pub(super) safety_buffering_prompt: Option<UserMessage>,
+    pub(super) safety_buffering_source: UserMessageSource,
     pub(crate) pending_steers: VecDeque<PendingSteer>,
     pub(super) rejected_steers_queue: VecDeque<UserMessage>,
+    pub(super) rejected_steer_sources: VecDeque<UserMessageSource>,
     pub(super) rejected_steer_history_records: VecDeque<UserMessageHistoryRecord>,
     pub(super) queued_user_messages: VecDeque<QueuedUserMessage>,
     pub(super) queued_user_message_history_records: VecDeque<UserMessageHistoryRecord>,
@@ -135,6 +147,7 @@ pub(crate) struct ThreadInputState {
     pub(super) submit_pending_steers_after_interrupt: bool,
     pub(super) current_collaboration_mode: CollaborationMode,
     pub(super) active_collaboration_mask: Option<CollaborationModeMask>,
+    pub(super) plan_mode_reasoning_effort: Option<ReasoningEffortConfig>,
     pub(super) task_running: bool,
     pub(super) agent_turn_running: bool,
 }
@@ -176,6 +189,7 @@ pub(crate) struct PendingSteer {
     pub(crate) client_id: String,
     pub(super) user_message: UserMessage,
     pub(super) history_record: UserMessageHistoryRecord,
+    pub(super) source: UserMessageSource,
     pub(super) compare_key: PendingSteerCompareKey,
 }
 
@@ -728,6 +742,20 @@ impl ChatWidget {
         {
             tracing::warn!("audio user inputs are not supported by the TUI and will be omitted");
         }
+        // TODO(kc) preserve file-backed images when the TUI can resolve or replay them.
+        if items.iter().any(|item| {
+            matches!(
+                item,
+                UserInput::Image {
+                    image: ImageReference::File { .. },
+                    ..
+                }
+            )
+        }) {
+            tracing::warn!(
+                "file-backed image inputs are not supported by the TUI and will be omitted"
+            );
+        }
         let mut message = String::new();
         let mut remote_image_urls = Vec::new();
         let mut local_images = Vec::new();
@@ -754,7 +782,14 @@ impl ChatWidget {
                         )
                     }),
                 ),
-                UserInput::Image { url, .. } => remote_image_urls.push(url.clone()),
+                UserInput::Image {
+                    image: ImageReference::Inline { url },
+                    ..
+                } => remote_image_urls.push(url.clone()),
+                UserInput::Image {
+                    image: ImageReference::File { .. },
+                    ..
+                } => {}
                 UserInput::LocalImage { path, .. } => local_images.push(path.clone()),
                 UserInput::Audio { .. } // TODO: Include audio inputs in the user message display.
                 | UserInput::LocalAudio { .. } // TODO: Include audio inputs in the user message display.

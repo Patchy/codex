@@ -1,6 +1,14 @@
 use anyhow::Context;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use codex_attachment_store::AttachmentStore;
+use codex_attachment_store::AttachmentStoreError;
+use codex_attachment_store::AttachmentStoreErrorKind;
+use codex_attachment_store::ResolveFuture;
+use codex_attachment_store::ResolveRequest;
+use codex_attachment_store::UploadFuture;
+use codex_attachment_store::UploadRequest;
+use codex_attachment_store::UploadResult;
 use codex_core::TurnInputRequest;
 use codex_features::Feature;
 use codex_history::RolloutItem;
@@ -10,6 +18,7 @@ use codex_protocol::config_types::Settings;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::ImageDetail;
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
@@ -41,7 +50,37 @@ use pretty_assertions::assert_eq;
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
+
+const UPLOADED_FILE_ID: &str = "file_uploaded_image";
+
+#[derive(Default)]
+pub(super) struct RecordingFileAttachmentStore {
+    pub(super) uploads: Mutex<Vec<UploadRequest>>,
+}
+
+impl AttachmentStore for RecordingFileAttachmentStore {
+    fn upload(&self, request: UploadRequest) -> UploadFuture<'_> {
+        self.uploads.lock().expect("uploads lock").push(request);
+        Box::pin(async {
+            Ok(UploadResult::File {
+                file_id: UPLOADED_FILE_ID.to_string(),
+            })
+        })
+    }
+
+    fn resolve<'a>(&'a self, request: ResolveRequest<'a>) -> ResolveFuture<'a> {
+        let file_id = request.file_id;
+        Box::pin(async move {
+            Err(AttachmentStoreError::new(
+                AttachmentStoreErrorKind::NotFound,
+                format!("attachment `{file_id}` was not found"),
+            ))
+        })
+    }
+}
 
 fn find_user_message_with_image(text: &str) -> Option<ResponseItem> {
     for line in text.lines() {
@@ -69,7 +108,10 @@ fn find_user_message_with_image(text: &str) -> Option<ResponseItem> {
 fn extract_image_url(item: &ResponseItem) -> Option<String> {
     match item {
         ResponseItem::Message { content, .. } => content.iter().find_map(|span| match span {
-            ContentItem::InputImage { image_url, .. } => Some(image_url.clone()),
+            ContentItem::InputImage {
+                image: ImageReference::Inline { image_url },
+                ..
+            } => Some(image_url.clone()),
             _ => None,
         }),
         _ => None,
@@ -178,7 +220,7 @@ async fn copy_paste_local_image_persists_rollout_request_shape() -> anyhow::Resu
                 ),
             },
             ContentItem::InputImage {
-                image_url,
+                image: ImageReference::Inline { image_url },
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
             ContentItem::InputText {
@@ -228,7 +270,9 @@ async fn drag_drop_image_persists_rollout_request_shape() -> anyhow::Result<()> 
         .start_or_steer_turn(
             TurnInputRequest::user_input(vec![
                 UserInput::Image {
-                    image_url: image_url.clone(),
+                    image: ImageReference::Inline {
+                        image_url: image_url.clone(),
+                    },
                     detail: None,
                 },
                 UserInput::Text {
@@ -269,7 +313,7 @@ async fn drag_drop_image_persists_rollout_request_shape() -> anyhow::Result<()> 
         role: "user".to_string(),
         content: vec![
             ContentItem::InputImage {
-                image_url,
+                image: ImageReference::Inline { image_url },
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
             ContentItem::InputText {
@@ -281,6 +325,83 @@ async fn drag_drop_image_persists_rollout_request_shape() -> anyhow::Result<()> 
     };
 
     assert_eq!(strip_response_item_id(strip_metadata(actual)), expected);
+
+    Ok(())
+}
+
+/// Core must forward an opaque file ID and persist that same reference in canonical history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_image_passes_through_request_and_rollout() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let test = test_codex().build_with_auto_env(&server).await?;
+    let response_mock = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-file"),
+            ev_assistant_message("msg-file", "done"),
+            ev_completed("resp-file"),
+        ]),
+    )
+    .await;
+
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![
+            UserInput::Image {
+                image: ImageReference::File {
+                    file_id: "file_123".to_string(),
+                },
+                detail: None,
+            },
+            UserInput::Text {
+                text: "file-backed image".to_string(),
+                text_elements: Vec::new(),
+            },
+        ]))
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let request = response_mock.single_request();
+    assert!(request.input().iter().any(|item| {
+        item.get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|content| {
+                content.iter().any(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("input_image")
+                        && item.get("file_id").and_then(Value::as_str) == Some("file_123")
+                })
+            })
+    }));
+
+    test.codex.shutdown_and_wait().await?;
+    let rollout_path = test.codex.rollout_path().expect("rollout path");
+    let rollout_text = read_rollout_text(&rollout_path).await?;
+    let actual = find_user_message_with_image(&rollout_text)
+        .expect("expected user message with file image in rollout");
+    assert_eq!(
+        strip_response_item_id(strip_metadata(actual)),
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![
+                ContentItem::InputImage {
+                    image: ImageReference::File {
+                        file_id: "file_123".to_string(),
+                    },
+                    detail: Some(DEFAULT_IMAGE_DETAIL),
+                },
+                ContentItem::InputText {
+                    text: "file-backed image".to_string(),
+                },
+            ],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }
+    );
 
     Ok(())
 }
@@ -341,7 +462,9 @@ async fn resumed_history_only_emits_resize_notices_for_new_images() -> anyhow::R
     historical_content.insert(
         /*index*/ 0,
         ContentItem::InputImage {
-            image_url: original_image_url.clone(),
+            image: ImageReference::Inline {
+                image_url: original_image_url.clone(),
+            },
             detail: Some(ImageDetail::High),
         },
     );
@@ -352,12 +475,15 @@ async fn resumed_history_only_emits_resize_notices_for_new_images() -> anyhow::R
         .join("\n");
     fs::write(&rollout_path, format!("{rollout}\n"))?;
 
-    let mut resume_builder = test_codex().with_config(|config| {
-        let _ = config.features.enable(Feature::ImageResizeNotice);
-        let _ = config
-            .features
-            .enable(Feature::RetainClientDeveloperMessages);
-    });
+    let resume_image_store = Arc::new(RecordingFileAttachmentStore::default());
+    let mut resume_builder = test_codex()
+        .with_image_store(resume_image_store.clone())
+        .with_config(|config| {
+            let _ = config.features.enable(Feature::ImageResizeNotice);
+            let _ = config
+                .features
+                .enable(Feature::RetainClientDeveloperMessages);
+        });
     let resumed = resume_builder
         .resume(&server, initial.home.clone(), rollout_path.clone())
         .await?;
@@ -373,7 +499,9 @@ async fn resumed_history_only_emits_resize_notices_for_new_images() -> anyhow::R
     resumed
         .codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Image {
-            image_url: original_image_url.clone(),
+            image: ImageReference::Inline {
+                image_url: original_image_url.clone(),
+            },
             detail: Some(ImageDetail::High),
         }]))
         .await?;
@@ -381,6 +509,16 @@ async fn resumed_history_only_emits_resize_notices_for_new_images() -> anyhow::R
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
+    {
+        let uploads = resume_image_store.uploads.lock().expect("uploads lock");
+        let [upload] = uploads.as_slice() else {
+            panic!("only the new image should be uploaded");
+        };
+        assert_eq!(
+            image::load_from_memory(&upload.data)?.dimensions(),
+            (2048, 768)
+        );
+    }
 
     let request = resumed_mock.single_request();
     assert!(request.has_content_kinds(&["images.resize_notice"]));
@@ -420,6 +558,15 @@ async fn resumed_history_only_emits_resize_notices_for_new_images() -> anyhow::R
         .context("historical image data URL")?;
     let historical_image = image::load_from_memory(&BASE64_STANDARD.decode(encoded_image)?)?;
     assert_eq!(historical_image.dimensions(), (2048, 768));
+    assert_eq!(
+        input[image_message_indices[1]]
+            .get("content")
+            .and_then(Value::as_array)
+            .and_then(|content| content.first())
+            .and_then(|item| item.get("file_id"))
+            .and_then(Value::as_str),
+        Some(UPLOADED_FILE_ID)
+    );
 
     let expected_notice = concat!(
         "<image_resize_notice>\n",
@@ -456,8 +603,17 @@ async fn resumed_history_only_emits_resize_notices_for_new_images() -> anyhow::R
     )
     .await;
     replayed.submit_turn("preserve recorded notices").await?;
-    let replayed_notices = replayed_mock
-        .single_request()
+    let replayed_request = replayed_mock.single_request();
+    assert!(replayed_request.input().iter().any(|item| {
+        item.get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|content| {
+                content.iter().any(|item| {
+                    item.get("file_id").and_then(Value::as_str) == Some(UPLOADED_FILE_ID)
+                })
+            })
+    }));
+    let replayed_notices = replayed_request
         .message_input_texts("developer")
         .into_iter()
         .filter(|text| text.starts_with("<image_resize_notice>"))
@@ -480,7 +636,9 @@ async fn resumed_history_only_emits_resize_notices_for_new_images() -> anyhow::R
             ResponseInputItem::Message {
                 role: "user".to_string(),
                 content: vec![ContentItem::InputImage {
-                    image_url: original_image_url,
+                    image: ImageReference::Inline {
+                        image_url: original_image_url,
+                    },
                     detail: Some(ImageDetail::High),
                 }],
                 phase: None,

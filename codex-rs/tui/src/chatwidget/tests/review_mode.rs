@@ -1,4 +1,5 @@
 use super::*;
+use codex_app_server_protocol::ImageReference;
 use pretty_assertions::assert_eq;
 use std::collections::VecDeque;
 
@@ -379,8 +380,10 @@ async fn restore_thread_input_state_restores_pending_steers_without_downgrading_
             questions: None,
             composer: None,
             safety_buffering_prompt: None,
+            safety_buffering_source: UserMessageSource::Prompt,
             pending_steers: VecDeque::from([expected_pending.clone()]),
             rejected_steers_queue,
+            rejected_steer_sources: VecDeque::new(),
             rejected_steer_history_records: VecDeque::new(),
             queued_user_messages,
             queued_user_message_history_records: VecDeque::new(),
@@ -389,6 +392,7 @@ async fn restore_thread_input_state_restores_pending_steers_without_downgrading_
             submit_pending_steers_after_interrupt: false,
             current_collaboration_mode: chat.current_collaboration_mode.clone(),
             active_collaboration_mask: chat.active_collaboration_mask.clone(),
+            plan_mode_reasoning_effort: chat.config.plan_mode_reasoning_effort.clone(),
             task_running: false,
             agent_turn_running: false,
         }),
@@ -644,7 +648,9 @@ async fn item_completed_pops_pending_steer_with_local_image_and_text_elements() 
         "user-1",
         vec![
             UserInput::Image {
-                url: "data:image/png;base64,placeholder".to_string(),
+                image: ImageReference::Inline {
+                    url: "data:image/png;base64,placeholder".to_string(),
+                },
                 detail: None,
             },
             UserInput::Text {

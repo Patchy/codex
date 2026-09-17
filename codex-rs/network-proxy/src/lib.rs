@@ -2,9 +2,11 @@
 
 mod attribution;
 mod authorization_path;
+mod brokered_tunnel;
 mod certs;
 mod config;
 mod connect_policy;
+mod connection_lifecycle;
 mod credential_broker;
 mod environment_policy;
 mod http_proxy;
@@ -23,6 +25,8 @@ mod responses;
 mod runtime;
 mod socks5;
 mod state;
+#[cfg(target_os = "macos")]
+mod system_dns;
 mod upstream;
 #[cfg(target_os = "windows")]
 mod windows_proxy_ingress;
@@ -43,10 +47,17 @@ pub use config::NetworkUnixSocketPermissions;
 pub use config::host_and_port_from_network_addr;
 pub use config::managed_proxy_ports;
 pub use credential_broker::CREDENTIAL_BROKER_ACTIVE_ENV_KEY;
+pub use credential_broker::CredentialAuthMethod;
+pub use credential_broker::CredentialBrokerContext;
+pub use credential_broker::CredentialBrokerEnvironment;
+pub use credential_broker::CredentialProviderConfig;
 pub use credential_broker::brokered_credential_binding_env_keys;
 pub use credential_broker::brokered_credential_dummy_env_keys;
 pub use credential_broker::brokered_credential_env_keys;
+pub use credential_broker::brokered_credential_marker_env_keys;
+pub use credential_broker::brokered_credential_value_env_keys;
 pub use credential_broker::credential_broker_provider_context_env_keys;
+pub use credential_broker::credential_broker_provider_sources_allowed;
 pub use credential_broker::is_credential_broker_provider_env_key;
 pub use environment_policy::EnvironmentNetworkPolicy;
 pub use mitm_hook::InjectedHeaderConfig;
@@ -74,6 +85,7 @@ pub use proxy::Args;
 pub use proxy::CODEX_PROXY_GIT_SSH_COMMAND_MARKER;
 pub use proxy::DEFAULT_NO_PROXY_VALUE;
 pub use proxy::ManagedNetworkSandboxContext;
+pub use proxy::ManagedProxyRouting;
 pub use proxy::NO_PROXY_ENV_KEYS;
 pub use proxy::NetworkProxy;
 pub use proxy::NetworkProxyBuilder;

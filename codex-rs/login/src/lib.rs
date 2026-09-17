@@ -2,6 +2,10 @@ pub mod auth;
 pub mod auth_env_telemetry;
 pub mod test_support;
 pub mod token_data;
+pub use auth::WorkspaceRouting;
+pub use auth::WorkspaceRoutingRequest;
+pub use auth::WorkspaceRoutingResolver;
+pub use auth::WorkspaceRoutingSession;
 
 mod callback_params;
 mod device_code_auth;
@@ -27,6 +31,7 @@ pub use success_page::LoginSuccessPage;
 pub use success_page::LoginSuccessPageBrand;
 
 pub use auth::AgentIdentityAuthPolicy;
+pub use auth::AuthChangeState;
 pub use auth::AuthConfig;
 pub use auth::AuthDotJson;
 pub use auth::AuthHeaders;

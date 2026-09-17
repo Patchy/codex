@@ -39,6 +39,7 @@ pub(crate) const LEGACY_CODE_MODE_TOOL_NAMES_KEY: &str = "code_mode_tool_names";
 pub(crate) const TOOL_NAMESPACES_INFO_KEY: &str = "tool_namespaces_info";
 pub(crate) const TURN_STARTED_AT_UNIX_MS_KEY: &str = "turn_started_at_unix_ms";
 pub(crate) const HISTORY_INGEST_REQUESTED_KEY: &str = "history_ingest_requested";
+pub(crate) const ANALYTICS_ENABLED_KEY: &str = "analytics_enabled";
 
 pub(crate) const FORKED_FROM_THREAD_ID_KEY: &str = "forked_from_thread_id";
 pub(crate) const FORKED_FROM_ORDINAL_EXCLUSIVE_KEY: &str = "forked_from_ordinal_exclusive";
@@ -58,8 +59,7 @@ pub(crate) const WORKSPACES_KEY: &str = "workspaces";
 // App-server clients can specify additional metadata in the `responsesapi_client_metadata` param
 // when submitting a turn, but they must not override fields owned by core.
 const RESERVED_METADATA_KEYS: &[&str] = &[
-    codex_protocol::guardian_ticket::GUARDIAN_TICKET_METADATA_KEY,
-    "guardian_ticket_requested",
+    "guardian_credits_requested",
     INSTALLATION_ID_KEY,
     X_CODEX_INSTALLATION_ID_HEADER,
     SESSION_ID_KEY,
@@ -79,6 +79,7 @@ const RESERVED_METADATA_KEYS: &[&str] = &[
     TOOL_NAMESPACES_INFO_KEY,
     TURN_STARTED_AT_UNIX_MS_KEY,
     HISTORY_INGEST_REQUESTED_KEY,
+    ANALYTICS_ENABLED_KEY,
     FORKED_FROM_THREAD_ID_KEY,
     FORKED_FROM_ORDINAL_EXCLUSIVE_KEY,
     PARENT_THREAD_ID_KEY,
@@ -96,18 +97,20 @@ const RESERVED_METADATA_KEYS: &[&str] = &[
 ];
 // These keys were previously valid user configuration. Accept existing configs while filtering
 // their values before constructing Core-owned request metadata.
-const BACKWARD_COMPATIBLE_RESERVED_METADATA_KEYS: &[&str] =
-    &[WINDOW_NUMBER_KEY, FORKED_FROM_ORDINAL_EXCLUSIVE_KEY];
+const BACKWARD_COMPATIBLE_RESERVED_METADATA_KEYS: &[&str] = &[
+    WINDOW_NUMBER_KEY,
+    FORKED_FROM_ORDINAL_EXCLUSIVE_KEY,
+    ANALYTICS_ENABLED_KEY,
+];
 const MAX_EXTRA_METADATA_ENTRIES: usize = 16;
 const MAX_EXTRA_METADATA_KEY_BYTES: usize = 64;
 pub(crate) const MAX_EXTRA_METADATA_VALUE_BYTES: usize = 128;
 
 /// Metadata attached to model requests whose purpose is conversation compaction.
 ///
-/// This covers both local compaction requests sent through the normal `/responses` path and remote
-/// compaction requests sent through `/responses/compact`. These fields describe the operation at
-/// dispatch time. Post-response outcomes such as status, error, duration, and token deltas remain
-/// in compaction analytics events.
+/// This covers both local and remote compaction requests sent through the `/responses` path. These
+/// fields describe the operation at dispatch time. Post-response outcomes such as status, error,
+/// duration, and token deltas remain in compaction analytics events.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub(crate) struct CompactionTurnMetadata {
     trigger: CompactionTrigger,
@@ -219,8 +222,8 @@ pub(crate) enum TurnToolSource {
 /// truth.
 #[derive(Clone, Debug)]
 pub struct CodexResponsesMetadata {
-    /// Opaque runtime receipt; deliberately omitted from metadata projections.
-    pub(crate) guardian_ticket: Option<codex_protocol::guardian_ticket::GuardianTicket>,
+    /// Guardian parent reference; projected only onto a Guardian request.
+    pub(crate) parent_response_id: Option<String>,
     pub(crate) installation_id: String,
     pub(crate) session_id: String,
     pub(crate) thread_id: String,
@@ -249,6 +252,9 @@ pub struct CodexResponsesMetadata {
     pub(crate) tool_namespaces_info: Option<TurnToolNamespacesInfo>,
     pub(crate) turn_started_at_unix_ms: Option<i64>,
     pub(crate) history_ingest_requested: Option<bool>,
+    /// Selected session analytics client's collection state, independent of event eligibility or delivery.
+    /// Absent when the request has no initialized session analytics context.
+    pub(crate) analytics_enabled: Option<bool>,
     pub(crate) extra: BTreeMap<String, String>,
 }
 
@@ -260,7 +266,7 @@ impl CodexResponsesMetadata {
         window_id: String,
     ) -> Self {
         Self {
-            guardian_ticket: None,
+            parent_response_id: None,
             installation_id,
             session_id,
             thread_id,
@@ -289,6 +295,7 @@ impl CodexResponsesMetadata {
             tool_namespaces_info: None,
             turn_started_at_unix_ms: None,
             history_ingest_requested: None,
+            analytics_enabled: None,
             extra: BTreeMap::new(),
         }
     }
@@ -415,6 +422,7 @@ impl CodexResponsesMetadata {
             tool_namespaces_info: self.tool_namespaces_info.as_ref(),
             turn_started_at_unix_ms: self.turn_started_at_unix_ms,
             history_ingest_requested: self.history_ingest_requested,
+            analytics_enabled: self.analytics_enabled,
             compaction,
             // Extra metadata enriches the Codex turn metadata blob, not literal top-level
             // Responses client_metadata. Product metadata is validated while loading config;
@@ -561,6 +569,8 @@ struct CodexTurnMetadataPayload<'a> {
     turn_started_at_unix_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     history_ingest_requested: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    analytics_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     compaction: Option<CompactionTurnMetadata>,
     #[serde(flatten)]

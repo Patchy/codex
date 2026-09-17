@@ -11,9 +11,8 @@ use codex_api::TransportError;
 use codex_api::is_azure_responses_provider;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
-use codex_login::default_client::RESIDENCY_HEADER_NAME;
-use codex_login::default_client::ResidencyRequirement;
-use codex_login::default_client::read_default_client_residency_requirement;
+use codex_login::WorkspaceRoutingRequest;
+use codex_login::default_client::ClientRedirectPolicy;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_models_manager::cache::ModelsCache;
 use codex_models_manager::manager::OpenAiModelsManager;
@@ -22,8 +21,8 @@ use codex_models_manager::manager::StaticModelsManager;
 use codex_protocol::account::ProviderAccount;
 use codex_protocol::error::CodexErr;
 use codex_protocol::openai_models::ModelsResponse;
-use http::HeaderValue;
 
+use crate::ResolvedResponsesProvider;
 use crate::amazon_bedrock::AmazonBedrockModelProvider;
 use crate::auth::ProviderAuthScope;
 use crate::auth::ResolvedProviderAuth;
@@ -31,15 +30,7 @@ use crate::auth::auth_manager_for_provider;
 use crate::auth::resolve_provider_auth;
 use crate::auth::resolve_provider_auth_for_scope;
 use crate::models_endpoint::OpenAiModelsEndpoint;
-
-pub(crate) fn enforce_managed_residency(provider: &mut Provider) {
-    if let Some(requirement) = read_default_client_residency_requirement() {
-        let value = match requirement {
-            ResidencyRequirement::Us => HeaderValue::from_static("us"),
-        };
-        provider.headers.insert(RESIDENCY_HEADER_NAME, value);
-    }
-}
+use crate::workspace_routing::WorkspaceRoutingContext;
 
 /// Remote context-compaction protocols supported by a model provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,11 +217,50 @@ pub trait ModelProvider: fmt::Debug + Send + Sync {
     fn api_provider(&self) -> ModelProviderFuture<'_, codex_protocol::error::Result<Provider>> {
         Box::pin(async move {
             let auth = self.auth().await;
-            let mut provider = self
-                .info()
-                .to_api_provider(auth.as_ref().map(CodexAuth::auth_mode))?;
-            enforce_managed_residency(&mut provider);
-            Ok(provider)
+            self.info()
+                .to_api_provider(auth.as_ref().map(CodexAuth::auth_mode))
+        })
+    }
+
+    /// Resolves routing for Responses HTTP, compaction, and WebSocket handshakes.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "serialize discovery and the session's first successful routing transition"
+    )]
+    fn responses_api_provider<'a>(
+        &'a self,
+        routing_context: &'a WorkspaceRoutingContext,
+    ) -> ModelProviderFuture<'a, codex_protocol::error::Result<ResolvedResponsesProvider>> {
+        Box::pin(async move {
+            let mut provider = self.api_provider().await?;
+            let mut redirect_policy = ClientRedirectPolicy::Default;
+            if provider_uses_first_party_auth_path(self.info())
+                && self.info().supports_codex_backend_routes()
+                && let Some(auth) = self.auth().await.filter(CodexAuth::is_chatgpt_auth)
+                && let Some(auth_manager) = self.auth_manager()
+            {
+                let mut previously_routed = routing_context.previously_routed.lock().await;
+                if let Some(routing) = auth_manager
+                    .workspace_routing(
+                        &auth,
+                        WorkspaceRoutingRequest {
+                            provider_base_url: provider.base_url.clone(),
+                            chatgpt_base_url: routing_context.chatgpt_base_url.clone(),
+                            previously_routed: *previously_routed,
+                            session: routing_context.session.clone(),
+                        },
+                    )
+                    .await?
+                {
+                    crate::workspace_routing::apply_workspace_routing(&mut provider, routing)?;
+                    redirect_policy = ClientRedirectPolicy::Reject;
+                    *previously_routed = true;
+                }
+            }
+            Ok(ResolvedResponsesProvider {
+                provider,
+                redirect_policy,
+            })
         })
     }
 
@@ -514,13 +544,17 @@ impl ModelProvider for ConfiguredModelProvider {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
     use std::num::NonZeroU64;
+    use std::task::Context;
+    use std::task::Waker;
 
     use codex_http_client::HttpClientFactory;
     use codex_http_client::OutboundProxyPolicy;
     use codex_login::auth::AgentIdentityAuthPolicy;
     use codex_login::auth::BedrockApiKeyAuth;
     use codex_model_provider_info::AwsAuthRefreshConfig;
+    use codex_model_provider_info::AwsCredentialExportConfig;
     use codex_model_provider_info::ModelProviderAwsAuthInfo;
     use codex_model_provider_info::WireApi;
     use codex_model_provider_info::create_oss_provider_with_base_url;
@@ -766,6 +800,7 @@ mod tests {
             ModelProviderInfo::create_amazon_bedrock_provider(Some(ModelProviderAwsAuthInfo {
                 profile: Some("codex-bedrock".to_string()),
                 region: None,
+                credential_export: None,
                 auth_refresh: None,
             })),
             Some(AuthManager::from_auth_for_testing(CodexAuth::from_api_key(
@@ -823,6 +858,7 @@ mod tests {
         let aws = ModelProviderAwsAuthInfo {
             profile: Some("codex-bedrock".to_string()),
             region: Some("us-west-2".to_string()),
+            credential_export: None,
             auth_refresh: Some(AwsAuthRefreshConfig {
                 command: "aws".to_string(),
                 args: Vec::from(
@@ -903,6 +939,93 @@ mod tests {
             ProviderUnauthorizedRecovery::Recovered
         );
         assert_eq!(read_counter(), "11");
+
+        let fixture = tempfile::tempdir().expect("export fixture should be created");
+        let export_counter = fixture.path().join("exports");
+        let export_gate = fixture.path().join("release");
+        #[cfg(unix)]
+        let (command, mut args) = (
+            "sh".to_string(),
+            vec![
+                "-c".to_string(),
+                r#"printf '1\n' >> "$1"
+while [ ! -e "$2" ]; do :; done
+printf '%s\n' '{"AccessKeyId":"exported","SecretAccessKey":"secret"}'
+"#
+                .to_string(),
+                "export-credentials".to_string(),
+            ],
+        );
+        #[cfg(windows)]
+        let (command, mut args) = {
+            let script = fixture.path().join("export.cmd");
+            std::fs::write(
+                &script,
+                concat!(
+                    "@echo off\r\n>> \"%~1\" echo 1\r\n",
+                    ":wait\r\nif not exist \"%~2\" goto wait\r\n",
+                    "echo {\"AccessKeyId\":\"exported\",\"SecretAccessKey\":\"secret\"}\r\n",
+                ),
+            )
+            .expect("export script should be written");
+            (
+                "cmd.exe".to_string(),
+                vec![
+                    "/D".to_string(),
+                    "/Q".to_string(),
+                    "/C".to_string(),
+                    script.to_string_lossy().into_owned(),
+                ],
+            )
+        };
+        args.extend(
+            [&export_counter, &export_gate].map(|path| path.to_string_lossy().into_owned()),
+        );
+        let provider_info =
+            ModelProviderInfo::create_amazon_bedrock_provider(Some(ModelProviderAwsAuthInfo {
+                profile: None,
+                credential_export: Some(AwsCredentialExportConfig {
+                    command,
+                    args: args.into_iter().map(RedactedString::from).collect(),
+                    timeout_ms: NonZeroU64::new(5_000).expect("timeout should be non-zero"),
+                }),
+                ..aws.clone()
+            }));
+        let first_export = create_model_provider(provider_info.clone(), /*auth_manager*/ None);
+        let second_export = create_model_provider(provider_info, /*auth_manager*/ None);
+        let first_refresh = first_export.recover_from_unauthorized();
+        let second_refresh = second_export.recover_from_unauthorized();
+        tokio::pin!(first_refresh, second_refresh);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::select! {
+                result = &mut first_refresh => panic!("export should wait for its gate: {result:?}"),
+                () = async {
+                    while !export_counter.exists() {
+                        tokio::task::yield_now().await;
+                    }
+                } => {}
+            }
+        }).await.expect("export should start after login");
+        assert_eq!(read_counter(), "111");
+        {
+            // Queue another recovery after login finishes, while export still holds the lock.
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(second_refresh.as_mut().poll(&mut context).is_pending());
+        }
+        std::fs::write(&export_gate, []).expect("export gate should open");
+        let (first_result, second_result) = tokio::join!(first_refresh, second_refresh);
+        assert_eq!(
+            [first_result, second_result].map(|result| result.expect("provider should recover")),
+            [ProviderUnauthorizedRecovery::Recovered; 2]
+        );
+        assert_eq!(read_counter(), "111");
+        assert_eq!(
+            std::fs::read_to_string(export_counter)
+                .expect("read export counter")
+                .lines()
+                .collect::<Vec<_>>(),
+            vec!["1"]
+        );
         std::fs::remove_file(&counter).expect("refresh invocation counter should be removed");
 
         let different_profile = ModelProviderAwsAuthInfo {

@@ -123,6 +123,8 @@ pub struct TuiGlobalKeymap {
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct TuiChatKeymap {
+    /// Start or stop a voice conversation.
+    pub toggle_voice: Option<KeybindingsSpec>,
     /// Toggle the microphone in an active voice conversation.
     pub toggle_voice_mute: Option<KeybindingsSpec>,
     /// Interrupt the active turn.
@@ -437,12 +439,20 @@ pub struct TuiAgentsKeymap {
     pub resume: Option<KeybindingsSpec>,
     /// Search the available agent tasks.
     pub search: Option<KeybindingsSpec>,
-    /// Start composing a new agent task.
+    /// Open a new session in the selected checkout.
     pub new_task: Option<KeybindingsSpec>,
+    /// Open a new session in a worktree from the project default branch.
+    pub new_worktree: Option<KeybindingsSpec>,
     /// Rename the selected task.
     pub rename: Option<KeybindingsSpec>,
     /// Stop the selected running task.
     pub stop: Option<KeybindingsSpec>,
+    /// Archive the selected task and its child agents after confirmation.
+    pub archive: Option<KeybindingsSpec>,
+    /// Permanently delete the selected task and its child agents after confirmation.
+    pub delete: Option<KeybindingsSpec>,
+    /// Hide the selected task until explicitly resumed or the TUI restarts.
+    pub hide: Option<KeybindingsSpec>,
     /// Toggle grouping tasks by status or project.
     pub toggle_grouping: Option<KeybindingsSpec>,
 }

@@ -3,6 +3,7 @@
 //! This module owns the `App` struct, shared imports, and the high-level run loop that coordinates
 //! the focused app submodules.
 
+pub(crate) use self::agents_overview::PendingWorktree;
 use crate::AppServerTarget;
 use crate::app_backtrack::BacktrackState;
 use crate::app_command::AppCommand;
@@ -131,6 +132,7 @@ use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadMemoryMode;
+use codex_app_server_protocol::ThreadSettingsUpdateParams;
 use codex_app_server_protocol::ThreadStartSource;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnError as AppServerTurnError;
@@ -141,8 +143,6 @@ use codex_config::LoaderOverrides;
 use codex_config::types::ApprovalsReviewer;
 use codex_config::types::MemoriesToml;
 use codex_config::types::ModelAvailabilityNuxConfig;
-#[cfg(target_os = "windows")]
-use codex_config::types::WindowsToml;
 use codex_exec_server::EnvironmentManager;
 use codex_features::Feature;
 use codex_features::FeaturesToml;
@@ -153,9 +153,6 @@ use codex_models_manager::model_presets::HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG;
 use codex_otel::SessionTelemetry;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::ThreadId;
-use codex_protocol::config_types::Personality;
-#[cfg(target_os = "windows")]
-use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 use codex_protocol::models::PermissionProfile;
@@ -163,8 +160,6 @@ use codex_protocol::openai_models::ModelAvailabilityNux;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelUpgrade;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
-#[cfg(target_os = "windows")]
-use codex_protocol::permissions::FileSystemSandboxKind;
 use codex_rollout::StateDbHandle;
 use codex_terminal_detection::user_agent;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -200,6 +195,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use toml::Value as TomlValue;
 use uuid::Uuid;
 mod agent_message_consolidation;
@@ -207,8 +203,10 @@ mod agent_navigation;
 mod agent_picker;
 mod agent_status_feed;
 mod agents_overview;
+mod agents_overview_actions;
 mod agents_overview_details;
 mod agents_overview_threads;
+mod agents_overview_usage;
 mod agents_overview_view;
 pub(crate) use agents_overview::AGENTS_OVERVIEW_VIEW_ID;
 mod app_server_event_targets;
@@ -218,6 +216,7 @@ mod backend_banner_fallback;
 mod background_requests;
 mod config_persistence;
 mod connector_mentions;
+mod daemon_menu;
 mod event_dispatch;
 mod exit_summary;
 mod experimental_features;
@@ -226,21 +225,27 @@ mod history_pagination;
 mod history_ui;
 mod input;
 mod loaded_threads;
+mod managed_worktree_creation;
 mod misalignment_policy;
 mod model_defaults;
 mod new_session;
+pub(crate) use new_session::has_launch_setting;
 mod pending_interactive_replay;
 mod permission_shortcuts;
 mod pets;
 mod platform_actions;
 mod plugin_mentions;
 mod rate_limit_refresh;
+mod realtime_delivery;
+mod realtime_settings;
+mod reasoning_replay;
 mod recap;
 mod reconnect;
 mod replay_filter;
 mod resize_reflow;
 mod resume_config;
 mod safety_buffering;
+mod server_version_notice;
 mod session_lifecycle;
 mod session_picker;
 mod side;
@@ -255,6 +260,9 @@ mod thread_session_state;
 mod thread_settings;
 mod thread_title;
 mod transcript_export;
+mod user_verification;
+mod user_verification_errors;
+mod user_verification_requests;
 mod working_directory;
 
 use self::agent_navigation::AgentNavigationDirection;
@@ -262,6 +270,7 @@ use self::agent_navigation::AgentNavigationState;
 use self::app_server_requests::PendingAppServerRequests;
 use self::loaded_threads::find_loaded_subagent_threads_for_primary;
 use self::pending_interactive_replay::PendingInteractiveReplayState;
+pub(crate) use self::platform_actions::WindowsSandboxHost;
 use self::platform_actions::*;
 use self::side::SideParentStatus;
 use self::side::SideParentStatusChange;
@@ -278,6 +287,10 @@ enum ThreadInteractiveRequest {
     AppLink(AppLinkViewParams),
     Approval(ApprovalRequest),
     McpServerElicitation(McpServerElicitationFormRequest),
+    UserVerification {
+        thread_id: ThreadId,
+        request: crate::bottom_pane::user_verification::UserVerificationRequest,
+    },
 }
 
 /// Extracts `receiver_thread_ids` from collab agent tool-call notifications.
@@ -417,14 +430,6 @@ impl AutoReviewMode {
     }
 }
 
-#[cfg(target_os = "windows")]
-fn managed_filesystem_sandbox_is_restricted(permission_profile: &PermissionProfile) -> bool {
-    matches!(
-        permission_profile.file_system_sandbox_policy().kind,
-        FileSystemSandboxKind::Restricted
-    )
-}
-
 /// Baseline cadence for periodic stream commit animation ticks.
 ///
 /// Smooth-mode streaming drains one line per tick, so this interval controls
@@ -560,6 +565,8 @@ pub(crate) struct App {
     cloud_config_bundle: CloudConfigBundleLoader,
     runtime_approval_policy_override: Option<RuntimeApprovalPolicyOverride>,
     runtime_permission_profile_override: Option<RuntimePermissionProfileOverride>,
+    /// In-flight remote selections; confirmed settings live in each task's server snapshot.
+    pending_server_profiles: HashMap<ThreadId, PermissionProfileSelection>,
 
     pub(crate) file_search: FileSearchManager,
 
@@ -568,12 +575,14 @@ pub(crate) struct App {
     last_thread_usage_status_cell: Option<history_ui::ThreadUsageStatusHistory>,
     pub(crate) pending_thread_usage_history_refresh: bool,
 
-    // Pager overlay state (Transcript or Static like Diff)
+    // Alternate-screen overlays: transcript, diff, and analytics.
     pub(crate) overlay: Option<Overlay>,
+    pub(crate) retained_analytics: Option<Box<crate::analytics::AnalyticsView>>,
     pub(crate) deferred_history_lines: Vec<crate::terminal_hyperlinks::HyperlinkLine>,
     has_emitted_history_lines: bool,
     transcript_reflow: TranscriptReflowState,
     initial_history_replay_buffer: Option<InitialHistoryReplayBuffer>,
+    pending_thread_switch_resets: usize,
     pub(crate) scrollback_has_older_history: bool,
 
     pub(crate) enhanced_keys_supported: bool,
@@ -593,8 +602,7 @@ pub(crate) struct App {
     pub(crate) backtrack: crate::app_backtrack::BacktrackState,
     /// When set, the next draw rebuilds terminal scrollback from the retained transcript cells.
     ///
-    /// This is used after a confirmed thread rollback to ensure scrollback reflects the trimmed
-    /// transcript cells.
+    /// This keeps scrollback consistent with the retained transcript after backtracking.
     pub(crate) backtrack_render_pending: bool,
     pub(crate) feedback: codex_feedback::CodexFeedback,
     feedback_audience: FeedbackAudience,
@@ -602,6 +610,7 @@ pub(crate) struct App {
     app_server_target: AppServerTarget,
     reconnect: reconnect::ReconnectState,
     /// Set when the user confirms an update; propagated on exit.
+    daemon_cli_executable: Option<AbsolutePathBuf>,
     pub(crate) pending_update_action: Option<UpdateAction>,
 
     /// Tracks the thread we intentionally shut down while exiting the app.
@@ -617,9 +626,13 @@ pub(crate) struct App {
     windows_sandbox: WindowsSandboxState,
 
     thread_event_channels: HashMap<ThreadId, ThreadEventChannel>,
+    pending_realtime_speech_replay: HashMap<ThreadId, Vec<(String, ThreadItem)>>,
+    pending_realtime_transcript_replay:
+        HashMap<ThreadId, VecDeque<crate::chatwidget::RealtimeTranscriptRecord>>,
+    realtime_replay_order: VecDeque<ThreadId>,
     temporary_structured_requests: HashMap<ThreadId, mpsc::UnboundedSender<ServerNotification>>,
     /// Track title generation across thread switches and deduplicate automatic requests.
-    pending_thread_titles: HashSet<(ThreadId, ThreadTitleDestination)>,
+    pending_thread_titles: HashMap<(ThreadId, ThreadTitleDestination), CancellationToken>,
     thread_event_listener_tasks: HashMap<ThreadId, JoinHandle<()>>,
     agent_navigation: AgentNavigationState,
     agents_overview: agents_overview::AgentsOverviewState,
@@ -636,6 +649,20 @@ pub(crate) struct App {
         tokio::sync::broadcast::Sender<codex_app_server_protocol::ThreadStatusChangedNotification>,
     dynamic_tool_tasks: HashMap<codex_app_server_protocol::RequestId, (String, JoinHandle<()>)>,
     pending_startup_thread_start: bool,
+    pending_server_version_notice: Option<crate::status::remote_connection::ServerVersionNotice>,
+    /// Opens the session picker after event dispatch returns, with a fresh stack.
+    pending_open_resume_picker: bool,
+    /// Runs a requested /cd after event dispatch returns, with a fresh stack.
+    pending_working_directory_change: Option<working_directory::PendingWorkingDirectoryChange>,
+    /// Starts worktree setup after the event handler returns, with a fresh stack.
+    pending_start_managed_worktree: Option<(crate::app_event::ManagedWorktreeMode, Option<String>)>,
+    pending_managed_worktree_creation: bool,
+    /// Defers checkout completion and config loading until the event handler returns.
+    pending_managed_worktree_created: Option<Box<crate::app_event::ManagedWorktreeCreated>>,
+    /// Defers the saved-history fork until the event handler has returned.
+    pending_managed_worktree_transition: Option<Box<crate::app_event::ManagedWorktreeTransition>>,
+    /// Holds notifications until the new widget is attached on a fresh loop iteration.
+    pending_managed_worktree_attach: Option<Box<working_directory::ManagedWorktreeAttach>>,
     /// Keeps protected screens quarantined until initialized chat receives genuine user input.
     startup_protected_input_boundary: bool,
     /// Keeps that boundary armed while a startup approval waits for the typing-idle timer.
@@ -807,10 +834,6 @@ impl App {
             feedback: self.feedback.clone(),
             is_first_run: false,
             status_account_display: self.chat_widget.status_account_display().cloned(),
-            runtime_model_provider_base_url: self
-                .chat_widget
-                .runtime_model_provider_base_url()
-                .map(str::to_string),
             initial_plan_type: self.chat_widget.current_plan_type(),
             model: Some(self.chat_widget.current_model().to_string()),
             startup_tooltip_override: None,
@@ -878,6 +901,8 @@ impl App {
 
         match &event {
             TuiEvent::FocusLost => {
+                self.chat_widget
+                    .set_sparkle_terminal_focus(/*focused*/ false);
                 let now = Instant::now();
                 let thread_id = self.current_displayed_thread_id();
 
@@ -947,6 +972,7 @@ impl App {
                     // Allow widgets to process any pending timers before rendering.
                     let had_active_view = self.chat_widget.has_active_view();
                     self.chat_widget.pre_draw_tick();
+                    self.refresh_agents_overview_usage(app_server, tui.frame_requester());
                     let rendered_area = self.render_chat_widget_frame(tui, screen_size)?;
                     if !had_active_view
                         && self.chat_widget.has_active_view()
@@ -1002,6 +1028,8 @@ impl App {
 
     fn render_chat_widget_frame(&mut self, tui: &mut tui::Tui, screen_size: Size) -> Result<Rect> {
         self.sync_thread_title_progress();
+        self.chat_widget
+            .set_sparkle_terminal_focus(tui.is_terminal_focused());
         let dashboard_visible = self
             .chat_widget
             .selected_index_for_present_view(AGENTS_OVERVIEW_VIEW_ID)

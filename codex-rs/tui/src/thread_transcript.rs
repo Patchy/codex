@@ -120,6 +120,7 @@ pub(crate) fn thread_items_to_transcript_cells(
                         .collect(),
                 };
                 cells.push(Arc::new(UserHistoryCell {
+                    spoken: false,
                     message: item.message(),
                     text_elements: item.text_elements(),
                     local_image_paths: item.local_image_paths(),
@@ -183,6 +184,19 @@ pub(crate) fn thread_items_to_transcript_cells(
                         /*transcript_only*/ false,
                     )));
                 }
+            }
+            ThreadItem::WebSearch(item) => {
+                cells.push(Arc::new(crate::history_cell::new_web_search_call(
+                    item.id,
+                    item.query,
+                    item.action
+                        .unwrap_or(codex_app_server_protocol::WebSearchAction::Other),
+                )));
+            }
+            ThreadItem::ImageView { path, .. } => {
+                cells.push(Arc::new(crate::history_cell::new_view_image_tool_call(
+                    path,
+                )));
             }
             other => {
                 if let Some(cell) = fallback_transcript_cell(&other) {
@@ -273,13 +287,6 @@ fn fallback_transcript_cell(item: &ThreadItem) -> Option<PlainHistoryCell> {
         } => {
             vec![sub_agent_activity_summary(*kind, agent_path).dim().into()]
         }
-        ThreadItem::WebSearch(item) => {
-            vec![vec!["web search: ".dim(), item.query.clone().into()].into()]
-        }
-        ThreadItem::ImageView { path, .. } => {
-            let path = path.render_for_ui();
-            vec![format!("image: {path}").dim().into()]
-        }
         ThreadItem::ImageGeneration(item) => {
             let saved = item
                 .saved_path
@@ -306,6 +313,8 @@ fn fallback_transcript_cell(item: &ThreadItem) -> Option<PlainHistoryCell> {
         | ThreadItem::FunctionCallOutput { .. }
         | ThreadItem::Plan { .. }
         | ThreadItem::Reasoning { .. }
+        | ThreadItem::WebSearch(_)
+        | ThreadItem::ImageView { .. }
         | ThreadItem::Sleep(_) => return None,
     };
     (!lines.is_empty()).then(|| PlainHistoryCell::new(lines))

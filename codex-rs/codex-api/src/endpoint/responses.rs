@@ -23,33 +23,9 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use tracing::instrument;
 
-/// Responses-compatible inference routes supported by Codex backend.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum ResponsesEndpoint {
-    /// Regular user-owned model inference.
-    #[default]
-    Responses,
-    /// Full Guardian approval-review agent inference.
-    Guardian,
-    /// Lightweight asynchronous Guardian risk classification.
-    GuardianClassifier,
-}
-
-impl ResponsesEndpoint {
-    /// Returns the provider-relative path for this inference surface.
-    pub const fn path(self) -> &'static str {
-        match self {
-            Self::Responses => "/responses",
-            Self::Guardian => "/guardian",
-            Self::GuardianClassifier => "/guardian-classifier",
-        }
-    }
-}
-
 pub struct ResponsesClient<T: HttpTransport> {
     session: EndpointSession<T>,
     sse_telemetry: Option<Arc<dyn SseTelemetry>>,
-    endpoint: ResponsesEndpoint,
 }
 
 #[derive(Default)]
@@ -60,8 +36,6 @@ pub struct ResponsesOptions {
     pub extra_headers: HeaderMap,
     pub compression: Compression,
     pub turn_state: Option<Arc<OnceLock<String>>>,
-    /// Runtime-only parent receipt, attached after inference tracing.
-    pub guardian_ticket: Option<codex_protocol::guardian_ticket::GuardianTicket>,
 }
 
 impl<T: HttpTransport> ResponsesClient<T> {
@@ -69,14 +43,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
         Self {
             session: EndpointSession::new(transport, provider, auth),
             sse_telemetry: None,
-            endpoint: ResponsesEndpoint::Responses,
         }
-    }
-
-    /// Selects a Responses-compatible backend route for subsequent requests.
-    pub fn with_endpoint(mut self, endpoint: ResponsesEndpoint) -> Self {
-        self.endpoint = endpoint;
-        self
     }
 
     pub fn with_telemetry(
@@ -87,7 +54,6 @@ impl<T: HttpTransport> ResponsesClient<T> {
         Self {
             session: self.session.with_request_telemetry(request),
             sse_telemetry: sse,
-            endpoint: self.endpoint,
         }
     }
 
@@ -98,12 +64,12 @@ impl<T: HttpTransport> ResponsesClient<T> {
         fields(
             transport = "responses_http",
             http.method = "POST",
-            api.path = self.endpoint.path()
+            api.path = "/responses"
         )
     )]
     pub async fn stream_request(
         &self,
-        mut request: ResponsesApiRequest,
+        request: ResponsesApiRequest,
         options: ResponsesOptions,
     ) -> Result<ResponseStream, ApiError> {
         let ResponsesOptions {
@@ -113,19 +79,9 @@ impl<T: HttpTransport> ResponsesClient<T> {
             extra_headers,
             compression,
             turn_state,
-            guardian_ticket,
         } = options;
-        crate::guardian_ticket::attach(
-            &mut request.client_metadata,
-            guardian_ticket.as_ref(),
-            self.endpoint,
-        );
-
-        let mut body = EncodedJsonBody::encode(&request)
+        let body = EncodedJsonBody::encode(&request)
             .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
-        if guardian_ticket.is_some() {
-            body = body.without_body_logging();
-        }
 
         let mut headers = extra_headers;
         if let Some(ref thread_id) = thread_id {
@@ -147,7 +103,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
         fields(
             transport = "responses_http",
             http.method = "POST",
-            api.path = self.endpoint.path(),
+            api.path = "/responses",
             turn.has_state = turn_state.is_some()
         )
     )]
@@ -180,7 +136,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
             .session
             .stream_encoded_json_with(
                 Method::POST,
-                self.endpoint.path(),
+                "/responses",
                 extra_headers,
                 Some(body),
                 |req| {

@@ -12,11 +12,14 @@ use std::collections::HashSet;
 
 use codex_protocol::ResponseItemId;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::UserMessageEvent;
+use codex_protocol::protocol::UserMessageImageKind;
 use codex_rollout::CompactedItem;
 use codex_rollout::RetainedContextEntry;
+use codex_rollout::RetainedInputSource;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
 
@@ -42,7 +45,7 @@ struct PendingUserResponse {
 struct InstructionBoundary {
     record_index: usize,
     message_id: Option<ResponseItemId>,
-    acceptance_order: Option<u64>,
+    input_source: RetainedInputSource,
     alive: bool,
 }
 
@@ -161,10 +164,7 @@ impl RollbackPlanner {
                 } else if rollback::counts_as_boundary(&response.item) {
                     let boundary = self.start_boundary(index);
                     self.boundaries[boundary].message_id = response.id().cloned();
-                    self.boundaries[boundary].acceptance_order = response
-                        .metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.user_input_order);
+                    self.boundaries[boundary].input_source = response.metadata.as_ref().into();
                     if let ResponseItem::Message { role, content, .. } = &response.item
                         && role == "user"
                     {
@@ -323,7 +323,7 @@ impl RollbackPlanner {
         self.boundaries.push(InstructionBoundary {
             record_index: index,
             message_id: None,
-            acceptance_order: None,
+            input_source: RetainedInputSource::Local(None),
             alive: true,
         });
         let had_prior_boundary = !self.boundary_stack.is_empty();
@@ -380,7 +380,8 @@ impl RollbackPlanner {
         }
         if let Some(boundary) = first_removed_boundary {
             let source = &self.boundaries[boundary];
-            if let Some(order) = source.acceptance_order {
+            let acceptance_order = source.input_source.acceptance_order();
+            if let Some(order) = acceptance_order {
                 // An answer may have been persisted before the queued instruction
                 // accepted ahead of it. Both are removed at that acceptance boundary.
                 for fact in &self.retained_fact_sources {
@@ -411,18 +412,18 @@ impl RollbackPlanner {
             // including in checkpoints. Legacy evidence uses the recorded boundary.
             // Later checkpoints have not been observed yet and already reflect this rollback.
             for frame in self.compactions.iter_mut().rev().take_while(|frame| {
-                source.acceptance_order.is_some() || frame.record_index >= source.record_index
+                acceptance_order.is_some() || frame.record_index >= source.record_index
             }) {
                 if let Some(context) = &mut frame.item.retained_context {
-                    if source.acceptance_order.is_some()
+                    if acceptance_order.is_some()
                         || context
                             .ordered_entries()
-                            .any(|entry| matches!(entry, RetainedContextEntry::UserMessage(_)))
+                            .any(|(_, entry)| matches!(entry, RetainedContextEntry::UserMessage(_)))
                     {
                         context.rollback(
                             &removed_turns,
                             source.message_id.as_ref().map(ResponseItemId::as_str),
-                            source.acceptance_order,
+                            source.input_source,
                         );
                     } else {
                         // Checkpoints written without instruction retention keep the legacy
@@ -489,19 +490,39 @@ fn explicit_event_turn_id(event: &EventMsg) -> Option<&str> {
 fn user_response_matches_event(content: &[ContentItem], event: &UserMessageEvent) -> bool {
     let mut text = String::new();
     let mut images = Vec::new();
+    let mut file_ids = Vec::new();
+    let mut image_order = Vec::new();
     let mut audio = Vec::new();
     for item in content {
         match item {
             ContentItem::InputText { text: item_text } => text.push_str(item_text),
-            ContentItem::InputImage { image_url, .. } => images.push(image_url.as_str()),
+            ContentItem::InputImage { image, .. } => match image {
+                ImageReference::Inline { image_url } => {
+                    image_order.push(UserMessageImageKind::Inline);
+                    images.push(image_url.as_str());
+                }
+                ImageReference::File { file_id } => {
+                    image_order.push(UserMessageImageKind::File);
+                    file_ids.push(file_id.as_str());
+                }
+            },
             ContentItem::InputAudio { audio_url } => audio.push(audio_url.as_str()),
             ContentItem::OutputText { .. } => return false,
         }
     }
     text == event.message
+        && (!event.has_complete_image_order() || image_order == event.image_order)
         && images
             == event
                 .images
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        && file_ids
+            == event
+                .file_ids
                 .as_deref()
                 .unwrap_or_default()
                 .iter()

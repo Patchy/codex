@@ -7,6 +7,7 @@ use serde::Deserializer;
 use serde::Serialize;
 use serde::Serializer;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -125,8 +126,9 @@ pub struct NetworkProxyConfig {
     pub allow_upstream_proxy: bool,
     #[serde(default)]
     pub dangerously_allow_non_loopback_proxy: bool,
-    #[serde(default)]
-    pub dangerously_allow_all_unix_sockets: bool,
+    /// When no socket map is set, omission defers to attachment policy; execution defaults to false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dangerously_allow_all_unix_sockets: Option<bool>,
     #[serde(default)]
     pub mode: NetworkMode,
     #[serde(default)]
@@ -138,9 +140,17 @@ pub struct NetworkProxyConfig {
     pub mitm: bool,
     #[serde(default)]
     pub credential_broker: bool,
+    /// Whether brokerage enabled MITM rather than inheriting an explicit setting.
+    #[serde(skip)]
+    pub credential_broker_enabled_mitm: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub credential_providers: BTreeMap<String, crate::CredentialProviderConfig>,
     /// Trusted OpenAI endpoint derived from local configuration, never sent to remote executors.
     #[serde(skip)]
     pub credential_broker_openai_host: Option<String>,
+    /// Trusted local destination context, never sent to remote executors or child environments.
+    #[serde(skip)]
+    pub credential_broker_context: crate::CredentialBrokerContext,
     #[serde(default)]
     pub dangerously_allow_plaintext_credential_injection: bool,
     #[serde(default)]
@@ -157,14 +167,17 @@ impl Default for NetworkProxyConfig {
             enable_socks5_udp: true,
             allow_upstream_proxy: true,
             dangerously_allow_non_loopback_proxy: false,
-            dangerously_allow_all_unix_sockets: false,
+            dangerously_allow_all_unix_sockets: None,
             mode: NetworkMode::default(),
             domains: None,
             unix_sockets: None,
             allow_local_binding: false,
             mitm: false,
             credential_broker: false,
+            credential_broker_enabled_mitm: false,
+            credential_providers: BTreeMap::new(),
             credential_broker_openai_host: None,
+            credential_broker_context: crate::CredentialBrokerContext::default(),
             dangerously_allow_plaintext_credential_injection: false,
             mitm_hooks: Vec::new(),
         }
@@ -174,11 +187,63 @@ impl Default for NetworkProxyConfig {
 impl NetworkProxyConfig {
     pub fn set_credential_broker_enabled(&mut self, enabled: bool) {
         self.credential_broker = enabled;
-        self.mitm |= enabled;
+        if enabled {
+            self.credential_broker_enabled_mitm |= !self.mitm;
+            self.mitm = true;
+        } else if self.credential_broker_enabled_mitm {
+            self.mitm = !self.mitm_hooks.is_empty();
+            self.credential_broker_enabled_mitm = false;
+        }
     }
 
     pub fn set_credential_broker_openai_base_url(&mut self, base_url: Option<&str>) {
         self.credential_broker_openai_host = base_url.and_then(trusted_credential_broker_host);
+    }
+
+    /// Retains trusted destination context without changing child environment policy. Conflicting
+    /// case-insensitive provider overrides disable brokerage on Windows.
+    pub fn configure_credential_broker_environment(
+        &mut self,
+        environment: &HashMap<String, String>,
+    ) {
+        if cfg!(windows)
+            && self.credential_broker
+            && self.has_ambiguous_windows_credential_environment(environment)
+        {
+            warn!(
+                "credential brokerage disabled because shell environment overrides contain \
+                 conflicting case-insensitive provider keys"
+            );
+            self.set_credential_broker_enabled(/*enabled*/ false);
+        }
+        self.credential_broker_context = if self.credential_broker {
+            crate::CredentialBrokerContext::capture(self, environment)
+        } else {
+            crate::CredentialBrokerContext::default()
+        };
+    }
+
+    fn has_ambiguous_windows_credential_environment(
+        &self,
+        environment: &HashMap<String, String>,
+    ) -> bool {
+        environment.iter().any(|(key, value)| {
+            let is_provider_key =
+                crate::credential_broker::is_credential_broker_provider_env_key(key)
+                    || self.credential_providers.values().any(|provider| {
+                        provider
+                            .env
+                            .iter()
+                            .chain(provider.url_prefix_from_env.iter())
+                            .any(|candidate| key.eq_ignore_ascii_case(candidate))
+                    });
+            is_provider_key
+                && environment.iter().any(|(candidate, candidate_value)| {
+                    key != candidate
+                        && key.eq_ignore_ascii_case(candidate)
+                        && value != candidate_value
+                })
+        })
     }
 
     pub fn allowed_domains(&self) -> Option<Vec<String>> {
@@ -281,7 +346,7 @@ impl NetworkProxyConfig {
         for entry in entries {
             unix_sockets.entries.insert(entry, permission);
         }
-        self.unix_sockets = (!unix_sockets.entries.is_empty()).then_some(unix_sockets);
+        self.unix_sockets = Some(unix_sockets);
     }
 }
 
@@ -364,7 +429,9 @@ pub(crate) fn clamp_bind_addrs(
         "SOCKS5 proxy",
         "dangerously_allow_non_loopback_proxy",
     );
-    if cfg.allow_unix_sockets().is_empty() && !cfg.dangerously_allow_all_unix_sockets {
+    if cfg.allow_unix_sockets().is_empty()
+        && !cfg.dangerously_allow_all_unix_sockets.unwrap_or(false)
+    {
         return (http_addr, socks_addr);
     }
 
@@ -630,18 +697,101 @@ mod tests {
                 enable_socks5_udp: true,
                 allow_upstream_proxy: true,
                 dangerously_allow_non_loopback_proxy: false,
-                dangerously_allow_all_unix_sockets: false,
+                dangerously_allow_all_unix_sockets: None,
                 mode: NetworkMode::Full,
                 domains: None,
                 unix_sockets: None,
                 allow_local_binding: false,
                 mitm: false,
                 credential_broker: false,
+                credential_broker_enabled_mitm: false,
+                credential_providers: BTreeMap::new(),
                 credential_broker_openai_host: None,
+                credential_broker_context: crate::CredentialBrokerContext::default(),
                 dangerously_allow_plaintext_credential_injection: false,
                 mitm_hooks: Vec::new(),
             }
         );
+    }
+
+    #[test]
+    fn disabling_credential_broker_restores_independent_mitm_setting() {
+        for (mitm, add_hook) in [(false, false), (true, false), (false, true)] {
+            let mut original = NetworkProxyConfig {
+                enabled: true,
+                mitm,
+                ..Default::default()
+            };
+            let mut config = original.clone();
+            for _ in 0..2 {
+                config.set_credential_broker_enabled(/*enabled*/ true);
+            }
+            if add_hook {
+                config.mitm_hooks.push(MitmHookConfig {
+                    host: "api.example".to_string(),
+                    ..Default::default()
+                });
+                original.mitm_hooks.clone_from(&config.mitm_hooks);
+                original.mitm = true;
+            }
+            for _ in 0..2 {
+                config.set_credential_broker_enabled(/*enabled*/ false);
+            }
+            assert_eq!(config, original);
+            assert_eq!(
+                crate::RemoteNetworkProxyConfig::from_effective_config(&config).is_err(),
+                original.mitm
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn ambiguous_credential_environment_preserves_remote_proxy_support() {
+        let mut config = NetworkProxyConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let expected = crate::RemoteNetworkProxyConfig::from_effective_config(&config).unwrap();
+        config.set_credential_broker_enabled(/*enabled*/ true);
+        config.configure_credential_broker_environment(&HashMap::from([
+            ("GH_HOST".to_string(), "first.example".to_string()),
+            ("gh_host".to_string(), "second.example".to_string()),
+        ]));
+        assert_eq!(
+            crate::RemoteNetworkProxyConfig::from_effective_config(&config).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn credential_broker_context_accepts_non_unicode_environment() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::process::Command;
+
+        const CHILD_ENV: &str = "CODEX_TEST_NON_UNICODE_BROKER_CONTEXT";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "config::tests::credential_broker_context_accepts_non_unicode_environment",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, OsString::from_vec(vec![0xff]))
+                .env(OsString::from_vec(vec![0xfe]), "unrelated")
+                .env("GH_HOST", OsString::from_vec(vec![0xff]))
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+
+        let mut config = NetworkProxyConfig::default();
+        config.set_credential_broker_enabled(/*enabled*/ true);
+        config.configure_credential_broker_environment(&HashMap::new());
+        assert!(config.credential_broker);
     }
 
     #[test]
@@ -741,7 +891,6 @@ mod tests {
                 "enable_socks5_udp": true,
                 "allow_upstream_proxy": true,
                 "dangerously_allow_non_loopback_proxy": false,
-                "dangerously_allow_all_unix_sockets": false,
                 "mode": "full",
                 "domains": {
                     "example.com": "deny",
@@ -923,7 +1072,7 @@ mod tests {
     fn clamp_bind_addrs_forces_loopback_when_all_unix_sockets_enabled() {
         let cfg = NetworkProxyConfig {
             dangerously_allow_non_loopback_proxy: true,
-            dangerously_allow_all_unix_sockets: true,
+            dangerously_allow_all_unix_sockets: Some(true),
             ..Default::default()
         };
         let http_addr = "0.0.0.0:3128".parse::<SocketAddr>().unwrap();

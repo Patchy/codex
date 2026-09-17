@@ -137,7 +137,6 @@ pub(super) async fn spawn_review_thread(
     extension_data.insert(parent_turn_context.skills_snapshot().as_ref().clone());
 
     let review_turn_context = TurnContext {
-        guardian_ticket: None,
         sub_id: review_turn_id.clone(),
         trace_id: current_span_trace_id(),
         realtime_active: parent_turn_context.realtime_active,
@@ -148,6 +147,7 @@ pub(super) async fn spawn_review_thread(
         config: per_turn_config,
         auth_manager: auth_manager_for_context,
         initial_settings: Arc::clone(&step_settings),
+        disabled_plugin_ids: parent_turn_context.disabled_plugin_ids.clone(),
         current_settings: ArcSwap::from(step_settings),
         session_telemetry: session_telemetry_for_context,
         provider: provider_for_context,

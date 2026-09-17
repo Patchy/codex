@@ -204,7 +204,6 @@ pub(super) async fn make_chatwidget_manual_with_auth(
         feedback: codex_feedback::CodexFeedback::new(),
         is_first_run: true,
         status_account_display: None,
-        runtime_model_provider_base_url: None,
         initial_plan_type: None,
         model: Some(resolved_model.clone()),
         startup_tooltip_override: None,
@@ -213,6 +212,8 @@ pub(super) async fn make_chatwidget_manual_with_auth(
         session_telemetry,
     };
     let mut widget = ChatWidget::new_with_op_target(common, super::CodexOpTarget::Direct(op_tx));
+    widget.windows_sandbox_host = crate::app::WindowsSandboxHost::Local;
+    widget.windows_sandbox_config.requirements = Some(None);
     widget.transcript.active_cell = None;
     widget.transcript.active_cell_revision = 0;
     widget.set_model(&resolved_model);
@@ -299,13 +300,23 @@ fn test_model_info(slug: &str, priority: i32, supports_fast_mode: bool) -> Model
 }
 
 pub(crate) fn set_fast_mode_test_catalog(chat: &mut ChatWidget) {
+    set_fast_mode_test_catalog_for_models(chat, "gpt-5.4", "gpt-5.2");
+}
+
+pub(crate) fn set_fast_mode_test_catalog_for_models(
+    chat: &mut ChatWidget,
+    fast_model: &str,
+    standard_model: &str,
+) {
     let models: Vec<ModelPreset> = ModelsResponse {
         models: vec![
             test_model_info(
-                "gpt-5.4", /*priority*/ 0, /*supports_fast_mode*/ true,
+                fast_model, /*priority*/ 0, /*supports_fast_mode*/ true,
             ),
             test_model_info(
-                "gpt-5.2", /*priority*/ 1, /*supports_fast_mode*/ false,
+                standard_model,
+                /*priority*/ 1,
+                /*supports_fast_mode*/ false,
             ),
         ],
     }
@@ -334,13 +345,29 @@ pub(super) fn drain_insert_history(
     drain_insert_history_with(rx, |cell| cell.display_lines(/*width*/ 80))
 }
 
+pub(super) fn drain_insert_history_normalized(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+) -> Vec<Vec<ratatui::text::Line<'static>>> {
+    drain_insert_history_with(rx, |cell| {
+        cell.display_lines(/*width*/ 80)
+            .into_iter()
+            .map(|mut line| {
+                if cell.as_any().is::<history_cell::FinalMessageSeparator>() {
+                    line.spans = vec![normalize_completion_timestamps(cell, &line).into()];
+                }
+                line
+            })
+            .collect()
+    })
+}
+
 pub(super) fn drain_insert_history_transcript(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
 ) -> Vec<Vec<ratatui::text::Line<'static>>> {
     drain_insert_history_with(rx, |cell| cell.transcript_lines(/*width*/ 80))
 }
 
-fn drain_insert_history_with(
+pub(super) fn drain_insert_history_with(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
     render: impl Fn(&dyn HistoryCell) -> Vec<ratatui::text::Line<'static>>,
 ) -> Vec<Vec<ratatui::text::Line<'static>>> {
@@ -533,7 +560,30 @@ pub(super) fn handle_agent_message_delta(chat: &mut ChatWidget, delta: impl Into
     );
 }
 
+pub(super) fn handle_agent_reasoning_started(chat: &mut ChatWidget, id: impl Into<String>) {
+    chat.handle_server_notification(
+        ServerNotification::ItemStarted(ItemStartedNotification {
+            thread_id: thread_id(chat),
+            turn_id: chat
+                .turn_lifecycle
+                .last_turn_id
+                .clone()
+                .unwrap_or_else(|| "turn-1".to_string()),
+            started_at_ms: 0,
+            item: AppServerThreadItem::Reasoning {
+                id: id.into(),
+                summary: Vec::new(),
+                content: Vec::new(),
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+}
+
 pub(super) fn handle_agent_reasoning_delta(chat: &mut ChatWidget, delta: impl Into<String>) {
+    if chat.status_state.reasoning_item_id.is_none() {
+        handle_agent_reasoning_started(chat, "reasoning-1");
+    }
     chat.handle_server_notification(
         ServerNotification::ReasoningSummaryTextDelta(ReasoningSummaryTextDeltaNotification {
             thread_id: thread_id(chat),
@@ -551,6 +601,9 @@ pub(super) fn handle_agent_reasoning_delta(chat: &mut ChatWidget, delta: impl In
 }
 
 pub(super) fn handle_agent_reasoning_final(chat: &mut ChatWidget) {
+    if chat.status_state.reasoning_item_id.is_none() {
+        handle_agent_reasoning_started(chat, "reasoning-1");
+    }
     chat.handle_server_notification(
         ServerNotification::ItemCompleted(ItemCompletedNotification {
             thread_id: thread_id(chat),
@@ -739,6 +792,7 @@ pub(super) fn handle_image_generation_end(
                 failure: None,
                 saved_path,
                 imagegen_request_id: None,
+                generation_id: None,
             }),
         }),
         /*replay_kind*/ None,
@@ -847,6 +901,7 @@ pub(super) fn begin_exec_with_source(
         .map(|parsed| AppServerCommandAction::from_core_with_cwd(parsed, &chat.config.cwd))
         .collect();
     let item = AppServerThreadItem::CommandExecution {
+        model_context: None,
         id: call_id.to_string(),
         command: codex_shell_command::parse_command::shlex_join(&command),
         cwd: chat.config.cwd.clone().into(),
@@ -872,6 +927,7 @@ pub(super) fn begin_unified_exec_startup(
 ) -> AppServerThreadItem {
     let command = vec!["bash".to_string(), "-lc".to_string(), raw_cmd.to_string()];
     let item = AppServerThreadItem::CommandExecution {
+        model_context: None,
         id: call_id.to_string(),
         command: codex_shell_command::parse_command::shlex_join(&command),
         cwd: chat.config.cwd.clone().into(),
@@ -958,6 +1014,7 @@ pub(super) fn pending_steer(text: &str) -> PendingSteer {
         client_id: "test-submission".to_string(),
         user_message: UserMessage::from(text),
         history_record: UserMessageHistoryRecord::UserMessageText,
+        source: UserMessageSource::Prompt,
         compare_key: PendingSteerCompareKey {
             message: text.to_string(),
             image_count: 0,
@@ -1105,6 +1162,7 @@ pub(super) fn end_exec(
     handle_exec_end(
         chat,
         AppServerThreadItem::CommandExecution {
+            model_context: None,
             id,
             command,
             cwd,
@@ -1724,4 +1782,32 @@ pub(super) async fn assert_hook_events_snapshot(
         .map(|lines| lines_to_single_string(lines))
         .collect::<String>();
     assert_chatwidget_snapshot!(snapshot_name, combined);
+}
+
+/// Normalize timestamps only in structurally identified completion footer cells.
+pub(crate) fn normalize_completion_timestamps(
+    cell: &dyn HistoryCell,
+    value: impl std::fmt::Display,
+) -> String {
+    if !cell.as_any().is::<history_cell::FinalMessageSeparator>() {
+        return value.to_string();
+    }
+    static COMPLETION_FOOTER: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(
+        || {
+            regex_lite::Regex::new(r"(?m)^(?P<indent>[ \t]*)(?P<duration>Worked for (?:[0-9]+h )?(?:[0-9]+m )?[0-9]+s · )?(?:[A-Z][a-z]{2} [0-9]{1,2}(?:, [0-9]{4})? at )?[0-9]{1,2}:[0-9]{2} (?:AM|PM)(?P<padding>[ \t]*)$")
+                .expect("valid completion footer pattern")
+        },
+    );
+    COMPLETION_FOOTER
+        .replace_all(&value.to_string(), |captures: &regex_lite::Captures<'_>| {
+            let indent = &captures["indent"];
+            let padding = &captures["padding"];
+            let duration = if captures.name("duration").is_some() {
+                "Worked for [duration] · "
+            } else {
+                ""
+            };
+            format!("{indent}{duration}[completion time]{padding}")
+        })
+        .into_owned()
 }

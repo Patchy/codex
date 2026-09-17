@@ -116,11 +116,11 @@ use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnPlanStepStatus;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
+use codex_app_server_protocol::WindowsSandboxSetupMode;
 use codex_config::Constrained;
 use codex_config::ConstraintResult;
 use codex_config::types::ApprovalsReviewer;
 use codex_config::types::Notifications;
-use codex_config::types::WindowsSandboxModeToml;
 use codex_connectors::AppInfo;
 use codex_features::Feature;
 #[cfg(test)]
@@ -141,9 +141,8 @@ use codex_protocol::approvals::GuardianAssessmentStatus;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::config_types::ModeKind;
-use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::Settings;
-#[cfg(any(target_os = "windows", test))]
+#[cfg(target_os = "windows")]
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::AgentMessageItem;
@@ -178,16 +177,9 @@ use tracing::debug;
 use tracing::warn;
 
 const DEFAULT_MODEL_DISPLAY_NAME: &str = "loading";
-const MULTI_AGENT_ENABLE_TITLE: &str = "Enable subagents?";
-const MULTI_AGENT_ENABLE_YES: &str = "Yes, enable";
-const MULTI_AGENT_ENABLE_NO: &str = "Not now";
-const MULTI_AGENT_ENABLE_NOTICE: &str = "Subagents will be enabled in the next session.";
 const TRUSTED_ACCESS_FOR_CYBER_VERIFICATION_WARNING: &str = "Your conversations have multiple flags for possible cybersecurity risk. Responses may take longer because extra safety checks are on. To get authorized for security work, join the Trusted Access for Cyber program: https://chatgpt.com/cyber";
-const MEMORIES_DOC_URL: &str = "https://developers.openai.com/codex/memories";
-const MEMORIES_ENABLE_TITLE: &str = "Enable memories?";
-const MEMORIES_ENABLE_YES: &str = "Yes, enable";
-const MEMORIES_ENABLE_NO: &str = "Not now";
 const MEMORIES_ENABLE_NOTICE: &str = "Memories will be enabled in the next session.";
+const MEMORIES_DOC_URL: &str = "https://developers.openai.com/codex/memories";
 const PLAN_MODE_REASONING_SCOPE_TITLE: &str = "Apply reasoning change";
 const PLAN_MODE_REASONING_SCOPE_PLAN_ONLY: &str = "Apply to Plan mode override";
 const PLAN_MODE_REASONING_SCOPE_ALL_MODES: &str = "Apply to global default and Plan mode override";
@@ -263,8 +255,6 @@ use crate::app_event::AppEvent;
 use crate::app_event::ExitMode;
 use crate::app_event::PermissionProfileSelection;
 use crate::app_event::RateLimitRefreshOrigin;
-#[cfg(target_os = "windows")]
-use crate::app_event::WindowsSandboxEnableMode;
 use crate::app_event_sender::AppEventSender;
 use crate::auto_review_denials;
 use crate::auto_review_denials::RecentAutoReviewDenials;
@@ -353,6 +343,7 @@ use self::ide_context::IdeContextState;
 mod input_queue;
 mod reconnect;
 use self::input_queue::InputQueueState;
+mod image_submission;
 mod input_flow;
 mod input_restore;
 mod input_submission;
@@ -364,6 +355,7 @@ mod mcp_startup;
 use self::mcp_startup::McpStartupStatus;
 mod misalignment_policy;
 pub(crate) use misalignment_policy::MisalignmentReview;
+pub(crate) use misalignment_policy::MisalignmentTurnSource;
 mod pets;
 mod session_flow;
 mod session_header;
@@ -373,6 +365,7 @@ mod hooks;
 mod interaction;
 mod skills;
 mod slash_dispatch;
+mod worktree_picker;
 use self::skills::collect_tool_mentions;
 use self::skills::find_app_mentions;
 use self::skills::find_skill_mentions_with_tool_mentions;
@@ -387,7 +380,9 @@ use self::plan_implementation::PLAN_IMPLEMENTATION_TITLE;
 mod model_popup_state;
 mod model_popups;
 mod notifications;
+mod session_model_selection;
 use self::notifications::Notification;
+pub(crate) use self::session_model_selection::AstraModelPickerAction;
 mod permission_discovery;
 mod permission_popups;
 mod permission_shortcuts;
@@ -411,7 +406,22 @@ use self::rate_limits::is_app_server_cyber_policy_error;
 mod recap;
 mod reset_credits;
 pub(crate) use self::rate_limits::limit_label_for_window;
+mod completion;
+mod realtime;
+mod realtime_settings;
+mod realtime_split_flap;
+pub(crate) use realtime::MAX_REPLAY_TRANSCRIPT_CELLS;
+pub(crate) use realtime::MAX_TRANSCRIPT_BYTES;
+pub(crate) use realtime::RealtimeTranscriptRecord;
+pub(crate) use realtime::is_private_realtime_agent_item;
+pub(crate) use realtime::realtime_delegation_display_text;
+pub(crate) use realtime::realtime_delegation_input;
+#[cfg(test)]
+pub(crate) use realtime::tests::activate_voice_for_thread;
+#[cfg(test)]
+pub(crate) use realtime::tests::commit_realtime_history_events;
 mod reasoning_shortcuts;
+use self::realtime::RealtimeConversationUiState;
 mod rendering;
 mod replay;
 mod review;
@@ -437,12 +447,11 @@ use self::status_surfaces::CachedProjectRootName;
 mod thread_title_status;
 mod thread_usage;
 pub(crate) use self::thread_usage::ThreadUsageOutcome;
-mod tokens;
-pub(crate) use self::tokens::TokenActivityView;
 mod tool_lifecycle;
 mod tool_requests;
 mod transcript;
 mod transcript_export;
+mod usage_history;
 use self::transcript::TranscriptState;
 mod turn_lifecycle;
 mod turn_runtime;
@@ -464,6 +473,7 @@ use self::user_messages::UserMessageDisplay;
 #[cfg(test)]
 use self::user_messages::UserMessageHistoryOverride;
 use self::user_messages::UserMessageHistoryRecord;
+use self::user_messages::UserMessageSource;
 use self::user_messages::app_server_text_elements;
 pub(crate) use self::user_messages::create_initial_user_message;
 pub(crate) use self::user_messages::mention_bindings_from_user_inputs;
@@ -527,7 +537,6 @@ pub(crate) struct ChatWidgetInit {
     pub(crate) feedback: codex_feedback::CodexFeedback,
     pub(crate) is_first_run: bool,
     pub(crate) status_account_display: Option<StatusAccountDisplay>,
-    pub(crate) runtime_model_provider_base_url: Option<String>,
     pub(crate) initial_plan_type: Option<PlanType>,
     pub(crate) model: Option<String>,
     pub(crate) startup_tooltip_override: Option<String>,
@@ -581,23 +590,31 @@ pub(crate) struct ChatWidget {
     model_catalog: Arc<ModelCatalog>,
     model_popup_request_id: Option<uuid::Uuid>,
     permission_popup_request_id: Option<uuid::Uuid>,
+    worktree_popup_request_id: Option<uuid::Uuid>,
     permission_profiles_menu_opened: bool,
     model_popup_model_ids: Vec<String>,
     session_telemetry: SessionTelemetry,
     session_header: SessionHeader,
-    initial_user_message: Option<UserMessage>,
+    pub(crate) initial_user_message: Option<UserMessage>,
     status_account_display: Option<StatusAccountDisplay>,
+    /// Resolved lazily by the app layer (AppEvent::RefreshRuntimeModelProviderBaseUrl).
     runtime_model_provider_base_url: Option<String>,
     pub(crate) remote_connection: Option<RemoteConnectionStatus>,
+    /// Remote app servers cannot read image paths on the TUI host.
+    pub(crate) snapshot_local_images: bool,
+    pending_image_submission: Option<image_submission::PendingImageSubmission>,
+    pub(crate) local_worktree_operations: bool,
+    pub(crate) windows_sandbox_local_server: bool,
+    pub(crate) windows_sandbox_config: crate::windows_sandbox::WindowsSandboxConfig,
+    pub(crate) windows_sandbox_host: crate::app::WindowsSandboxHost,
+    #[cfg(any(target_os = "windows", test))]
+    pub(crate) windows_sandbox_elevated_setup_complete: bool,
     token_info: Option<TokenUsageInfo>,
     token_usage_pending: bool,
     // Status and polling use account usage reads; response streams may identify meters differently.
     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
     refreshing_status_outputs: Vec<(u64, StatusHistoryHandle)>,
     next_status_refresh_request_id: u64,
-    refreshing_token_activity_output: Option<tokens::PendingTokenActivityOutput>,
-    completed_token_activity_output: Option<history_cell::CompositeHistoryCell>,
-    next_token_activity_request_id: u64,
     pending_rate_limit_reset_request_id: Option<u64>,
     pending_rate_limit_reset_idempotency_key: Option<String>,
     rate_limit_reset_picker_request_id: Option<u64>,
@@ -639,6 +656,8 @@ pub(crate) struct ChatWidget {
     last_unified_wait: Option<UnifiedExecWaitState>,
     unified_exec_wait_streak: Option<UnifiedExecWaitStreak>,
     turn_lifecycle: TurnLifecycleState,
+    realtime_conversation: RealtimeConversationUiState,
+    realtime_conversation_available_for_thread: bool,
     safety_buffering: SafetyBufferingState,
     task_complete_pending: bool,
     unified_exec_processes: Vec<UnifiedExecProcessSummary>,
@@ -698,6 +717,7 @@ pub(crate) struct ChatWidget {
     thread_rename_block_message: Option<String>,
     active_side_conversation: bool,
     blocks_direct_input: bool,
+    external_writer_view: bool,
     misalignment_policy_violation: Option<misalignment_policy::MisalignmentViolation>,
     normal_placeholder_text: String,
     side_placeholder_text: String,
@@ -717,6 +737,7 @@ pub(crate) struct ChatWidget {
     suppress_initial_user_message_submit: bool,
     input_queue: InputQueueState,
     safety_buffering_prompt: Option<UserMessage>,
+    safety_buffering_source: UserMessageSource,
     /// Main chat-surface bindings resolved from `tui.keymap.chat`.
     chat_keymap: ChatKeymap,
     permission_shortcut_pending: bool,
@@ -804,6 +825,7 @@ pub(crate) struct ChatWidget {
     current_goal_status: Option<GoalStatusState>,
     external_editor_state: ExternalEditorState,
     last_rendered_user_message_display: Option<UserMessageDisplay>,
+    last_rendered_user_message_client_id: Option<String>,
     last_non_retry_error: Option<(String, String)>,
 }
 
@@ -853,7 +875,6 @@ pub(crate) enum ReplayKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SessionConfiguredDisplay {
     Normal,
-    PromptEdit,
     /// Apply session state without emitting the session info cell.
     Quiet,
     SideConversation,
@@ -1060,8 +1081,10 @@ impl ChatWidget {
         let snapshot = self.feedback.snapshot(self.thread_id);
         #[cfg(target_os = "windows")]
         let include_windows_sandbox_log =
-            codex_windows_sandbox::current_log_file_path_for_codex_home(&self.config.codex_home)
-                .is_file();
+            codex_windows_sandbox::current_log_file_path_for_codex_home(
+                &self.local_settings.codex_home,
+            )
+            .is_file();
         #[cfg(not(target_os = "windows"))]
         let include_windows_sandbox_log = false;
         let params = crate::bottom_pane::feedback_upload_consent_params(
@@ -1077,44 +1100,48 @@ impl ChatWidget {
         self.request_redraw();
     }
 
-    pub(crate) fn open_multi_agent_enable_prompt(&mut self) {
-        let items = vec![
-            SelectionItem {
-                name: MULTI_AGENT_ENABLE_YES.to_string(),
-                description: Some(
-                    "Save the setting now. You will need a new session to use it.".to_string(),
-                ),
-                actions: vec![Box::new(|tx| {
-                    tx.send(AppEvent::UpdateFeatureFlags {
-                        updates: vec![(Feature::Collab, true)],
-                    });
-                    tx.send(AppEvent::InsertHistoryCell(Box::new(
-                        history_cell::new_warning_event(MULTI_AGENT_ENABLE_NOTICE.to_string()),
-                    )));
-                })],
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-            SelectionItem {
-                name: MULTI_AGENT_ENABLE_NO.to_string(),
-                description: Some("Keep subagents disabled.".to_string()),
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-        ];
-
+    pub(crate) fn open_feature_enable_prompt(&mut self, feature: Feature) {
+        let (label, name) = match feature {
+            Feature::Collab => ("Subagents", "subagents"),
+            Feature::MemoryTool => ("Memories", "memories"),
+            _ => return,
+        };
         self.bottom_pane.show_selection_view(SelectionViewParams {
-            title: Some(MULTI_AGENT_ENABLE_TITLE.to_string()),
-            subtitle: Some("Subagents are currently disabled in your config.".to_string()),
+            title: Some(format!("Enable {name}?")),
+            subtitle: Some(format!("{label} are disabled in this TUI session.")),
+            footer_note: (feature == Feature::MemoryTool).then(|| {
+                Line::from(vec![
+                    "Learn more: ".dim(),
+                    MEMORIES_DOC_URL.cyan().underlined(),
+                ])
+            }),
             footer_hint: Some(standard_popup_hint_line()),
-            items,
+            items: vec![
+                SelectionItem {
+                    name: "Yes, enable".to_string(),
+                    description: Some(
+                        "Save on the server for new threads. This thread is unchanged.".to_string(),
+                    ),
+                    actions: vec![Box::new(move |tx| {
+                        tx.send(AppEvent::EnableFeatureForNewThreads(feature));
+                    })],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+                SelectionItem {
+                    name: "Not now".to_string(),
+                    description: Some(format!("Keep {name} disabled.")),
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+            ],
             ..Default::default()
         });
     }
 
     pub(crate) fn open_memories_popup(&mut self) {
         if !self.config.features.enabled(Feature::MemoryTool) {
-            self.open_memories_enable_prompt();
+            self.open_feature_enable_prompt(Feature::MemoryTool);
             return;
         }
 
@@ -1125,42 +1152,6 @@ impl ChatWidget {
             self.bottom_pane.list_keymap(),
         );
         self.bottom_pane.show_view(Box::new(view));
-    }
-
-    pub(crate) fn open_memories_enable_prompt(&mut self) {
-        let items = vec![
-            SelectionItem {
-                name: MEMORIES_ENABLE_YES.to_string(),
-                description: Some(
-                    "Save the setting now. You will need a new session to use it.".to_string(),
-                ),
-                actions: vec![Box::new(|tx| {
-                    tx.send(AppEvent::UpdateFeatureFlags {
-                        updates: vec![(Feature::MemoryTool, true)],
-                    });
-                })],
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-            SelectionItem {
-                name: MEMORIES_ENABLE_NO.to_string(),
-                description: Some("Keep memories disabled.".to_string()),
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-        ];
-
-        self.bottom_pane.show_selection_view(SelectionViewParams {
-            title: Some(MEMORIES_ENABLE_TITLE.to_string()),
-            subtitle: Some("Memories are currently disabled in your config.".to_string()),
-            footer_note: Some(Line::from(vec![
-                "Learn more: ".dim(),
-                MEMORIES_DOC_URL.cyan().underlined(),
-            ])),
-            footer_hint: Some(standard_popup_hint_line()),
-            items,
-            ..Default::default()
-        });
     }
 
     pub(crate) fn set_memory_settings(&mut self, use_memories: bool, generate_memories: bool) {
@@ -1228,6 +1219,8 @@ impl ChatWidget {
         self.update_due_hook_visibility();
         self.schedule_hook_timer_if_needed();
         self.bottom_pane.pre_draw_tick();
+        self.flush_realtime_transcript_history();
+        self.refresh_realtime_microphone_level();
         if let Some(pet) = self.ambient_pet.as_ref() {
             pet.schedule_next_frame();
         }
@@ -1246,20 +1239,25 @@ impl ChatWidget {
 
     fn flush_active_cell(&mut self) {
         if let Some(active) = self.transcript.take_active_cell() {
-            self.transcript.needs_final_message_separator = true;
             self.app_event_tx.send(AppEvent::InsertHistoryCell(active));
             self.request_pending_usage_output_insertion();
         }
     }
 
-    fn flush_completed_command_activity(&mut self) {
-        if self
-            .transcript
-            .active_cell
-            .as_ref()
-            .and_then(|cell| cell.as_any().downcast_ref::<ExecCell>())
-            .is_some_and(|cell| !cell.is_active())
-        {
+    fn has_completed_tool_activity(&self) -> bool {
+        self.transcript.active_cell.as_ref().is_some_and(|cell| {
+            cell.as_any()
+                .downcast_ref::<ExecCell>()
+                .is_some_and(|cell| !cell.is_active())
+                || cell
+                    .as_any()
+                    .downcast_ref::<history_cell::ComputerActivityCell>()
+                    .is_some_and(|cell| !cell.is_active())
+        })
+    }
+
+    fn flush_completed_tool_activity(&mut self) {
+        if self.has_completed_tool_activity() {
             self.flush_active_cell();
         }
     }
@@ -1269,6 +1267,17 @@ impl ChatWidget {
     }
 
     fn add_boxed_history(&mut self, cell: Box<dyn HistoryCell>) {
+        if let Some(active) = self.take_history_insertion_prefix(cell.as_ref()) {
+            self.app_event_tx.send(AppEvent::InsertHistoryCell(active));
+            self.request_pending_usage_output_insertion();
+        }
+        self.app_event_tx.send(AppEvent::InsertHistoryCell(cell));
+    }
+
+    fn take_history_insertion_prefix(
+        &mut self,
+        cell: &dyn HistoryCell,
+    ) -> Option<Box<dyn HistoryCell>> {
         // Keep the placeholder session header as the active cell until real session info arrives,
         // so we can merge headers instead of committing a duplicate box to history.
         let keep_placeholder_header_active = !self.is_session_configured()
@@ -1290,20 +1299,15 @@ impl ChatWidget {
         {
             // Only break exec grouping if the cell renders visible lines.
             if !self.has_active_stream_tail() {
-                self.flush_active_cell();
+                return self.transcript.take_active_cell();
             }
-            self.transcript.needs_final_message_separator = true;
         } else if !keep_placeholder_header_active
-            && self
-                .transcript
-                .active_cell
-                .as_ref()
-                .is_some_and(|active_cell| active_cell.as_any().is::<ExecCell>())
+            && self.has_completed_tool_activity()
             && !cell.transcript_lines(history_width).is_empty()
         {
-            self.flush_completed_command_activity();
+            return self.transcript.take_active_cell();
         }
-        self.app_event_tx.send(AppEvent::InsertHistoryCell(cell));
+        None
     }
 
     fn enter_review_mode_with_hint(&mut self, hint: String, from_replay: bool) {
@@ -1339,7 +1343,20 @@ impl ChatWidget {
         items: &[UserInput],
         client_id: Option<&str>,
         from_replay: bool,
+        turn_id: &str,
     ) {
+        if let Some(input) = realtime::realtime_delegation_input(items) {
+            if !from_replay && self.should_hide_realtime_delegation(turn_id) {
+                return;
+            }
+            let input = realtime::realtime_delegation_display_text(input);
+            let projected = [UserInput::Text {
+                text: input,
+                text_elements: Vec::new(),
+            }];
+            self.on_committed_user_message(&projected, client_id, from_replay, turn_id);
+            return;
+        }
         let display = Self::user_message_display_from_inputs(items);
         if from_replay {
             if self.review.is_review_mode {
@@ -1358,6 +1375,12 @@ impl ChatWidget {
             return;
         }
 
+        // Servers may omit media from receipts, so prefer the submission identity.
+        if client_id.is_some() && self.last_rendered_user_message_client_id.as_deref() == client_id
+        {
+            return;
+        }
+
         if self
             .input_queue
             .pending_steers
@@ -1373,6 +1396,9 @@ impl ChatWidget {
                 let pending_display =
                     user_message_display_for_history(pending.user_message, &pending.history_record);
                 self.on_user_message_display(pending_display);
+                // Later receipts carry the wire media, which may differ from the local attachment.
+                self.last_rendered_user_message_display = Some(display);
+                self.last_rendered_user_message_client_id = Some(pending.client_id);
             } else if self.last_rendered_user_message_display.as_ref() != Some(&display) {
                 tracing::warn!(
                     "pending steer matched receipt but queue was empty when rendering committed user message"
@@ -1387,7 +1413,9 @@ impl ChatWidget {
     }
 
     fn on_user_message_display(&mut self, display: UserMessageDisplay) {
+        self.transcript.last_status_copy_targets = None;
         self.last_rendered_user_message_display = Some(display.clone());
+        self.last_rendered_user_message_client_id = None;
         if !display.message.trim().is_empty()
             || !display.text_elements.is_empty()
             || !display.local_images.is_empty()
@@ -1400,9 +1428,6 @@ impl ChatWidget {
                 display.remote_image_urls,
             ));
         }
-
-        // User messages reset separator state so the next agent response doesn't add a stray break.
-        self.transcript.needs_final_message_separator = false;
     }
 
     /// Exit the UI immediately without waiting for shutdown.
@@ -1442,6 +1467,11 @@ impl ChatWidget {
                 exec.mark_failed();
             } else if let Some(tool) = cell.as_any_mut().downcast_mut::<McpToolCallCell>() {
                 tool.mark_failed();
+            } else if let Some(computer) = cell
+                .as_any_mut()
+                .downcast_mut::<history_cell::ComputerActivityCell>()
+            {
+                computer.mark_failed();
             }
             self.add_boxed_history(cell);
             self.request_pending_usage_output_insertion();
@@ -1572,6 +1602,14 @@ impl ChatWidget {
 
     pub(crate) fn add_warning_message(&mut self, message: String) {
         self.add_to_history(history_cell::new_warning_event(message));
+        self.request_redraw();
+    }
+
+    pub(crate) fn add_server_version_warning(
+        &mut self,
+        notice: crate::status::remote_connection::ServerVersionNotice,
+    ) {
+        self.add_to_history(history_cell::new_server_version_warning(notice));
         self.request_redraw();
     }
 
@@ -1730,10 +1768,6 @@ impl ChatWidget {
         self.bottom_pane.composer_is_empty() && !self.bottom_pane.is_in_paste_burst()
     }
 
-    pub(crate) fn composer_is_vim_enabled(&self) -> bool {
-        self.bottom_pane.composer_is_vim_enabled()
-    }
-
     #[cfg(test)]
     pub(crate) fn is_task_running_for_test(&self) -> bool {
         self.bottom_pane.is_task_running()
@@ -1795,6 +1829,26 @@ impl ChatWidget {
         self.bottom_pane.clear_esc_backtrack_hint();
     }
 
+    pub(crate) fn show_external_writer_thread(&mut self) {
+        self.cancel_image_submission();
+        self.blocks_direct_input = true;
+        self.external_writer_view = true;
+        self.pause_unavailable_thread();
+        if let Some(cell) = self.transcript.active_cell.as_mut() {
+            if let Some(exec) = cell.as_any_mut().downcast_mut::<ExecCell>() {
+                exec.freeze_snapshot();
+            } else if let Some(tool) = cell.as_any_mut().downcast_mut::<McpToolCallCell>() {
+                tool.freeze_snapshot();
+            }
+        }
+        self.bottom_pane
+            .set_composer_input_enabled(/*enabled*/ false, /*placeholder*/ None);
+    }
+
+    pub(crate) fn is_external_writer_view(&self) -> bool {
+        self.external_writer_view
+    }
+
     fn refresh_skills_for_current_cwd(&mut self, force_reload: bool) {
         self.submit_op(AppCommand::list_skills(
             vec![self.config.cwd.to_path_buf()],
@@ -1817,7 +1871,12 @@ impl ChatWidget {
                 AppCommand::UserTurn { .. } | AppCommand::Review { .. } | AppCommand::Compact
             )
         {
-            self.add_error_message(PARENT_OWNED_INPUT_MESSAGE.to_string());
+            self.add_error_message(if self.external_writer_view {
+                "This thread is open elsewhere. Close it there and retry resume to continue."
+                    .to_string()
+            } else {
+                PARENT_OWNED_INPUT_MESSAGE.to_string()
+            });
             return false;
         }
         self.prepare_local_op_submission(&op);
@@ -1827,9 +1886,13 @@ impl ChatWidget {
         match &self.codex_op_target {
             CodexOpTarget::Direct(codex_op_tx) => {
                 crate::session_log::log_outbound_op(&op);
+                let is_review = op.is_review();
                 if let Err(e) = codex_op_tx.send(op) {
                     tracing::error!("failed to submit op: {e}");
                     return false;
+                }
+                if is_review {
+                    self.on_review_started();
                 }
             }
             CodexOpTarget::AppEvent => {
@@ -1855,6 +1918,7 @@ impl ChatWidget {
                 | AppCommand::Review { .. }
                 | AppCommand::RunUserShellCommand { .. }
         ) {
+            self.transcript.last_status_copy_targets = None;
             self.input_queue.user_turn_pending_start = true;
         }
         if matches!(op, AppCommand::Interrupt) && self.turn_lifecycle.agent_turn_running {
@@ -1936,9 +2000,17 @@ impl ChatWidget {
     /// the main viewport updates.
     pub(crate) fn active_cell_transcript_key(&self) -> Option<ActiveCellTranscriptKey> {
         let cell = self.transcript.active_cell.as_ref();
-        let token_activity_cell = self.pending_token_activity_output();
+        let mut realtime_cells = self.realtime_conversation.live_transcript_cells();
         let rate_limit_reset_hint = self.pending_rate_limit_reset_hint();
-        if cell.is_none() && token_activity_cell.is_none() && rate_limit_reset_hint.is_none() {
+        if cell.is_none()
+            && self
+                .realtime_conversation
+                .live_transcript_cells()
+                .next()
+                .is_none()
+            && self.realtime_conversation.pending_history_cells.is_empty()
+            && rate_limit_reset_hint.is_none()
+        {
             return None;
         }
         Some(ActiveCellTranscriptKey {
@@ -1952,7 +2024,8 @@ impl ChatWidget {
                     self.subagent_panel
                         .as_ref()
                         .and_then(super::history_cell::HistoryCell::transcript_animation_tick)
-                }),
+                })
+                .or_else(|| realtime_cells.find_map(|cell| cell.transcript_animation_tick())),
         })
     }
 
@@ -1970,12 +2043,17 @@ impl ChatWidget {
         if let Some(cell) = self.transcript.active_cell.as_ref() {
             lines.extend(cell.transcript_hyperlink_lines(width));
         }
-        if let Some(token_activity_cell) = self.pending_token_activity_output() {
-            let token_activity_lines = token_activity_cell.transcript_hyperlink_lines(width);
-            if !token_activity_lines.is_empty() && !lines.is_empty() {
+        for cell in self
+            .realtime_conversation
+            .pending_history_cells
+            .iter()
+            .chain(self.realtime_conversation.live_transcript_cells())
+        {
+            let realtime_lines = cell.transcript_hyperlink_lines(width);
+            if !realtime_lines.is_empty() && !lines.is_empty() {
                 lines.push(HyperlinkLine::from(""));
             }
-            lines.extend(token_activity_lines);
+            lines.extend(realtime_lines);
         }
         if let Some(rate_limit_reset_hint) = self.pending_rate_limit_reset_hint() {
             let hint_lines = rate_limit_reset_hint.transcript_hyperlink_lines(width);
@@ -2020,6 +2098,13 @@ fn has_websocket_timing_metrics(summary: RuntimeMetricsSummary) -> bool {
 
 impl Drop for ChatWidget {
     fn drop(&mut self) {
+        if self.realtime_conversation.handle.is_some()
+            && let Some(thread_id) = self.thread_id
+        {
+            self.app_event_tx
+                .send(AppEvent::StopRealtimeConversation { thread_id });
+        }
+        self.reset_realtime_conversation();
         self.stop_rate_limit_poller();
     }
 }

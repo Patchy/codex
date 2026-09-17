@@ -1,6 +1,27 @@
 use super::*;
 use pretty_assertions::assert_eq;
 
+#[test]
+fn experimental_features_analytics_plan_history() {
+    let feature = Feature::AnalyticsPlanHistory;
+    let stage = feature.stage();
+    let (app_tx, _app_rx) = tokio::sync::mpsc::unbounded_channel();
+    let view = ExperimentalFeaturesView::new(
+        vec![ExperimentalFeatureItem {
+            key: feature.key().to_string(),
+            name: stage.experimental_menu_name().unwrap().to_string(),
+            description: stage.experimental_menu_description().unwrap().to_string(),
+            enabled: feature.default_enabled(),
+            writable: true,
+        }],
+        ThreadId::new(),
+        /*catalog_rx*/ None,
+        AppEventSender::new(app_tx),
+        crate::keymap::RuntimeKeymap::defaults().list,
+    );
+    snapshot_view("experimental_features_analytics_plan_history", &view);
+}
+
 fn server_feature(name: &str) -> ExperimentalFeature {
     ExperimentalFeature {
         name: name.to_string(),
@@ -206,4 +227,54 @@ fn snapshot_view(name: &str, view: &ExperimentalFeaturesView) {
     let mut buffer = Buffer::empty(area);
     view.render(area, &mut buffer);
     insta::assert_snapshot!(name, buffer_text(&buffer));
+}
+
+#[test]
+fn voice_discovery_requires_the_client_runtime() {
+    for supported in [false, true] {
+        let (app_tx, _app_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (catalog_tx, catalog_rx) = oneshot::channel();
+        let mut view = ExperimentalFeaturesView::new(
+            Vec::new(),
+            ThreadId::new(),
+            Some(catalog_rx),
+            AppEventSender::new(app_tx),
+            crate::keymap::RuntimeKeymap::defaults().list,
+        );
+        view.voice_supported = supported;
+        catalog_tx
+            .send(Ok(vec![server_feature("realtime_conversation")]))
+            .unwrap();
+        assert!(view.pre_draw_tick(Instant::now()));
+        assert_eq!(view.features.len(), usize::from(supported));
+        snapshot_view(
+            if supported {
+                "voice_runtime_available"
+            } else {
+                "voice_runtime_unavailable"
+            },
+            &view,
+        );
+    }
+}
+
+#[test]
+fn daemon_auto_start_menu_snapshot() {
+    let feature = Feature::DaemonAutoStart;
+    let stage = feature.stage();
+    let (app_tx, _app_rx) = tokio::sync::mpsc::unbounded_channel();
+    let view = ExperimentalFeaturesView::new(
+        vec![ExperimentalFeatureItem {
+            key: feature.key().to_string(),
+            name: stage.experimental_menu_name().unwrap().to_string(),
+            description: stage.experimental_menu_description().unwrap().to_string(),
+            enabled: feature.default_enabled(),
+            writable: true,
+        }],
+        ThreadId::new(),
+        /*catalog_rx*/ None,
+        AppEventSender::new(app_tx),
+        crate::keymap::RuntimeKeymap::defaults().list,
+    );
+    snapshot_view("daemon_auto_start_menu", &view);
 }

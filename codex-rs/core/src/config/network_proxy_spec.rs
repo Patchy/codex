@@ -5,6 +5,7 @@ use codex_network_proxy::ConfigReloader;
 use codex_network_proxy::ConfigReloaderFuture;
 use codex_network_proxy::ConfigState;
 use codex_network_proxy::EnvironmentNetworkPolicy;
+use codex_network_proxy::ManagedProxyRouting;
 use codex_network_proxy::NetworkDecision;
 use codex_network_proxy::NetworkPolicyDecider;
 use codex_network_proxy::NetworkProxy;
@@ -34,19 +35,29 @@ pub struct NetworkProxySpec {
 
 pub struct StartedNetworkProxy {
     proxy: NetworkProxy,
+    network_policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
     _handle: NetworkProxyHandle,
 }
 
 impl StartedNetworkProxy {
-    fn new(proxy: NetworkProxy, handle: NetworkProxyHandle) -> Self {
+    fn new(
+        proxy: NetworkProxy,
+        handle: NetworkProxyHandle,
+        network_policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
+    ) -> Self {
         Self {
             proxy,
+            network_policy_decider,
             _handle: handle,
         }
     }
 
     pub fn proxy(&self) -> NetworkProxy {
         self.proxy.clone()
+    }
+
+    pub(crate) fn network_policy_decider(&self) -> Option<Arc<dyn NetworkPolicyDecider>> {
+        self.network_policy_decider.as_ref().map(Arc::clone)
     }
 }
 
@@ -78,6 +89,10 @@ impl ConfigReloader for StaticNetworkProxyReloader {
 impl NetworkProxySpec {
     pub(crate) fn enabled(&self) -> bool {
         self.config.enabled
+    }
+
+    pub(crate) fn credential_broker_enabled(&self) -> bool {
+        self.config.credential_broker && self.constraints.enabled != Some(false)
     }
 
     pub fn proxy_host_and_port(&self) -> String {
@@ -175,13 +190,17 @@ impl NetworkProxySpec {
     pub async fn start_proxy(
         &self,
         permission_profile: &PermissionProfile,
+        managed_proxy_routing: ManagedProxyRouting,
         policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
         blocked_request_observer: Option<Arc<dyn BlockedRequestObserver>>,
         enable_network_approval_flow: bool,
         audit_metadata: NetworkProxyAuditMetadata,
     ) -> std::io::Result<StartedNetworkProxy> {
         let state = self.build_state_with_audit_metadata(audit_metadata)?;
-        let mut builder = NetworkProxy::builder().state(Arc::new(state));
+        let mut builder = NetworkProxy::builder()
+            .state(Arc::new(state))
+            .managed_proxy_routing(managed_proxy_routing);
+        let retained_policy_decider = policy_decider.as_ref().map(Arc::clone);
         if enable_network_approval_flow && !self.hard_deny_allowlist_misses {
             if let Some(policy_decider) = policy_decider {
                 builder = builder.policy_decider_arc(policy_decider);
@@ -200,7 +219,11 @@ impl NetworkProxySpec {
             .run()
             .await
             .map_err(|err| std::io::Error::other(format!("failed to run network proxy: {err}")))?;
-        Ok(StartedNetworkProxy::new(proxy, handle))
+        Ok(StartedNetworkProxy::new(
+            proxy,
+            handle,
+            retained_policy_decider,
+        ))
     }
 
     pub(crate) fn recompute_for_permission_profile(
@@ -243,7 +266,7 @@ impl NetworkProxySpec {
                 NetworkProxyConfig {
                     enabled: true,
                     // Without a controller, the owner supplies the entire permission ceiling.
-                    dangerously_allow_all_unix_sockets: true,
+                    dangerously_allow_all_unix_sockets: Some(true),
                     allow_local_binding: true,
                     ..NetworkProxyConfig::default()
                 },
@@ -285,6 +308,13 @@ impl NetworkProxySpec {
                 format!("environment network policy violates managed requirements: {error}"),
             )
         })?;
+        tracing::debug!(
+            controller_policy = ?controller.map(Self::environment_policy),
+            controller_allow_all_unix_sockets = ?controller.and_then(|spec| spec.config.dangerously_allow_all_unix_sockets),
+            attachment_policy = ?policy,
+            effective_policy = ?spec.environment_policy(),
+            "resolved environment network policy"
+        );
         Ok(spec)
     }
 
@@ -330,7 +360,7 @@ impl NetworkProxySpec {
         ))
     }
 
-    fn build_config_state_for_spec(&self) -> std::io::Result<ConfigState> {
+    pub(super) fn build_config_state_for_spec(&self) -> std::io::Result<ConfigState> {
         build_config_state(self.config.clone(), self.constraints.clone()).map_err(|err| {
             std::io::Error::other(format!("failed to build network proxy state: {err}"))
         })
@@ -371,7 +401,7 @@ impl NetworkProxySpec {
         if let Some(dangerously_allow_all_unix_sockets) =
             requirements.dangerously_allow_all_unix_sockets
         {
-            config.dangerously_allow_all_unix_sockets = dangerously_allow_all_unix_sockets;
+            config.dangerously_allow_all_unix_sockets = Some(dangerously_allow_all_unix_sockets);
             constraints.dangerously_allow_all_unix_sockets =
                 Some(dangerously_allow_all_unix_sockets);
         }

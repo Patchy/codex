@@ -16,6 +16,7 @@ use codex_execpolicy::Evaluation;
 use codex_execpolicy::MatchOptions;
 use codex_execpolicy::Policy;
 use codex_execpolicy::RuleMatch;
+use codex_prompts::ResolvedModelMessages;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::AdditionalPermissionProfile;
@@ -293,8 +294,9 @@ impl CoreShellActionProvider {
                     })?;
                 let approval_ctx = ApprovalContext {
                     review_context: GuardianReviewContext::from_resolved_settings(
-                        turn_context,
+                        Arc::clone(&turn_context),
                         &step_settings,
+                        &turn_context.environments,
                     ),
                     // The running process can outlive its launching tool or code-mode cell.
                     cancellation_token: None,
@@ -368,9 +370,12 @@ impl CoreShellActionProvider {
                             EscalationDecision::deny(Some(rejection))
                         }
                         ReviewDecision::TimedOut => EscalationDecision::deny(Some(
-                            crate::guardian::guardian_timeout_message(
+                            ResolvedModelMessages::from_model(
                                 self.review_context.turn().model_info(),
-                            ),
+                            )
+                            .auto_review()
+                            .timeout_instructions
+                            .to_string(),
                         )),
                         ReviewDecision::ApprovedMcpPolicyAmendment => {
                             error!("Shell escalation received ApprovedMcpPolicyAmendment");
@@ -788,7 +793,7 @@ impl CoreShellCommandExecutor {
             environment_id: self.network_environment_id.as_deref(),
             network: self.network.as_ref(),
             sandbox_policy_cwd: &sandbox_policy_cwd,
-            codex_linux_sandbox_exe: self.codex_linux_sandbox_exe.as_deref(),
+            sandbox_exe: self.codex_linux_sandbox_exe.as_deref(),
             use_legacy_landlock: self.use_legacy_landlock,
             windows_sandbox_level: self.windows_sandbox_level,
             windows_sandbox_private_desktop: false,

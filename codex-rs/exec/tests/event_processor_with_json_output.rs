@@ -169,6 +169,7 @@ fn turn_started_emits_turn_started_event() {
 fn command_execution_started_and_completed_translate_to_thread_events() {
     let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
     let command_item = ThreadItem::CommandExecution {
+        model_context: None,
         id: "cmd-1".to_string(),
         command: "ls".to_string(),
         cwd: test_path_buf("/tmp/project").abs().into(),
@@ -211,6 +212,7 @@ fn command_execution_started_and_completed_translate_to_thread_events() {
     let completed = processor.collect_thread_events(ServerNotification::ItemCompleted(
         ItemCompletedNotification {
             item: ThreadItem::CommandExecution {
+                model_context: None,
                 id: "cmd-1".to_string(),
                 command: "ls".to_string(),
                 cwd: test_path_buf("/tmp/project").abs().into(),
@@ -490,6 +492,7 @@ fn mcp_tool_call_begin_and_end_emit_item_events() {
                 arguments: json!({ "key": "value" }),
                 app_context: None,
                 mcp_app_resource_uri: None,
+                mcp_app_ui: None,
                 plugin_id: None,
                 read_only_hint: None,
                 result: None,
@@ -510,6 +513,7 @@ fn mcp_tool_call_begin_and_end_emit_item_events() {
                 arguments: json!({ "key": "value" }),
                 app_context: None,
                 mcp_app_resource_uri: None,
+                mcp_app_ui: None,
                 plugin_id: None,
                 read_only_hint: None,
                 result: Some(Box::new(McpToolCallResult {
@@ -584,6 +588,7 @@ fn mcp_tool_call_failure_sets_failed_status() {
                 arguments: json!({ "param": 42 }),
                 app_context: None,
                 mcp_app_resource_uri: None,
+                mcp_app_ui: None,
                 plugin_id: None,
                 read_only_hint: None,
                 result: None,
@@ -635,6 +640,7 @@ fn mcp_tool_call_defaults_arguments_and_preserves_structured_content() {
                 arguments: serde_json::Value::Null,
                 app_context: None,
                 mcp_app_resource_uri: None,
+                mcp_app_ui: None,
                 plugin_id: None,
                 read_only_hint: None,
                 result: None,
@@ -655,6 +661,7 @@ fn mcp_tool_call_defaults_arguments_and_preserves_structured_content() {
                 arguments: serde_json::Value::Null,
                 app_context: None,
                 mcp_app_resource_uri: None,
+                mcp_app_ui: None,
                 plugin_id: None,
                 read_only_hint: None,
                 result: Some(Box::new(McpToolCallResult {
@@ -1348,6 +1355,7 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
     let started =
         processor.collect_thread_events(ServerNotification::ItemStarted(ItemStartedNotification {
             item: ThreadItem::CommandExecution {
+                model_context: None,
                 id: "cmd-1".to_string(),
                 command: "ls".to_string(),
                 cwd: test_path_buf("/tmp/project").abs().into(),
@@ -1390,6 +1398,7 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: vec![ThreadItem::CommandExecution {
+                    model_context: None,
                     id: "cmd-1".to_string(),
                     command: "ls".to_string(),
                     cwd: test_path_buf("/tmp/project").abs().into(),

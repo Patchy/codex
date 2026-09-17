@@ -77,6 +77,8 @@ mod status_line_setup;
 mod status_line_style;
 mod status_surface_preview;
 mod title_setup;
+pub(crate) mod user_verification;
+mod voice_strip;
 pub(crate) use action_required_title::ACTION_REQUIRED_PREVIEW_PREFIX;
 pub(crate) use action_required_title::build_action_required_title_text;
 pub(crate) use actionable_banner::ActionableBanner;
@@ -99,6 +101,8 @@ pub(crate) use mcp_server_elicitation::McpServerElicitationFormRequest;
 pub(crate) use mcp_server_elicitation::McpServerElicitationOverlay;
 pub(crate) use request_user_input::RequestUserInputOverlay;
 pub(crate) use status_line_style::status_line_from_segments;
+pub(crate) use voice_strip::VoiceStripPhase;
+pub(crate) use voice_strip::VoiceStripState;
 mod bottom_pane_view;
 mod effort_ignition;
 
@@ -218,6 +222,7 @@ pub(crate) use chat_composer::ComposerDraftSnapshot;
 pub(crate) use chat_composer::InputResult;
 pub(crate) use chat_composer::QueuedInputAction;
 pub(crate) use chat_composer_history::HistoryEntry;
+pub(crate) use textarea::KillBufferSnapshot;
 
 use crate::status_indicator_widget::StatusDetailsCapitalization;
 use crate::status_indicator_widget::StatusIndicatorWidget;
@@ -228,6 +233,7 @@ pub(crate) use list_selection_view::SELECTION_TOGGLE_BLOCKED_PREFIX;
 pub(crate) use list_selection_view::SELECTION_TOGGLE_UNAVAILABLE_PREFIX;
 pub(crate) use list_selection_view::SelectionAction;
 pub(crate) use list_selection_view::SelectionItem;
+pub(crate) use list_selection_view::SelectionSecondaryAction;
 
 struct DelayedApprovalRequest {
     request: ApprovalRequest,
@@ -475,6 +481,11 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    pub(crate) fn transcript_shortcut_hint(&self) -> Option<crate::key_hint::ShortcutHint> {
+        self.keymap
+            .primary_hint(KeymapContext::Global, "open_transcript")
+    }
+
     /// Clear pending attachments and mention bindings e.g. when a slash command doesn't submit text.
     pub(crate) fn drain_pending_submission_state(&mut self) {
         let _ = self.take_recent_submission_images_with_placeholders();
@@ -516,8 +527,8 @@ impl BottomPane {
         self.request_redraw();
     }
 
-    pub fn set_personality_command_enabled(&mut self, enabled: bool) {
-        self.composer.set_personality_command_enabled(enabled);
+    pub fn set_worktrees_enabled(&mut self, enabled: bool) {
+        self.composer.set_worktrees_enabled(enabled);
         self.request_redraw();
     }
 
@@ -533,6 +544,11 @@ impl BottomPane {
 
     pub fn set_goal_command_enabled(&mut self, enabled: bool) {
         self.composer.set_goal_command_enabled(enabled);
+        self.request_redraw();
+    }
+
+    pub fn set_voice_command_enabled(&mut self, enabled: bool) {
+        self.composer.set_voice_command_enabled(enabled);
         self.request_redraw();
     }
 
@@ -570,6 +586,14 @@ impl BottomPane {
             questions.set_vim_enabled(enabled);
         }
         self.request_redraw();
+    }
+
+    pub(crate) fn take_kill_buffer_snapshot(&mut self) -> KillBufferSnapshot {
+        self.composer.take_kill_buffer_snapshot()
+    }
+
+    pub(crate) fn restore_kill_buffer_snapshot(&mut self, snapshot: KillBufferSnapshot) {
+        self.composer.restore_kill_buffer_snapshot(snapshot);
     }
 
     pub(crate) fn toggle_vim_enabled(&mut self) -> bool {
@@ -1063,6 +1087,12 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    pub(crate) fn set_voice_strip(&mut self, state: Option<VoiceStripState>) {
+        self.composer
+            .set_voice_strip(state, self.frame_requester.clone());
+        self.request_redraw();
+    }
+
     pub(crate) fn set_remote_image_urls(&mut self, urls: Vec<String>) {
         self.composer.set_remote_image_urls(urls);
         self.request_redraw();
@@ -1272,6 +1302,18 @@ impl BottomPane {
     }
 
     fn apply_standard_popup_hint(&self, params: &mut list_selection_view::SelectionViewParams) {
+        // Configured list actions take precedence over optional row shortcuts.
+        for item in &mut params.items {
+            if item.secondary_action.as_ref().is_some_and(|secondary| {
+                let (code, modifiers) = secondary.key.parts();
+                self.keymap
+                    .list
+                    .action_for(KeyEvent::new(code, modifiers))
+                    .is_some()
+            }) {
+                item.secondary_action = None;
+            }
+        }
         if !params.allow_cancel {
             if params.footer_hint.is_none()
                 || params.footer_hint.as_ref() == Some(&popup_consts::standard_popup_hint_line())

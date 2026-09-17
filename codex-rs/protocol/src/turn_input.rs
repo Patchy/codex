@@ -135,6 +135,9 @@ pub enum TurnInputMode {
     StartOrSteer,
     /// Start only when the thread is idle.
     StartIfIdle,
+    /// Start an internal continuation when idle.
+    /// Reject if another task has started since the expected previous turn.
+    ContinueIfIdle { expected_previous_turn_id: String },
     /// Steer only if this exact turn is active.
     Steer { expected_turn_id: String },
 }
@@ -158,8 +161,6 @@ pub enum CyberAccessProgram {
 /// child input, Core also compares root lineage to detect ambiguity.
 #[derive(Clone, Debug, Default)]
 pub struct TurnStartOptions {
-    /// Parent inference receipt for an internal Guardian turn. Never persisted.
-    pub guardian_ticket: Option<crate::guardian_ticket::GuardianTicket>,
     /// Source classification for the caller that starts a new turn.
     /// Ignored when the submitted input steers an active turn.
     pub turn_trigger: Option<String>,
@@ -217,6 +218,12 @@ pub enum SteerSubmission {
 /// Why Core did not accept submitted turn input for turn processing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NotSubmittedReason {
+    /// New work superseded the expected previous turn of an internal continuation.
+    Superseded,
+
+    /// The host is draining and no longer permits new regular turns.
+    ServerDraining,
+
     /// `start_turn_if_idle` found an active turn.
     NotIdle,
 
