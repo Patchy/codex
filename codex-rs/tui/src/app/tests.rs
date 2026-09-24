@@ -21,16 +21,24 @@ mod backend_banner_startup_tests;
 mod background_exit_tests;
 #[path = "tests/background_task_defaults_tests.rs"]
 mod background_task_defaults_tests;
+#[path = "tests/browsing_pagination_tests.rs"]
+mod browsing_pagination_tests;
 #[path = "tests/buffered_replay.rs"]
 mod buffered_replay;
 #[path = "tests/connector_policy.rs"]
 mod connector_policy;
 #[path = "tests/disconnect_tests.rs"]
 mod disconnect;
+#[path = "tests/external_writer_fork_tests.rs"]
+mod external_writer_fork_tests;
+#[path = "tests/fork_workspace_roots_tests.rs"]
+mod fork_workspace_roots_tests;
 #[path = "tests/fresh_sparkle_tests.rs"]
 mod fresh_sparkle_tests;
 #[path = "tests/key_chords.rs"]
 mod key_chords;
+#[path = "tests/local_command_scroll_tests.rs"]
+mod local_command_scroll_tests;
 #[path = "tests/luna_reserve_recovery_tests.rs"]
 mod luna_reserve_recovery_tests;
 #[path = "tests/mcp_startup.rs"]
@@ -46,7 +54,11 @@ mod pagination_completion_tests;
 mod patch_approval_tests;
 #[path = "tests/permission_selection_tests.rs"]
 mod permission_selection_tests;
+#[path = "tests/unavailable_commands_tests.rs"]
+mod unavailable_commands;
 
+#[path = "tests/history_hydration_tests.rs"]
+mod history_hydration_tests;
 #[path = "tests/permission_shortcuts_tests.rs"]
 mod permission_shortcuts_tests;
 mod plugin_catalog;
@@ -61,11 +73,15 @@ mod realtime_start;
 mod reasoning_resume_tests;
 #[path = "tests/recap_generation_tests.rs"]
 mod recap_generation;
+#[path = "tests/resume_shutdown_tests.rs"]
+mod resume_shutdown_tests;
 mod safety_buffering;
 #[path = "tests/session_lifecycle_requests.rs"]
 mod session_lifecycle_requests;
 mod session_summary;
 mod startup;
+#[path = "tests/startup_frame_tests.rs"]
+mod startup_frame_tests;
 #[path = "tests/startup_warnings_tests.rs"]
 mod startup_warnings_tests;
 #[path = "tests/stream_animation_tests.rs"]
@@ -74,6 +90,8 @@ mod stream_animation_tests;
 mod thread_usage;
 #[path = "tests/transcript_composer.rs"]
 mod transcript_composer;
+#[path = "tests/transcript_selection.rs"]
+mod transcript_selection;
 #[path = "tests/turn_submission.rs"]
 mod turn_submission;
 #[path = "tests/user_verification_routes_tests.rs"]
@@ -84,6 +102,7 @@ mod worktree_background_terminals_tests;
 use super::*;
 use crate::app_backtrack::BacktrackSelection;
 use crate::app_backtrack::BacktrackState;
+use crate::app_backtrack::nth_user_position;
 use crate::app_backtrack::user_count;
 use crate::app_event::HistoryBatchEntryResponse;
 
@@ -413,6 +432,7 @@ async fn handle_mcp_inventory_result_respects_origin_thread() {
             name: "docs".to_string(),
             runtime_status: None,
             plugin_id: None,
+            http_origin: None,
             server_info: None,
             tools: HashMap::new(),
             resources: Vec::new(),
@@ -447,7 +467,7 @@ fn bypass_hook_trust_startup_warning_snapshot() {
             "`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation."
                 .to_string(),
         )
-        .display_lines(/*width*/ 80),
+        .transcript_lines(/*width*/ 80),
     );
 
     assert_app_snapshot!("bypass_hook_trust_startup_warning", rendered);
@@ -471,7 +491,7 @@ async fn cyber_model_auto_review_notice_snapshot() -> Result<()> {
         Ok(AppEvent::InsertHistoryCell(cell)) => cell,
         other => panic!("expected InsertHistoryCell event, got {other:?}"),
     };
-    let rendered = lines_to_single_string(&cell.display_lines(/*width*/ 80));
+    let rendered = lines_to_single_string(&cell.transcript_lines(/*width*/ 80));
     assert_app_snapshot!("cyber_model_auto_review_notice", rendered);
     Ok(())
 }
@@ -594,6 +614,31 @@ async fn enqueue_primary_thread_session_replays_buffered_approval_after_attach()
     };
     *request_id = AppServerRequestId::Integer(2);
     params.thread_id = background_thread_id.to_string();
+    app.pending_app_server_requests
+        .note_server_request(&background_request);
+    app.enqueue_thread_request(background_thread_id, background_request.clone())
+        .await?;
+
+    crate::chatwidget::activate_voice_for_thread(&mut app.chat_widget, thread_id);
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    app.replace_chat_widget_with_app_server_thread(
+        &mut tui,
+        AppServerStartedThread {
+            session: test_thread_session(ThreadId::new(), app.config.cwd.to_path_buf()),
+            turns: Vec::new(),
+            blocks_direct_input: false,
+            task_tools_available: false,
+        },
+        session_lifecycle::ThreadAttachPresentation::SessionLineage,
+        /*initial_user_message*/ None,
+    )
+    .await?;
+    Box::pin(app.select_agent_thread(&mut tui, &mut app_server, thread_id)).await?;
+
+    assert!(
+        !app.pending_app_server_requests
+            .contains_server_request(&background_request)
+    );
     app.pending_app_server_requests
         .note_server_request(&background_request);
     app.enqueue_thread_request(background_thread_id, background_request)
@@ -824,7 +869,7 @@ async fn reset_thread_event_state_aborts_listener_tasks() {
         .await
         .expect("listener task should report it started");
 
-    app.reset_thread_event_state();
+    app.reset_thread_event_state().await;
 
     assert_eq!(app.thread_event_listener_tasks.is_empty(), true);
     assert!(app.pending_server_profiles.is_empty());
@@ -3780,7 +3825,7 @@ async fn side_defers_parent_approval_overlay_until_parent_replay() -> Result<()>
 }
 
 #[tokio::test]
-async fn replay_snapshot_with_pending_request_suppresses_replay_notices() {
+async fn replay_snapshot_with_pending_request_retains_warnings_without_covering_approval() {
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
     let thread_id =
         ThreadId::from_string("00000000-0000-0000-0000-000000000011").expect("valid thread");
@@ -3814,14 +3859,19 @@ async fn replay_snapshot_with_pending_request_suppresses_replay_notices() {
     assert_eq!(app.chat_widget.has_active_view(), true);
 
     let mut replayed_history = String::new();
+    let mut warnings = Vec::new();
     while let Ok(event) = app_event_rx.try_recv() {
         if let AppEvent::InsertHistoryCell(cell) = event {
-            replayed_history.push_str(&lines_to_single_string(
-                &cell.transcript_lines(/*width*/ 80),
-            ));
+            warnings.extend(
+                cell.warning_entries()
+                    .into_iter()
+                    .map(|entry| entry.details),
+            );
+            replayed_history.push_str(&lines_to_single_string(&cell.display_lines(/*width*/ 80)));
         }
     }
 
+    assert_eq!(warnings, vec![stale_warning]);
     assert!(
         replayed_history.is_empty(),
         "expected pending approval replay to suppress session notices, got {replayed_history:?}"
@@ -5087,9 +5137,9 @@ async fn side_parent_status_prioritizes_input_over_approval() -> Result<()> {
     assert_snapshot!(
         format!("{input_footer}\n{approval_footer}\n{cleared_footer}"),
         @r"
-        Side from main thread · main needs input · ctrl + / to switch · ctrl + c to close
-        Side from main thread · main needs approval · ctrl + / to switch · ctrl + c to close
-        Side from main thread · ctrl + / to switch · ctrl + c to close
+        Side from main thread · main needs input · ctrl+/ to switch · ctrl+c to close
+        Side from main thread · main needs approval · ctrl+/ to switch · ctrl+c to close
+        Side from main thread · ctrl+/ to switch · ctrl+c to close
         "
     );
 
@@ -5402,14 +5452,7 @@ async fn active_side_thread_renders_live_mcp_startup_notifications() {
             app.insert_history_cell(&mut tui, cell);
         }
     }
-    let inline = app
-        .transcript_cells
-        .iter()
-        .flat_map(|cell| cell.display_lines(/*width*/ 120))
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(inline.contains("1 MCP startup issue"));
+    assert_eq!(history_cell::warning_count(&app.transcript_cells), 1);
     let rendered = rendered_cells.join("\n");
     assert!(app.chat_widget.side_conversation_active());
     assert_eq!(rendered.matches("sentry is not logged in").count(), 1);
@@ -5778,6 +5821,7 @@ async fn render_clear_ui_header_after_long_transcript_for_snapshot() -> String {
             app.chat_widget.config_ref(),
             &app.local_settings,
             app.chat_widget.current_model(),
+            &session.model,
             &session,
             is_first,
             /*tooltip_override*/ None,
@@ -5835,13 +5879,71 @@ async fn clear_ui_after_long_transcript_snapshots_fresh_header_only() {
 }
 
 #[tokio::test]
-#[cfg_attr(
-    target_os = "windows",
-    ignore = "snapshot path rendering differs on Windows"
-)]
-async fn ctrl_l_clear_ui_after_long_transcript_reuses_clear_header_snapshot() {
-    let rendered = render_clear_ui_header_after_long_transcript_for_snapshot().await;
-    assert_app_snapshot!("clear_ui_after_long_transcript_fresh_header_only", rendered);
+async fn ctrl_l_clears_owned_history_and_preserves_the_draft() -> Result<()> {
+    let (mut app, _codex_home, thread_id) =
+        pagination_completion_tests::completed_history_app(&["Oldest", "Newest"]).await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    let mut app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+    let started = app_server
+        .resume_thread(
+            &app.local_settings,
+            app.config.clone(),
+            thread_id,
+            crate::app_server_session::ResumeModelSettings::RestoreFromThread,
+        )
+        .await?;
+    app.enqueue_primary_thread_session(started.session, started.turns)
+        .await?;
+    app.scrollback_has_older_history = app_server.has_older_history(thread_id);
+    assert!(app.scrollback_has_older_history);
+    let cursor = app_server
+        .begin_older_history_page(thread_id)
+        .expect("older page");
+    let page = app_server
+        .thread_items_page(
+            thread_id,
+            /*turn_id*/ None,
+            Some(cursor.clone()),
+            /*limit*/ 100,
+        )
+        .await?;
+    app.chat_widget.set_model("gpt-test");
+    app.chat_widget.insert_str("draft survives");
+    app.transcript_cells = vec![Arc::new(history_cell::PlainHistoryCell::new(
+        (0..50).map(|_| "old transcript row".into()).collect(),
+    ))];
+    tui.set_owned_screen(/*owned*/ true)?;
+    let size = ratatui::layout::Size::new(/*width*/ 80, /*height*/ 12);
+    app.render_owned_transcript(&mut tui, size)?;
+    app.handle_tui_event(
+        &mut tui,
+        &mut app_server,
+        TuiEvent::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+    )
+    .await?;
+    app.render_owned_transcript(&mut tui, size)?;
+    app.handle_older_history_page(&mut tui, &mut app_server, thread_id, &cursor, Ok(page))
+        .await?;
+    assert!(app_server.has_older_history(thread_id));
+    app.request_owned_history(&mut tui, &mut app_server);
+    assert!(!app_server.is_older_history_page_pending(thread_id, &cursor));
+    assert_eq!(app.transcript_cells.len(), 1);
+    assert!(
+        app.transcript_cells[0]
+            .as_any()
+            .is::<history_cell::SessionHeaderHistoryCell>()
+    );
+    let header = lines_to_single_string(&app.transcript_cells[0].display_lines(/*width*/ 80));
+    assert!(header.contains("gpt-test"));
+    assert!(!header.contains("old transcript row"));
+    assert_eq!(
+        app.chat_widget.composer_text_with_pending(),
+        "draft survives"
+    );
+    assert!(tui.is_owned_screen());
+    tui.set_owned_screen(/*owned*/ false)?;
+    app_server.shutdown().await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -5879,14 +5981,14 @@ async fn clear_ui_header_shows_fast_status_for_fast_capable_models() {
     assert_app_snapshot!("clear_ui_header_fast_status_fast_capable_models", rendered);
 }
 
-async fn make_test_app() -> App {
+async fn make_test_app() -> Box<App> {
     let (chat_widget, app_event_tx, _rx, _op_rx) = make_chatwidget_manual_with_sender().await;
     let config = chat_widget.config_ref().clone();
     let file_search = FileSearchManager::new(config.cwd.to_path_buf(), app_event_tx.clone());
     let model = get_model_offline_for_tests(config.model.as_deref());
     let session_telemetry = test_session_telemetry(&config, model.as_str());
 
-    App {
+    Box::new(App {
         feature_write_lock: Arc::default(),
         model_catalog: chat_widget.model_catalog(),
         session_telemetry,
@@ -5906,6 +6008,9 @@ async fn make_test_app() -> App {
         runtime_permission_profile_override: None,
         file_search,
         transcript_cells: Vec::new(),
+        composer_tips: super::composer_hints::ComposerTips::new(/*seed*/ 0),
+        native_history: Default::default(),
+        transcript_view: Default::default(),
         last_rendered_history_tail: None,
         last_thread_usage_status_cell: None,
         pending_thread_usage_history_refresh: false,
@@ -5939,6 +6044,8 @@ async fn make_test_app() -> App {
         pending_realtime_speech_replay: HashMap::new(),
         pending_realtime_transcript_replay: HashMap::new(),
         realtime_replay_order: VecDeque::new(),
+        background_voice: None,
+        background_voice_error: None,
         temporary_structured_requests: HashMap::new(),
         pending_thread_titles: HashMap::new(),
         thread_event_listener_tasks: HashMap::new(),
@@ -5972,11 +6079,11 @@ async fn make_test_app() -> App {
         pending_plugin_enabled_writes: HashMap::new(),
         pending_hook_enabled_writes: HashMap::new(),
         recap: recap::RecapState::default(),
-    }
+    })
 }
 
 pub(super) async fn make_test_app_with_channels() -> (
-    App,
+    Box<App>,
     tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
     tokio::sync::mpsc::UnboundedReceiver<Op>,
 ) {
@@ -5987,7 +6094,7 @@ pub(super) async fn make_test_app_with_channels() -> (
     let session_telemetry = test_session_telemetry(&config, model.as_str());
 
     (
-        App {
+        Box::new(App {
             feature_write_lock: Arc::default(),
             model_catalog: chat_widget.model_catalog(),
             session_telemetry,
@@ -6007,6 +6114,9 @@ pub(super) async fn make_test_app_with_channels() -> (
             runtime_permission_profile_override: None,
             file_search,
             transcript_cells: Vec::new(),
+            composer_tips: super::composer_hints::ComposerTips::new(/*seed*/ 0),
+            native_history: Default::default(),
+            transcript_view: Default::default(),
             last_rendered_history_tail: None,
             last_thread_usage_status_cell: None,
             pending_thread_usage_history_refresh: false,
@@ -6040,6 +6150,8 @@ pub(super) async fn make_test_app_with_channels() -> (
             pending_realtime_speech_replay: HashMap::new(),
             pending_realtime_transcript_replay: HashMap::new(),
             realtime_replay_order: VecDeque::new(),
+            background_voice: None,
+            background_voice_error: None,
             temporary_structured_requests: HashMap::new(),
             pending_thread_titles: HashMap::new(),
             thread_event_listener_tasks: HashMap::new(),
@@ -6073,7 +6185,7 @@ pub(super) async fn make_test_app_with_channels() -> (
             pending_plugin_enabled_writes: HashMap::new(),
             pending_hook_enabled_writes: HashMap::new(),
             recap: recap::RecapState::default(),
-        },
+        }),
         rx,
         op_rx,
     )
@@ -6501,8 +6613,7 @@ async fn capped_resize_reflow_renders_recent_suffix_only() {
             .map(rendered_line_text)
             .collect::<Vec<_>>(),
         vec![
-            "Earlier messages are available — press ctrl + t to view the full transcript"
-                .to_string(),
+            "Earlier messages are available — press ctrl+t to view the full transcript".to_string(),
             String::new(),
             "cell 18".to_string(),
             String::new(),
@@ -7344,6 +7455,7 @@ async fn backtrack_selection_preserves_selected_prompt_and_requests_branch() {
             app.chat_widget.config_ref(),
             &app.local_settings,
             app.chat_widget.current_model(),
+            &session.model,
             &session,
             is_first,
             /*tooltip_override*/ None,
@@ -7445,10 +7557,10 @@ async fn backtrack_selection_preserves_selected_prompt_and_requests_branch() {
         event,
         AppEvent::RevertSessionForPromptEdit {
             thread_id,
-            nth_user_message,
+            selected_cell,
             prompt,
         } if thread_id == expected.thread_id
-            && nth_user_message == expected.nth_user_message
+            && Arc::ptr_eq(&selected_cell, &app.transcript_cells[nth_user_position(&app.transcript_cells, expected.nth_user_message).unwrap()])
             && prompt == expected.prompt
     );
 
@@ -7802,6 +7914,8 @@ async fn in_app_resume_uses_configured_or_explicit_cwd() -> Result<()> {
                 crate::start_app_server_for_picker(
                     &config,
                     &crate::AppServerTarget::Embedded,
+                    Vec::new(),
+                    LoaderOverrides::without_managed_config_for_tests(),
                     /*state_db*/ None,
                     Arc::clone(&environment_manager),
                 )
@@ -7947,6 +8061,8 @@ async fn remembered_current_cwd_stays_at_launch_across_in_app_resumes() -> Resul
     let mut app_server = Box::pin(crate::start_app_server_for_picker(
         &config,
         &crate::AppServerTarget::Embedded,
+        Vec::new(),
+        LoaderOverrides::without_managed_config_for_tests(),
         state_db.clone(),
         Arc::new(EnvironmentManager::default_for_tests()),
     ))
@@ -8074,9 +8190,12 @@ async fn prompt_edit_reverts_earlier_and_first_visible_prompts_in_place() -> Res
 
     let source_thread_id = ThreadId::from_string(&source_thread_id)?;
     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&config)).await?;
-    // Leave the oldest prompt on an unloaded page.
+    // Bound fixture hydration independently from the owned viewport exercised below.
+    // Inline hydration's row cap leaves the oldest prompt on an unloaded page.
     let mut local_settings = crate::local_settings::LocalSettings::from(&config);
-    local_settings.tui.terminal_resize_reflow_max_rows = Some(3);
+    local_settings.transcript_mode = crate::transcript_mode::TranscriptMode::Terminal;
+    local_settings.tui.alternate_screen = codex_config::types::AltScreenMode::Never;
+    local_settings.tui.terminal_resize_reflow_max_rows = Some(2);
     let started = app_server
         .resume_thread(
             &local_settings,
@@ -8089,6 +8208,7 @@ async fn prompt_edit_reverts_earlier_and_first_visible_prompts_in_place() -> Res
     let selected_turn = started.turns[3].clone();
     app.enqueue_primary_thread_session(started.session, started.turns)
         .await?;
+    app.scrollback_has_older_history = app_server.has_older_history(source_thread_id);
     {
         let mut store = app
             .thread_event_channels
@@ -8124,7 +8244,7 @@ async fn prompt_edit_reverts_earlier_and_first_visible_prompts_in_place() -> Res
             app.transcript_cells.push(Arc::from(cell));
         }
     }
-    assert_eq!(crate::app_backtrack::user_count(&app.transcript_cells), 3);
+    assert_eq!(crate::app_backtrack::user_count(&app.transcript_cells), 2);
     let child_id = ThreadId::new();
     let child = Arc::clone(&app.ensure_thread_channel(child_id).store);
     let goal = app_server
@@ -8137,6 +8257,48 @@ async fn prompt_edit_reverts_earlier_and_first_visible_prompts_in_place() -> Res
         .await?
         .goal;
     let mut tui = crate::tui::test_support::make_test_tui()?;
+    tui.set_owned_screen(/*owned*/ true)?;
+    let size = Size::new(/*width*/ 80, /*height*/ 24);
+    app.render_owned_transcript(&mut tui, size)?;
+    app.transcript_view
+        .scroll(&app.transcript_cells, /*rows*/ -1);
+    app.render_owned_transcript(&mut tui, size)?;
+    // Freeze a visible selection before the same thread's authoritative history changes.
+    let selected_row = crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal)
+        .content()
+        .chunks(usize::from(size.width))
+        .position(|row| {
+            row.iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>()
+                .contains("selected prompt")
+        })
+        .expect("selected prompt should be visible") as u16;
+    for (kind, column) in [
+        (
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            2,
+        ),
+        (
+            crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            8,
+        ),
+    ] {
+        app.transcript_view.handle_mouse(
+            crossterm::event::MouseEvent {
+                kind,
+                column,
+                row: selected_row,
+                modifiers: KeyModifiers::NONE,
+            },
+            &app.transcript_cells,
+        );
+    }
+    assert!(
+        app.transcript_view
+            .selected_text(&app.transcript_cells)
+            .is_some()
+    );
     let prompt = crate::chatwidget::UserMessage {
         text: "selected prompt [Image #1]".to_string(),
         local_images: vec![crate::bottom_pane::LocalImageAttachment {
@@ -8154,16 +8316,72 @@ async fn prompt_edit_reverts_earlier_and_first_visible_prompts_in_place() -> Res
         AppEvent::UpdateModel("gpt-5.4".into()),
     ))
     .await?;
-    let control = Box::pin(app.handle_event(
+    app.app_server_target = crate::AppServerTarget::Remote {
+        endpoint: crate::RemoteAppServerEndpoint::WebSocket {
+            websocket_url: "ws://127.0.0.1:4500".to_string(),
+            auth_token: None,
+        },
+    };
+    let before = app_server
+        .thread_read(source_thread_id, /*include_turns*/ true)
+        .await?;
+    for text in [None, Some("/help"), Some(" \t!")] {
+        let mut remote_prompt = prompt.clone();
+        if let Some(text) = text {
+            remote_prompt.text = text.into();
+            remote_prompt.local_images.clear();
+        }
+        Box::pin(app.handle_event(
+            &mut tui,
+            &mut app_server,
+            AppEvent::RevertSessionForPromptEdit {
+                thread_id: source_thread_id,
+                selected_cell: Arc::clone(
+                    &app.transcript_cells
+                        [nth_user_position(&app.transcript_cells, /*nth*/ 1).unwrap()],
+                ),
+                prompt: remote_prompt,
+            },
+        ))
+        .await?;
+        assert!(app.chat_widget.composer_is_empty());
+        assert_eq!(
+            app_server
+                .thread_read(source_thread_id, /*include_turns*/ true)
+                .await?
+                .turns,
+            before.turns
+        );
+    }
+    app.app_server_target = crate::AppServerTarget::Embedded;
+    let selection = AppEvent::RevertSessionForPromptEdit {
+        thread_id: source_thread_id,
+        selected_cell: Arc::clone(
+            &app.transcript_cells[nth_user_position(&app.transcript_cells, /*nth*/ 1).unwrap()],
+        ),
+        prompt: prompt.clone(),
+    };
+    // A queued page shifts both identical prompts before confirmation is dispatched.
+    let cursor = app_server
+        .begin_older_history_page(source_thread_id)
+        .expect("older page");
+    let page = app_server
+        .thread_items_page(
+            source_thread_id,
+            /*turn_id*/ None,
+            Some(cursor.clone()),
+            /*limit*/ 1,
+        )
+        .await?;
+    app.handle_older_history_page(
         &mut tui,
         &mut app_server,
-        AppEvent::RevertSessionForPromptEdit {
-            thread_id: source_thread_id,
-            nth_user_message: 1,
-            prompt: prompt.clone(),
-        },
-    ))
+        source_thread_id,
+        &cursor,
+        Ok(page),
+    )
     .await?;
+    let control = Box::pin(app.handle_event(&mut tui, &mut app_server, selection)).await?;
 
     while let Ok(event) = app_event_rx.try_recv() {
         match event {
@@ -8174,6 +8392,32 @@ async fn prompt_edit_reverts_earlier_and_first_visible_prompts_in_place() -> Res
             _ => {}
         }
     }
+    assert_eq!(
+        (
+            app.transcript_view.is_following(),
+            app.transcript_view.selected_text(&app.transcript_cells)
+        ),
+        (true, None),
+    );
+    let bottom = app.render_owned_transcript(&mut tui, size)?;
+    let buffer = crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal);
+    let transcript = buffer
+        .content()
+        .chunks(usize::from(size.width))
+        .take(usize::from(bottom.y))
+        .map(|row| {
+            row.iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let stable_cwd = "/tmp/project";
+    let cwd = test_path_buf(stable_cwd).display().to_string();
+    let transcript = transcript.replace(&cwd, &format!("{stable_cwd:<width$}", width = cwd.len()));
+    insta::assert_snapshot!("owned_prompt_revert_retained_history", transcript);
     assert!(Arc::ptr_eq(
         &child,
         &app.thread_event_channels[&child_id].store
@@ -8199,7 +8443,7 @@ async fn prompt_edit_reverts_earlier_and_first_visible_prompts_in_place() -> Res
             .iter()
             .map(|turn| turn.id.as_str())
             .collect::<Vec<_>>(),
-        vec!["turn-0", "turn-1"]
+        vec!["turn-0", "turn-1", "turn-2"]
     );
 
     let history = app
@@ -8223,7 +8467,9 @@ async fn prompt_edit_reverts_earlier_and_first_visible_prompts_in_place() -> Res
             .iter()
             .any(|line| line.contains("Thread forked from"))
     );
-    // Editing the first visible prompt leaves the unloaded prefix intact.
+    // Editing the first visible prompt also discards search state from the removed window.
+    app.transcript_view.begin_search();
+    assert!(app.transcript_view.is_search_active());
     app.chat_widget.restore_thread_input_state(
         /*input_state*/ None,
         crate::chatwidget::ThreadInputStateRestoreMode {
@@ -8235,7 +8481,9 @@ async fn prompt_edit_reverts_earlier_and_first_visible_prompts_in_place() -> Res
         &mut app_server,
         AppEvent::RevertSessionForPromptEdit {
             thread_id: source_thread_id,
-            nth_user_message: 0,
+            selected_cell: Arc::clone(
+                &app.transcript_cells[nth_user_position(&app.transcript_cells, /*nth*/ 0).unwrap()],
+            ),
             prompt: "retained prompt".into(),
         },
     ))
@@ -8245,6 +8493,8 @@ async fn prompt_edit_reverts_earlier_and_first_visible_prompts_in_place() -> Res
             Box::pin(app.handle_event(&mut tui, &mut app_server, event)).await?;
         }
     }
+    assert!(!app.transcript_view.is_search_active());
+    assert!(app.transcript_view.is_following());
     assert_eq!(app.chat_widget.thread_id(), Some(source_thread_id));
     assert_eq!(
         app.chat_widget.composer_text_with_pending(),
@@ -8261,25 +8511,21 @@ async fn prompt_edit_reverts_earlier_and_first_visible_prompts_in_place() -> Res
             .collect::<Vec<_>>(),
         vec!["turn-0"]
     );
-    let cursor = app_server
-        .begin_older_history_page(source_thread_id)
-        .expect("retained prefix should remain pageable after reverting the visible window");
-    let page = app_server
-        .thread_items_page(
-            source_thread_id,
-            /*turn_id*/ None,
-            Some(cursor.clone()),
-            /*limit*/ 100,
-        )
+    tui.set_owned_screen(/*owned*/ true)?;
+    app.handle_tui_event(&mut tui, &mut app_server, TuiEvent::Draw)
         .await?;
-    app.handle_older_history_page(
-        &mut tui,
-        &mut app_server,
-        source_thread_id,
-        &cursor,
-        Ok(page),
-    )
-    .await?;
+    assert_eq!(
+        app.transcript_view.history,
+        crate::pager_overlay::TranscriptHistoryState::LoadingOlder
+    );
+    loop {
+        let event = app_event_rx.recv().await.expect("older history page");
+        if let AppEvent::OlderThreadHistoryLoaded { .. } = event {
+            Box::pin(app.handle_event(&mut tui, &mut app_server, event)).await?;
+            break;
+        }
+    }
+    tui.set_owned_screen(/*owned*/ false)?;
     let prompts = app
         .transcript_cells
         .iter()
@@ -8295,6 +8541,7 @@ async fn prompt_edit_reverts_earlier_and_first_visible_prompts_in_place() -> Res
         app_server.thread_goal_get(source_thread_id).await?.goal,
         Some(goal)
     );
+    tui.set_owned_screen(/*owned*/ false)?;
     app_server.shutdown().await?;
 
     Ok(())
@@ -9336,6 +9583,7 @@ async fn clear_only_ui_reset_preserves_chat_session_state() {
     app.overlay = Some(Overlay::new_transcript(
         app.transcript_cells.clone(),
         crate::keymap::RuntimeKeymap::defaults().pager,
+        /*copy_on_select*/ false,
     ));
     app.deferred_history_lines = vec![Line::from("stale buffered line").into()];
     app.has_emitted_history_lines = true;

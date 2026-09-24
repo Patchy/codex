@@ -1,6 +1,8 @@
 //! Windows sandbox prompts and warning surfaces for `ChatWidget`.
 
 use super::*;
+#[cfg(any(target_os = "windows", test))]
+use crate::render::renderable::ColumnRenderable;
 
 impl ChatWidget {
     #[cfg(any(target_os = "windows", test))]
@@ -124,7 +126,7 @@ impl ChatWidget {
                     });
                 }) as _
             }),
-            ..Default::default()
+            ..SelectionViewParams::picker()
         });
     }
 
@@ -258,7 +260,7 @@ impl ChatWidget {
                     });
                 }) as _
             }),
-            ..Default::default()
+            ..SelectionViewParams::picker()
         });
     }
 
@@ -272,8 +274,7 @@ impl ChatWidget {
 
     #[cfg(target_os = "windows")]
     pub(crate) fn maybe_prompt_windows_sandbox_enable(&mut self, show_now: bool) {
-        let windows_sandbox_level = self.windows_sandbox_config.level();
-        let setup_is_required = windows_sandbox_level == WindowsSandboxLevel::Disabled
+        let setup_is_required = !self.windows_sandbox_config.is_enabled()
             || self.elevated_windows_sandbox_setup_required();
         if show_now
             && setup_is_required

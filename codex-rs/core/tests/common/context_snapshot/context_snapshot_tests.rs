@@ -77,6 +77,25 @@ fn lite_tool_catalog_and_code_calls_are_visible() {
 }
 
 #[test]
+fn code_mode_timing_normalization_preserves_status_and_user_output() {
+    for status in ["Script completed", "Script failed", "Script terminated"] {
+        let text = format!(
+            "{status}\nWall time 1.000 seconds (code-mode 1.001 seconds; overhead -0.001 seconds)\nOutput:\nWall time 2.0 seconds"
+        );
+        assert_eq!(
+            Normalizer::default().text(
+                &text,
+                TextSource::Other,
+                &ContextSnapshotOptions::default(),
+            ),
+            format!(
+                "{status}\nWall time <DURATION> seconds (code-mode <DURATION> seconds; overhead <DURATION> seconds)\nOutput:\nWall time 2.0 seconds"
+            ),
+        );
+    }
+}
+
+#[test]
 fn tool_outputs_show_only_their_own_names_and_namespaces() {
     let items = [
         json!({ "type": "function_call", "call_id": "lookup", "namespace": "collaboration", "name": "lookup", "arguments": "{}" }),
@@ -680,7 +699,7 @@ fn detailed_permissions_normalize_paths_and_keep_policy_changes_visible() {
             "Some additional sandbox guidance. ".repeat(5)
         );
         let environment = format!(
-            "<environment_context>\n<cwd>{cwd}</cwd>\n<root>{external}</root>\n</environment_context>"
+            "<environment_context>\n<cwd>{cwd}</cwd>\n<filesystem><root>{external}</root><path>{external}</path><path>{cwd}{separator}{denied}</path></filesystem>\n</environment_context>"
         );
         let body = json!({"input": [
             {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": permissions}]},

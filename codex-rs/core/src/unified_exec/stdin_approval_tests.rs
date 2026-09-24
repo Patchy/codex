@@ -10,6 +10,7 @@ use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_sandboxing::SandboxType;
 use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -95,9 +96,13 @@ fn denied_reads_reject_file_system_changes_but_only_review_network_changes() {
 }
 
 #[tokio::test]
-async fn captured_network_changes_require_review_or_a_new_terminal() -> anyhow::Result<()> {
+async fn captured_network_changes_require_review() -> anyhow::Result<()> {
     let (_session, mut turn) = make_session_and_context().await;
-    let mut environment = turn.environments.primary().expect("environment").clone();
+    let mut environment = turn
+        .initial_environments
+        .primary()
+        .expect("environment")
+        .clone();
     environment.config_mut().permission_profile =
         PermissionProfileSnapshot::legacy(PermissionProfile::read_only());
     let mut proxy = NetworkProxyConfig {
@@ -150,9 +155,7 @@ async fn captured_network_changes_require_review_or_a_new_terminal() -> anyhow::
     );
     assert_eq!(
         permissions.review_requirement(&current, environment.permission_profile()),
-        Err(
-            "this terminal cannot enforce the current environment-owned network restrictions; start a new terminal"
-        )
+        Ok(SandboxPermissions::RequireEscalated)
     );
     Ok(())
 }
@@ -160,7 +163,11 @@ async fn captured_network_changes_require_review_or_a_new_terminal() -> anyhow::
 #[tokio::test]
 async fn internal_grants_require_review_without_exposing_paths() -> anyhow::Result<()> {
     let (_session, turn) = make_session_and_context().await;
-    let mut environment = turn.environments.primary().expect("environment").clone();
+    let mut environment = turn
+        .initial_environments
+        .primary()
+        .expect("environment")
+        .clone();
     environment.config_mut().permission_profile =
         PermissionProfileSnapshot::legacy(PermissionProfile::read_only());
     let grants = serde_json::from_value(json!({
@@ -196,7 +203,11 @@ async fn internal_grants_require_review_without_exposing_paths() -> anyhow::Resu
 #[tokio::test]
 async fn readable_snapshot_does_not_require_stdin_approval() -> anyhow::Result<()> {
     let (_session, turn) = make_session_and_context().await;
-    let mut environment = turn.environments.primary().expect("environment").clone();
+    let mut environment = turn
+        .initial_environments
+        .primary()
+        .expect("environment")
+        .clone();
     environment.config_mut().permission_profile =
         PermissionProfileSnapshot::legacy(PermissionProfile::read_only());
     let snapshot = turn.config.cwd.join("shell-snapshot.sh");
@@ -221,19 +232,34 @@ async fn readable_snapshot_does_not_require_stdin_approval() -> anyhow::Result<(
     Ok(())
 }
 
-#[test_case::test_case(TerminalSandboxSource::Native, SandboxPermissions::RequireEscalated; "native_disabled_sandbox_needs_review_when_enabled")]
-#[test_case::test_case(TerminalSandboxSource::Executor, SandboxPermissions::UseDefault; "executor_keeps_its_restricted_token_default")]
+#[test_case::test_case(TerminalSandboxSource::Native, SandboxType::None, SandboxPermissions::RequireEscalated; "native_disabled_sandbox_needs_review_when_enabled")]
+#[test_case::test_case(TerminalSandboxSource::Executor, SandboxType::None, SandboxPermissions::UseDefault; "executor_keeps_its_restricted_token_default")]
+#[test_case::test_case(TerminalSandboxSource::Native, SandboxType::WindowsMxc, SandboxPermissions::UseDefault; "native_mxc_ignores_legacy_level_changes")]
 #[tokio::test]
 async fn enabling_windows_sandbox_respects_the_launch_backend(
     source: TerminalSandboxSource,
+    sandbox_type: SandboxType,
     expected: SandboxPermissions,
 ) -> anyhow::Result<()> {
     let (_session, turn) = make_session_and_context().await;
-    let mut environment = turn.environments.primary().expect("environment").clone();
+    let mut environment = turn
+        .initial_environments
+        .primary()
+        .expect("environment")
+        .clone();
     environment.selection.cwd = PathUri::parse("file:///C:/workspace")?;
     environment.config_mut().permission_profile =
         PermissionProfileSnapshot::legacy(PermissionProfile::read_only());
+    environment.config_mut().windows_sandbox_type = sandbox_type;
     environment.config_mut().windows_sandbox_level = WindowsSandboxLevel::Disabled;
+    assert_eq!(
+        environment.windows_sandbox_selection_for_turn_metadata(),
+        if sandbox_type == SandboxType::WindowsMxc {
+            codex_file_system::WindowsSandboxSelection::Mxc
+        } else {
+            codex_file_system::WindowsSandboxSelection::Disabled
+        }
+    );
     let permissions = TerminalPermissions::for_launch(
         &environment,
         &turn,

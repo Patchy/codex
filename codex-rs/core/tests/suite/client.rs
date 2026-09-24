@@ -1521,6 +1521,42 @@ async fn provider_auth_command_refreshes_after_401() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_auth_command_refreshes_during_websocket_preconnect() {
+    skip_if_no_network!();
+
+    let server = MockServer::start().await;
+    let auth_fixture = ProviderAuthCommandFixture::new(&["first-token", "second-token"]).unwrap();
+    Mock::given(method("GET"))
+        .and(path("/v1/responses"))
+        .and(header("authorization", "Bearer first-token"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Auth must recover during preconnect, before the ordinary HTTP fallback turn.
+    Mock::given(method("GET"))
+        .and(path("/v1/responses"))
+        .and(header("authorization", "Bearer second-token"))
+        .respond_with(ResponseTemplate::new(426))
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_sse_once_match(
+        &server,
+        header("authorization", "Bearer second-token"),
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
+
+    let mut provider =
+        ModelProviderInfo::create_openai_provider(Some(format!("{}/v1", server.uri())));
+    provider.requires_openai_auth = false;
+    provider.auth = Some(auth_fixture.auth());
+    provider.supports_websockets = true;
+    send_request_with_provider(provider).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn provider_auth_command_recovers_after_initial_resolution_failure() {
     skip_if_no_network!();
 
@@ -1604,10 +1640,12 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
     let provider = ModelProviderInfo {
         name: "corp".into(),
         base_url: Some(format!("{}/v1", server.uri())),
+        model_catalog_url: None,
         env_key: None,
         env_key_instructions: None,
         experimental_bearer_token: None,
         auth: Some(auth),
+        gateway_oauth: None,
         aws: None,
         wire_api: WireApi::Responses,
         query_params: None,
@@ -1627,6 +1665,7 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
 
 #[expect(clippy::unwrap_used)]
 async fn send_request_with_provider(provider: ModelProviderInfo) {
+    let preconnect = provider.supports_websockets;
     let codex_home = TempDir::new().unwrap();
     let mut config = load_default_config_for_test(&codex_home).await;
     config.model_provider_id = provider.name.clone();
@@ -1662,6 +1701,7 @@ async fn send_request_with_provider(provider: ModelProviderInfo) {
         "test_originator".to_string(),
         config.model_verbosity,
         config.features.enabled(Feature::ContentItemKinds),
+        config.features.enabled(Feature::ReasoningEffortOverride),
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
@@ -1672,9 +1712,21 @@ async fn send_request_with_provider(provider: ModelProviderInfo) {
         /*attestation_provider*/ None,
         config.http_client_factory(),
         config.workspace_routing_context(),
+        Vec::new(),
     );
     let responses_metadata = test_turn_responses_metadata(&client, thread_id);
     let mut client_session = client.new_session();
+    if preconnect {
+        client_session
+            .preconnect_websocket(
+                &model_info,
+                /*service_tier*/ None,
+                &session_telemetry,
+                &responses_metadata,
+            )
+            .await
+            .expect("preconnect should recover authentication before the first turn");
+    }
     let mut prompt = Prompt::default();
     prompt.input.push(ResponseItem::Message {
         id: None,
@@ -2354,43 +2406,46 @@ async fn powershell_shell_version_is_model_visible_only_when_enabled() -> anyhow
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn includes_configured_max_effort_in_request() -> anyhow::Result<()> {
+async fn includes_configured_effort_in_request() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
-    let server = MockServer::start().await;
+    for (effort, expected) in [
+        ("max", json!("max")),
+        ("0", json!(0)),
+        ("64", json!(64)),
+        ("future", json!("future")),
+        ("-1", json!("-1")),
+        ("18446744073709551616", json!("18446744073709551616")),
+    ] {
+        let server = MockServer::start().await;
+        let resp_mock = mount_sse_once(
+            &server,
+            sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+        )
+        .await;
+        let TestCodex { codex, .. } = test_codex()
+            .with_model("gpt-5.4")
+            .with_pre_build_hook(move |home| {
+                std::fs::write(
+                    home.join("config.toml"),
+                    format!("model_reasoning_effort = \"{effort}\"\n"),
+                )
+                .expect("write test config");
+            })
+            .build_with_auto_env(&server)
+            .await?;
 
-    let resp_mock = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
-    )
-    .await;
-    let TestCodex { codex, .. } = test_codex()
-        .with_model("gpt-5.4")
-        .with_config(|config| {
-            config.model_reasoning_effort = Some(ReasoningEffort::Max);
-        })
-        .build(&server)
-        .await?;
+        codex
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "hello".into(),
+                text_elements: Vec::new(),
+            }]))
+            .await
+            .unwrap();
 
-    codex
-        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-            text: "hello".into(),
-            text_elements: Vec::new(),
-        }]))
-        .await
-        .unwrap();
-
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    let request = resp_mock.single_request();
-    let request_body = request.body_json();
-
-    assert_eq!(
-        request_body
-            .get("reasoning")
-            .and_then(|t| t.get("effort"))
-            .and_then(|v| v.as_str()),
-        Some("max")
-    );
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+        let request = resp_mock.single_request();
+        assert_eq!(request.body_json()["reasoning"]["effort"], expected);
+    }
 
     Ok(())
 }
@@ -3103,10 +3158,12 @@ async fn azure_responses_request_does_not_store_and_preserves_prefixed_item_ids(
     let provider = ModelProviderInfo {
         name: "azure".into(),
         base_url: Some(format!("{}/openai", server.uri())),
+        model_catalog_url: None,
         env_key: None,
         env_key_instructions: None,
         experimental_bearer_token: None,
         auth: None,
+        gateway_oauth: None,
         aws: None,
         wire_api: WireApi::Responses,
         query_params: None,
@@ -3157,6 +3214,7 @@ async fn azure_responses_request_does_not_store_and_preserves_prefixed_item_ids(
         "test_originator".to_string(),
         config.model_verbosity,
         config.features.enabled(Feature::ContentItemKinds),
+        config.features.enabled(Feature::ReasoningEffortOverride),
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
@@ -3164,6 +3222,7 @@ async fn azure_responses_request_does_not_store_and_preserves_prefixed_item_ids(
         /*attestation_provider*/ None,
         config.http_client_factory(),
         config.workspace_routing_context(),
+        Vec::new(),
     );
     let responses_metadata = test_turn_responses_metadata(&client, thread_id);
     let mut client_session = client.new_session();
@@ -3729,10 +3788,12 @@ async fn azure_overrides_assign_properties_used_for_responses_url() {
     let provider = ModelProviderInfo {
         name: "custom".to_string(),
         base_url: Some(format!("{}/openai", server.uri())),
+        model_catalog_url: None,
         // Reuse the existing environment variable to avoid using unsafe code
         env_key: Some(EXISTING_ENV_VAR_WITH_NON_EMPTY_VALUE.to_string()),
         experimental_bearer_token: None,
         auth: None,
+        gateway_oauth: None,
         aws: None,
         query_params: Some(std::collections::HashMap::from([(
             "api-version".to_string(),
@@ -3813,6 +3874,7 @@ async fn env_var_overrides_loaded_auth() {
     let provider = ModelProviderInfo {
         name: ModelProviderInfo::create_openai_provider(/*base_url*/ None).name,
         base_url: Some(format!("{}/openai", server.uri())),
+        model_catalog_url: None,
         // Reuse the existing environment variable to avoid using unsafe code
         env_key: Some(EXISTING_ENV_VAR_WITH_NON_EMPTY_VALUE.to_string()),
         query_params: Some(std::collections::HashMap::from([(
@@ -3822,6 +3884,7 @@ async fn env_var_overrides_loaded_auth() {
         env_key_instructions: None,
         experimental_bearer_token: None,
         auth: None,
+        gateway_oauth: None,
         aws: None,
         wire_api: WireApi::Responses,
         http_headers: Some(std::collections::HashMap::from([(

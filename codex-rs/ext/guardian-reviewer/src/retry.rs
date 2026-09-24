@@ -100,9 +100,11 @@ fn should_retry_guardian_review(outcome: &GuardianReviewOutcome) -> bool {
             | CodexErrorInfo::SessionBudgetExceeded
             | CodexErrorInfo::UsageLimitExceeded
             | CodexErrorInfo::CyberPolicy
+            | CodexErrorInfo::BioPolicy
             | CodexErrorInfo::MisalignmentPolicyViolation
             | CodexErrorInfo::Unauthorized
             | CodexErrorInfo::BadRequest
+            | CodexErrorInfo::InvalidPrompt
             | CodexErrorInfo::SandboxError
             | CodexErrorInfo::ActiveTurnNotSteerable { .. }
             | CodexErrorInfo::ThreadRollbackFailed

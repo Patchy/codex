@@ -11,13 +11,17 @@ use http::StatusCode;
 use pretty_assertions::assert_eq;
 use std::time::Duration;
 
-#[test]
-fn codex_err_debug_preserves_legacy_shape() {
+#[tokio::test(start_paused = true)]
+async fn codex_err_debug_preserves_legacy_shape() {
     let actual = [
         CodexErr::Timeout,
         CodexErr::Stream("disconnected".to_string()),
-        CodexErr::Stream("retry later".to_string()).with_retry_delay(Duration::from_secs(2)),
-        CodexErr::InternalServerError.with_retry_delay(Duration::from_secs(3)),
+        CodexErr::Stream("retry later".to_string()).with_retry_after(
+            RetryAfter::from_delay(Duration::from_secs(2)).expect("retry deadline"),
+        ),
+        CodexErr::InternalServerError.with_retry_after(
+            RetryAfter::from_delay(Duration::from_secs(3)).expect("retry deadline"),
+        ),
     ]
     .map(|err| format!("{err:?}"));
 
@@ -69,11 +73,44 @@ fn retryability_preserves_error_details_distinctions() {
 
     for (err, expected) in errors {
         assert_eq!(
-            err.is_retryable(),
+            err.retry_delay(/*retry_count*/ 1).is_some(),
             expected,
             "unexpected retryability for {err:?}"
         );
     }
+}
+
+/// Retryable errors prefer server advice and otherwise back off by attempt; advice does not
+/// make a terminal error retryable.
+#[test]
+fn retry_delay_distinguishes_server_advice_backoff_and_terminal_errors() {
+    let error = CodexErr::InternalServerError;
+    for (retry_count, expected_millis) in [(1, 180..220), (3, 720..880)] {
+        let delay = error.retry_delay(retry_count).expect("retryable error");
+        assert!(expected_millis.contains(&delay.as_millis()));
+    }
+    assert_eq!(error.server_retry_delay(), None);
+
+    let advice = Duration::ZERO;
+    let retry_after = RetryAfter::from_delay(advice).expect("retry deadline");
+    let error = error.with_retry_after(retry_after);
+    assert_eq!(
+        (
+            error.retry_delay(/*retry_count*/ 1),
+            error.retry_delay(/*retry_count*/ 3),
+            error.server_retry_delay(),
+        ),
+        (Some(advice), Some(advice), Some(advice)),
+    );
+
+    let error = CodexErr::QuotaExceeded.with_retry_after(retry_after);
+    assert_eq!(
+        (
+            error.retry_delay(/*retry_count*/ 1),
+            error.server_retry_delay(),
+        ),
+        (None, Some(advice)),
+    );
 }
 
 fn rate_limit_snapshot() -> RateLimitSnapshot {
@@ -235,10 +272,10 @@ fn to_error_event_handles_response_stream_failed() {
         .status(StatusCode::TOO_MANY_REQUESTS)
         .body("")
         .unwrap();
-    let source = HttpResponse::from(response)
+    let mut source = HttpResponse::from(response)
         .error_for_status_ref()
-        .unwrap_err()
-        .with_url("http://example.com".parse().unwrap());
+        .unwrap_err();
+    *source.url_mut().unwrap() = "http://example.com".parse().unwrap();
     let err = CodexErr::ResponseStreamFailed(ResponseStreamFailed {
         source,
         request_id: Some("req-123".to_string()),

@@ -36,6 +36,7 @@ use codex_utils_path_uri::PathUri;
 #[cfg(unix)]
 use crate::CODEX_ARG0_EXEC_HELPER_ARG1;
 use crate::ExecServerRuntimePaths;
+use crate::process_telemetry::trace_process_id;
 use crate::protocol::ExecParams;
 use crate::rpc::internal_error;
 use crate::rpc::invalid_params;
@@ -59,7 +60,6 @@ struct PreparedWindowsSandboxRequest {
     network_proxy_restricting_sid: Option<String>,
     proxy_settings_mode: WindowsSandboxProxySettingsMode,
     filesystem_overrides: Option<WindowsSandboxFilesystemOverrides>,
-    use_private_desktop: bool,
 }
 
 impl PreparedExecRequest {
@@ -74,11 +74,15 @@ impl PreparedExecRequest {
                 network_proxy_restricting_sid: request.network_proxy_restricting_sid.as_deref(),
                 proxy_settings_mode: request.proxy_settings_mode,
                 filesystem_overrides: request.filesystem_overrides.as_ref(),
-                use_private_desktop: request.use_private_desktop,
             })
     }
 }
 
+#[tracing::instrument(
+    name = "codex.exec_server.process_prepare_sandbox",
+    skip_all,
+    fields(process.id = trace_process_id(params.process_id.as_str())),
+)]
 pub(crate) async fn prepare_exec_request_with_telemetry(
     params: &ExecParams,
     env: HashMap<String, String>,
@@ -90,9 +94,9 @@ pub(crate) async fn prepare_exec_request_with_telemetry(
     if let Some(sandbox) = params.sandbox.as_ref()
         && sandbox.windows_sandbox_selection == WindowsSandboxSelection::Mxc
     {
-        if params.arg0.is_some() || sandbox.windows_sandbox_private_desktop {
+        if params.arg0.is_some() {
             return Err(invalid_params(
-                "MXC custom argv0 and private-desktop launches are not supported".to_owned(),
+                "MXC custom argv0 is not supported".to_owned(),
             ));
         }
         if !codex_sandboxing::windows_mxc_available() {
@@ -271,7 +275,6 @@ pub(crate) async fn prepare_exec_request_with_telemetry(
             },
             use_legacy_landlock: sandbox_context.use_legacy_landlock,
             windows_sandbox_level: windows_sandbox_level.unwrap_or(WindowsSandboxLevel::Disabled),
-            windows_sandbox_private_desktop: sandbox_context.windows_sandbox_private_desktop,
         },
     };
     let mut request = if sandbox == SandboxType::WindowsRestrictedToken {
@@ -312,7 +315,6 @@ pub(crate) async fn prepare_exec_request_with_telemetry(
             network_proxy_restricting_sid,
             proxy_settings_mode: windows_sandbox_proxy_settings_mode,
             filesystem_overrides,
-            use_private_desktop: sandbox_context.windows_sandbox_private_desktop,
         })
     } else {
         None
@@ -348,8 +350,11 @@ async fn prepare_managed_network(
     let Some(network_proxy) = network_proxy.cloned() else {
         return Ok((env, managed_network.cloned(), None, None));
     };
-    let mut state = NetworkProxyState::from_remote_launch_config(network_proxy)
-        .map_err(|err| invalid_params(format!("invalid network proxy config: {err}")))?;
+    let mut state = NetworkProxyState::from_remote_launch_config(
+        network_proxy,
+        codex_utils_path_uri::Platform::native(),
+    )
+    .map_err(|err| invalid_params(format!("invalid network proxy config: {err}")))?;
     if let Some(observer) = network_policy_audit_observer {
         state.set_policy_audit_observer(observer);
     }

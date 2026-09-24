@@ -1,3 +1,4 @@
+mod environment_accessor;
 mod exec_permission_profile_serde;
 mod find_up;
 
@@ -18,6 +19,10 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
+pub use environment_accessor::EnvironmentAccess;
+pub use environment_accessor::EnvironmentAccessExt;
+pub use environment_accessor::EnvironmentAccessKey;
+pub use environment_accessor::FileSystemEnvironmentAccessor;
 pub use find_up::FindUpErrorPolicy;
 pub use find_up::find_nearest_ancestor_with_markers;
 pub use find_up::find_nearest_native_ancestor_with_markers;
@@ -357,8 +362,6 @@ pub struct FileSystemSandboxContext {
     pub temporary_directories: Option<Vec<PathUri>>,
     #[serde(rename = "windowsSandboxLevel")]
     pub windows_sandbox_selection: WindowsSandboxSelection,
-    #[serde(default)]
-    pub windows_sandbox_private_desktop: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub windows_sandbox_proxy_settings_mode: Option<WindowsSandboxProxySettingsMode>,
     #[serde(default)]
@@ -394,7 +397,6 @@ impl FileSystemSandboxContext {
             user_home_dir: None,
             temporary_directories: None,
             windows_sandbox_selection: WindowsSandboxSelection::Disabled,
-            windows_sandbox_private_desktop: false,
             windows_sandbox_proxy_settings_mode: None,
             use_legacy_landlock: false,
         }
@@ -471,8 +473,6 @@ pub struct WireFileSystemSandboxContext {
     temporary_directories: Option<Vec<PathUri>>,
     #[serde(rename = "windowsSandboxLevel")]
     windows_sandbox_selection: WindowsSandboxSelection,
-    #[serde(default)]
-    windows_sandbox_private_desktop: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     windows_sandbox_proxy_settings_mode: Option<WindowsSandboxProxySettingsMode>,
     #[serde(default)]
@@ -498,7 +498,6 @@ impl From<FileSystemSandboxContext> for WireFileSystemSandboxContext {
             user_home_dir,
             temporary_directories,
             windows_sandbox_selection,
-            windows_sandbox_private_desktop,
             windows_sandbox_proxy_settings_mode,
             use_legacy_landlock,
         } = sandbox;
@@ -543,7 +542,6 @@ impl From<FileSystemSandboxContext> for WireFileSystemSandboxContext {
             user_home_dir,
             temporary_directories,
             windows_sandbox_selection,
-            windows_sandbox_private_desktop,
             windows_sandbox_proxy_settings_mode,
             use_legacy_landlock,
         }
@@ -590,7 +588,6 @@ impl WireFileSystemSandboxContext {
             user_home_dir: self.user_home_dir,
             temporary_directories: self.temporary_directories,
             windows_sandbox_selection: self.windows_sandbox_selection,
-            windows_sandbox_private_desktop: self.windows_sandbox_private_desktop,
             windows_sandbox_proxy_settings_mode: self.windows_sandbox_proxy_settings_mode,
             use_legacy_landlock: self.use_legacy_landlock,
         }

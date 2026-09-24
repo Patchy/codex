@@ -4,6 +4,7 @@
 //! orchestration module without changing their event wiring.
 
 use super::*;
+use crate::render::renderable::ColumnRenderable;
 
 impl ChatWidget {
     pub(super) fn open_theme_picker(&mut self) {

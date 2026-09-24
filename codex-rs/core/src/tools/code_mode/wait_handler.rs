@@ -20,7 +20,9 @@ use super::telemetry::CodeModeToolCallGuard;
 use super::telemetry::trace_id;
 use super::wait_spec::create_wait_tool;
 
-pub struct CodeModeWaitHandler;
+pub struct CodeModeWaitHandler {
+    spec: ToolSpec,
+}
 
 #[derive(Debug, Deserialize)]
 struct ExecWaitArgs {
@@ -52,7 +54,7 @@ impl ToolExecutor<ToolInvocation> for CodeModeWaitHandler {
     }
 
     fn spec(&self) -> ToolSpec {
-        create_wait_tool()
+        self.spec.clone()
     }
 
     fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
@@ -64,6 +66,15 @@ impl ToolExecutor<ToolInvocation> for CodeModeWaitHandler {
 }
 
 impl CodeModeWaitHandler {
+    pub(crate) fn new(
+        description_override: Option<&str>,
+        parameters_override: Option<&str>,
+    ) -> Self {
+        Self {
+            spec: create_wait_tool(description_override, parameters_override),
+        }
+    }
+
     // Default to interrupted if this future is dropped; telemetry::CodeModeToolCallGuard::finish
     // overwrites this handler's captured span on explicit success or failure, including early errors.
     #[tracing::instrument(
@@ -94,8 +105,7 @@ impl CodeModeWaitHandler {
         } = invocation;
 
         let mut telemetry = CodeModeToolCallGuard::new(
-            session.services.analytics_events_client.clone(),
-            session.thread_id.to_string(),
+            &session,
             turn.sub_id.clone(),
             turn.turn_metadata_state.clone(),
             call_id.clone(),
@@ -178,15 +188,13 @@ impl CodeModeWaitHandler {
                 let wall_time = wait_response
                     .code_mode_host_duration()
                     .unwrap_or_else(|| started_at.elapsed());
-                handle_runtime_response(
+                Ok(boxed_tool_output(handle_runtime_response(
                     &step_context.settings.model_info,
                     wait_response.into(),
                     args.max_tokens,
                     wall_time,
-                )
-                .await
-                .map_err(FunctionCallError::RespondToModel)
-                .map(boxed_tool_output)
+                    exec.turn.config.code_mode.experimental_show_cell_overhead,
+                )))
             }
             _ => Err(FunctionCallError::RespondToModel(format!(
                 "{WAIT_TOOL_NAME} expects JSON arguments"

@@ -54,12 +54,12 @@ impl Normalizer {
         };
         let text = normalize_line_endings(&text);
         let segment = known_segment_name(&text, source);
-        let text = self.normalize_values(&text);
         let text = match segment.as_deref() {
             Some("PERMISSIONS_INSTRUCTIONS") => self.permissions(&text),
             Some("ENVIRONMENT_CONTEXT") => self.environment(&text),
             _ => text,
         };
+        let text = self.normalize_values(&text);
         if options.rewrite_known_segments
             && let Some(segment) = segment
         {
@@ -109,17 +109,22 @@ impl Normalizer {
     }
 
     fn normalize_values(&mut self, text: &str) -> String {
-        // Tool calls report elapsed wall time in an otherwise stable output header.
-        let text = if text.starts_with("Script completed\nWall time ")
-            || text.starts_with("Wall time: ")
-        {
+        // Tool calls report elapsed times in an otherwise stable output header.
+        let text = if text.starts_with("Script ") || text.starts_with("Wall time: ") {
             static WALL_TIME: OnceLock<Regex> = OnceLock::new();
             WALL_TIME
                 .get_or_init(|| {
-                    Regex::new(r"(?m)^(Wall time:?) [0-9]+(?:\.[0-9]+)? seconds$")
+                    Regex::new(r"(?m)^(Wall time:?) [0-9]+(?:\.[0-9]+)? seconds( \(code-mode [0-9]+(?:\.[0-9]+)? seconds; overhead -?[0-9]+(?:\.[0-9]+)? seconds\))?$")
                         .expect("tool wall time regex")
                 })
-                .replace(text, "${1} <DURATION> seconds")
+                .replace(text, |captures: &regex_lite::Captures<'_>| {
+                    let prefix = &captures[1];
+                    if captures.get(2).is_some() {
+                        format!("{prefix} <DURATION> seconds (code-mode <DURATION> seconds; overhead <DURATION> seconds)")
+                    } else {
+                        format!("{prefix} <DURATION> seconds")
+                    }
+                })
                 .into_owned()
         } else {
             text.to_string()

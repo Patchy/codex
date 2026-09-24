@@ -93,6 +93,7 @@ impl FeedbackRequestProcessor {
             None => None,
         };
 
+        let http_client_factory = self.config.http_client_factory();
         let auth = self.auth_manager.auth_cached();
         let turn_metadata = if let Some(conversation_id) = conversation_id
             && let Some(rollout_path) = self
@@ -278,10 +279,16 @@ impl FeedbackRequestProcessor {
                     upload_tags.entry(key).or_insert(value);
                 }
             }
+            extra_attachments.extend(
+                super::feedback_rollout_history::history_base_attachments(
+                    &self.config.codex_home,
+                    &attachment_paths,
+                )
+                .await,
+            );
         }
 
         let session_source = self.thread_manager.session_source();
-        let http_client_factory = self.config.http_client_factory();
         let runtime_handle = tokio::runtime::Handle::current();
 
         let upload_result = tokio::task::spawn_blocking(move || {

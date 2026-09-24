@@ -7,7 +7,6 @@ use codex_guardian_context::ContextProfile;
 #[cfg(test)]
 use codex_guardian_context::ConversationTranscriptEntry;
 use codex_guardian_context::GuardianRootMessage;
-use codex_guardian_context::PermissionContext;
 use codex_guardian_context::PlannedAction;
 use codex_guardian_context::PlannedActionKind;
 use codex_guardian_context::SectionError;
@@ -20,6 +19,7 @@ use codex_guardian_context::default_registry;
 use codex_protocol::models::ResponseItem;
 
 use crate::context::ContextualUserFragment;
+use crate::context::GuardianPermissionContext;
 use crate::context::GuardianReviewEvidence;
 use crate::context::GuardianToolDescriptions;
 use crate::context::NodeReplReviewEvidence;
@@ -27,6 +27,7 @@ use crate::context::NodeReplReviewEvidenceMode;
 use crate::context::node_repl_review_evidence_mode;
 use crate::event_mapping::is_contextual_user_message_content;
 use crate::session::session::Session;
+use crate::session::turn_context::TurnEnvironment;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_bytes_for_tokens;
 use codex_utils_output_truncation::truncate_text;
@@ -39,6 +40,8 @@ use super::GuardianReviewContext;
 use super::approval_request::format_guardian_action_pretty;
 
 const GUARDIAN_MAX_APPROVAL_REASON_TOKENS: usize = 512;
+// Bound both JSON and permission evidence without restricting manual approvals.
+const MAX_GUARDIAN_ENVIRONMENT_ID_BYTES: usize = 256;
 pub(super) const GUARDIAN_TRANSCRIPT_START: &str = ">>> TRANSCRIPT START\n";
 
 pub(crate) struct GuardianPromptItems {
@@ -86,6 +89,12 @@ pub(crate) async fn build_guardian_prompt_items_with_parent_turn(
     mode: GuardianPromptMode,
     reviewed_node_repl_evidence_sequence: u64,
 ) -> anyhow::Result<GuardianPromptItems> {
+    if request
+        .target_environment_id()
+        .is_some_and(|id| id.len() > MAX_GUARDIAN_ENVIRONMENT_ID_BYTES)
+    {
+        anyhow::bail!("approval environment id exceeds Guardian's 256-byte limit");
+    }
     let evidence_mode = parent_context
         .map(|context| node_repl_review_evidence_mode(context.turn()))
         .unwrap_or(NodeReplReviewEvidenceMode::Disabled);
@@ -98,7 +107,7 @@ pub(crate) async fn build_guardian_prompt_items_with_parent_turn(
     let root_authorization = session
         .services
         .agent_control
-        .root_user_authorization(session.thread_id)
+        .get_guardian_package(session.thread_id)
         .await
         .map(|snapshot| snapshot.messages);
     let trusted_user_inputs = session
@@ -143,7 +152,9 @@ pub(crate) async fn build_guardian_prompt_items_with_parent_turn(
             )
         }),
     };
-    let permissions = parent_context.map(parent_turn_permissions);
+    let permissions = parent_context
+        .map(|context| parent_turn_permissions(context, &request))
+        .transpose()?;
     let node_repl_snapshot = if node_repl_transcripts_enabled {
         session
             .services
@@ -208,25 +219,63 @@ pub(crate) async fn build_guardian_prompt_items_with_parent_turn(
     })
 }
 
-fn parent_turn_permissions(context: &GuardianReviewContext) -> PermissionContext {
+fn parent_turn_permissions(
+    context: &GuardianReviewContext,
+    request: &GuardianApprovalRequest,
+) -> anyhow::Result<GuardianPermissionContext> {
     let turn = context.turn();
-    let environment = context.environments().primary();
-    #[allow(deprecated)]
-    let cwd = environment
-        .and_then(|environment| environment.cwd().to_abs_path().ok())
-        .unwrap_or_else(|| turn.cwd.clone());
-    let permission_profile = context
-        .environments()
-        .permission_profile_or_else(|| turn.permission_profile());
+    let environment = match request.target_environment_id() {
+        Some(id) => Some(
+            context
+                .environments()
+                .turn_environments()
+                .find(|environment| environment.selection.environment_id == id)
+                .ok_or_else(|| anyhow::anyhow!("approval environment {id} is unavailable"))?,
+        ),
+        None => context.environments().primary(),
+    };
+    let native_cwd = environment
+        .filter(|environment| !environment.environment.is_remote())
+        .and_then(|environment| environment.cwd().to_abs_path().ok());
+    let permission_profile = environment
+        .map(TurnEnvironment::permission_profile_with_workspace_roots)
+        .unwrap_or_else(|| turn.permission_profile_for_environments(context.environments()));
     let file_system_policy = permission_profile.file_system_sandbox_policy();
-    PermissionContext {
+    // Remote restrictions must not be interpreted using the filesystem running Guardian.
+    // Older executors may not report their temp folders. If a rule explicitly denies those
+    // folders, decline automatic approval rather than guess. Default rules do not deny them.
+    if let Some(environment) = environment
+        && native_cwd.is_none()
+    {
+        let sandbox = environment.sandbox_context(/*additional_permissions*/ None);
+        let paths = sandbox.policy_context();
+        let mut denied_globs = file_system_policy
+            .get_unreadable_globs_with_context(&paths)
+            .map_err(anyhow::Error::msg)?;
+        denied_globs.sort();
+        denied_globs.dedup();
+        return Ok(GuardianPermissionContext {
+            environment_id: request.target_environment_id().map(str::to_owned),
+            denied_paths: file_system_policy
+                .get_unreadable_roots_with_context(&paths)
+                .map_err(anyhow::Error::msg)?
+                .into_iter()
+                .map(|path| path.inferred_native_path_string())
+                .collect(),
+            denied_globs,
+        });
+    }
+    #[allow(deprecated)]
+    let cwd = native_cwd.unwrap_or_else(|| turn.cwd.clone());
+    Ok(GuardianPermissionContext {
+        environment_id: request.target_environment_id().map(str::to_owned),
         denied_paths: file_system_policy
             .get_unreadable_roots_with_cwd(&cwd)
             .into_iter()
             .map(|root| root.to_string_lossy().into_owned())
             .collect(),
         denied_globs: file_system_policy.get_unreadable_globs_with_cwd(&cwd),
-    }
+    })
 }
 
 /// Exercises the sync profile through the host's existing transcript tests.
@@ -267,7 +316,7 @@ pub(super) fn collect_guardian_context(
     root_conversation: &[GuardianRootMessage],
     trusted_user_answers: &[String],
     planned_action: Option<&PlannedAction>,
-    permissions: Option<&PermissionContext>,
+    permissions: Option<&GuardianPermissionContext>,
     node_repl: Option<&codex_guardian_context::NodeReplContext<'_>>,
 ) -> Result<CollectedContext, SectionError> {
     let mut profile = ContextProfile::synchronous();

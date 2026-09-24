@@ -36,12 +36,12 @@ use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::items::TurnItem;
-use codex_protocol::mcp::is_node_repl_backed_server;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ImageReference;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::GuardianScope;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::CodexErrorInfo;
@@ -110,10 +110,10 @@ pub(crate) struct GuardianReviewSessionParams {
     pub(crate) spawn_config: Config,
     pub(crate) node_repl_policy: GuardianNodeReplPolicy,
     pub(crate) request: GuardianApprovalRequest,
+    pub(crate) category: GuardianScope,
     pub(crate) reasons: ApprovalRequestReasons,
     pub(crate) schema: Value,
     pub(crate) review_model: ReviewModel,
-    pub(crate) compaction_model_hash: Option<String>,
     pub(crate) reasoning_summary: ReasoningSummaryConfig,
     pub(crate) personality: Option<Personality>,
     pub(crate) external_cancel: Option<CancellationToken>,
@@ -795,11 +795,7 @@ async fn ensure_guardian_node_repl_policy(
         .turn()
         .model_info()
         .computer_use_review_required()
-        || !matches!(
-            &params.request,
-            GuardianApprovalRequest::McpToolCall { server, tool_name, .. }
-                if is_node_repl_backed_server(server) && tool_name == "js"
-        )
+        || params.category != GuardianScope::ComputerUse
     {
         return Ok(());
     }
@@ -855,18 +851,6 @@ async fn ensure_guardian_node_repl_policy(
     Ok(())
 }
 
-async fn load_rollout_items_for_fork(
-    session: &Session,
-) -> anyhow::Result<Option<Vec<RolloutItem>>> {
-    session
-        .try_ensure_rollout_materialized(PersistContext::Standard)
-        .await?;
-    session.flush_rollout().await?;
-    let live_thread = session.live_thread_for_persistence("guardian review fork")?;
-    let history = live_thread.load_history(/*include_archived*/ true).await?;
-    Ok(Some(history.items))
-}
-
 impl codex_guardian_reviewer::ReviewerRuntime for GuardianReviewSession {
     async fn submit_turn(&self, request: TurnInputRequest) -> anyhow::Result<TurnInputSubmission> {
         Ok(self
@@ -915,22 +899,16 @@ impl codex_guardian_reviewer::ReviewerSession for GuardianReviewSession {
     }
 
     async fn commit_snapshot(&self) {
-        match load_rollout_items_for_fork(&self.session).await {
-            Ok(Some(items)) if !items.is_empty() => {
-                let mut state = self.state.lock().await;
-                let last_admitted_node_repl_response_sequence =
-                    state.last_admitted_node_repl_response_sequence;
-                state.conversation.commit_snapshot(GuardianReviewHistory {
-                    initial_history: InitialHistory::Forked(items),
-                    last_admitted_node_repl_response_sequence,
-                });
-            }
-            Ok(Some(_)) => {}
-            Ok(None) => {}
-            Err(err) => {
-                warn!("failed to refresh guardian trunk rollout snapshot: {err}");
-            }
-        }
+        // The pool holds the review lock until this checkpoint is published. Capture the
+        // completed model context directly; saving and reloading the transcript adds no state.
+        let items = self.session.guardian_fork_history().await;
+        let mut state = self.state.lock().await;
+        let last_admitted_node_repl_response_sequence =
+            state.last_admitted_node_repl_response_sequence;
+        state.conversation.commit_snapshot(GuardianReviewHistory {
+            initial_history: InitialHistory::Forked(items),
+            last_admitted_node_repl_response_sequence,
+        });
     }
 }
 

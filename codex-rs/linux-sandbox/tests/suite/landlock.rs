@@ -28,6 +28,9 @@ use tempfile::NamedTempFile;
 #[path = "wslg_tests.rs"]
 mod wslg_tests;
 
+#[path = "nested_metadata_tests.rs"]
+mod nested_metadata_tests;
+
 // At least on GitHub CI, the arm64 tests appear to need longer timeouts.
 
 #[cfg(not(target_arch = "aarch64"))]
@@ -186,7 +189,6 @@ async fn run_cmd_result_with_permission_profile_for_cwd(
         network_environment_id: None,
         sandbox_permissions: SandboxPermissions::UseDefault,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
-        windows_sandbox_private_desktop: false,
         justification: None,
         arg0: None,
     };
@@ -825,7 +827,6 @@ async fn assert_network_blocked(cmd: &[&str]) {
         network_environment_id: None,
         sandbox_permissions: SandboxPermissions::UseDefault,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
-        windows_sandbox_private_desktop: false,
         justification: None,
         arg0: None,
     };

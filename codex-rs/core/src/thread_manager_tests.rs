@@ -1,5 +1,6 @@
 use super::*;
-use crate::agent::control::SpawnAgentOptions;
+use crate::agent::types::SpawnAgentOptions;
+use crate::config::RolloutBudgetConfig;
 use crate::config::test_config;
 use crate::init_state_db;
 use crate::installation_id::INSTALLATION_ID_FILENAME;
@@ -38,6 +39,7 @@ use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSource;
+use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::user_input::UserInput;
@@ -225,6 +227,7 @@ async fn thread_analytics_opt_out_overrides_shared_client() {
             }
             services.analytics_events_client.track_app_used(
                 codex_analytics::TrackEventsContext {
+                    turn_metadata: None,
                     model_slug: "test-model".to_string(),
                     turn_id: format!("test-turn-{thread_id}"),
                     thread_id,
@@ -281,11 +284,11 @@ async fn thread_analytics_opt_out_overrides_shared_client() {
 /// Controls without a custom allocation policy still produce distinct thread identifiers.
 #[test]
 fn thread_id_generator_defaults_to_standard_ids() {
-    let agent_control = AgentControl::default();
+    let agent_control = LocalAgentControl::default();
 
     assert_ne!(
-        agent_control.generate_thread_id(),
-        agent_control.generate_thread_id()
+        agent_control.runtime.generate_thread_id(),
+        agent_control.runtime.generate_thread_id()
     );
 }
 
@@ -375,20 +378,21 @@ async fn thread_id_generator_applies_to_roots_children_and_forks() {
         .thread
         .session
         .services
-        .agent_control
+        .local_agent_runtime
+        .control(root.thread.session.session_id())
         .spawn_agent_with_metadata(
             config.clone(),
             vec![UserInput::Text {
                 text: "child task".to_string(),
                 text_elements: Vec::new(),
             }],
-            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id: root.thread_id,
                 depth: 1,
                 agent_path: None,
                 agent_nickname: None,
                 agent_role: None,
-            })),
+            }),
             SpawnAgentOptions {
                 parent_thread_id: Some(root.thread_id),
                 ..Default::default()
@@ -1249,6 +1253,12 @@ async fn spawn_internal_session_preserves_parent_lineage_without_forking_history
 
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;
+    config.rollout_budget = Some(RolloutBudgetConfig {
+        limit_tokens: 100,
+        reminder_at_remaining_tokens: vec![75, 50, 25],
+        sampling_token_weight: 1.0,
+        prefill_token_weight: 1.0,
+    });
     config.codex_home = temp_dir.path().join("codex-home").abs();
     config.cwd = config.codex_home.abs();
     std::fs::create_dir_all(&config.codex_home).expect("create codex home");
@@ -1349,7 +1359,7 @@ async fn spawn_internal_session_preserves_parent_lineage_without_forking_history
             permission_profile: config.permissions.permission_profile_state().snapshot(),
             shell_environment_policy: Default::default(),
             windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
-            windows_sandbox_private_desktop: config.permissions.windows_sandbox_private_desktop,
+            windows_sandbox_type: config.permissions.windows_sandbox_type,
             use_legacy_landlock: config.features.use_legacy_landlock(),
             exec_policy: Some(codex_execpolicy::RequirementsExecPolicy::new(
                 codex_execpolicy::Policy::empty(),
@@ -1373,25 +1383,35 @@ async fn spawn_internal_session_preserves_parent_lineage_without_forking_history
         .await
         .expect("start internal reviewer");
     let reviewer_config = reviewer.thread.config_snapshot().await;
+    assert!(Arc::ptr_eq(
+        &reviewer.thread.session.services.agent_control,
+        &parent.thread.session.services.agent_control,
+    ));
 
     assert_eq!(
         reviewer.session_configured.session_id,
         parent.session_configured.session_id
     );
-    assert!(std::ptr::eq(
-        reviewer
-            .thread
-            .session
-            .services
-            .agent_control
-            .rollout_budget(),
-        parent
-            .thread
-            .session
-            .services
-            .agent_control
-            .rollout_budget(),
-    ));
+    reviewer
+        .thread
+        .session
+        .services
+        .agent_control
+        .record_usage(TokenUsage {
+            output_tokens: 25,
+            ..Default::default()
+        })
+        .await
+        .expect("record reviewer usage");
+    let reminder = parent
+        .thread
+        .session
+        .services
+        .agent_control
+        .pending_budget_reminder(parent.thread_id, "window")
+        .await
+        .expect("parent budget reminder");
+    assert_eq!(reminder.remaining_tokens, 75);
     assert_eq!(reviewer_config.parent_thread_id, Some(parent.thread_id));
     assert_eq!(reviewer_config.forked_from_thread_id, None);
     assert_eq!(reviewer_config.originator, "codex_work_desktop");
@@ -1484,7 +1504,10 @@ async fn spawn_internal_session_preserves_parent_lineage_without_forking_history
             internal_parent: Some(InternalSessionParent {
                 thread_id: parent.thread_id,
                 auth_manager: Arc::clone(&parent.thread.session.services.auth_manager),
-                agent_control: parent.thread.session.services.agent_control.clone(),
+                agent_control: AgentControlInit::Inherited {
+                    control: Arc::clone(&parent.thread.session.services.agent_control),
+                    runtime: parent.thread.session.services.local_agent_runtime.clone(),
+                },
                 originator: reviewer_config.originator.clone(),
                 inherited_instructions: None,
             }),
@@ -1692,10 +1715,13 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
             &first_session.services.mcp_thread_init,
             &first_session.services.thread_extension_data,
             McpThreadIdentity {
+                auth_changed: false,
                 session_source: &SessionSource::Exec,
                 originator: &first_originator,
                 disabled_plugin_ids: &[],
-                environments: McpEnvironmentScope::Live(&first_session.services.turn_environments),
+                environments: McpEnvironmentScope::Selected(
+                    &first_session.services.turn_environments.selections(),
+                ),
             },
             /*ready_selected_capability_roots*/ &[],
             /*executor_capability_discovery*/ None,
@@ -1711,10 +1737,13 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
             &second_session.services.mcp_thread_init,
             &second_session.services.thread_extension_data,
             McpThreadIdentity {
+                auth_changed: false,
                 session_source: &second_session_source,
                 originator: &second_originator,
                 disabled_plugin_ids: &[],
-                environments: McpEnvironmentScope::Live(&second_session.services.turn_environments),
+                environments: McpEnvironmentScope::Selected(
+                    &second_session.services.turn_environments.selections(),
+                ),
             },
             /*ready_selected_capability_roots*/ &[],
             /*executor_capability_discovery*/ None,
@@ -1783,11 +1812,12 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
                 &first_session.services.mcp_thread_init,
                 &first_session.services.thread_extension_data,
                 McpThreadIdentity {
+                    auth_changed: false,
                     session_source: &SessionSource::Exec,
                     originator: &first_originator,
                     disabled_plugin_ids: &disabled_plugin_ids,
-                    environments: McpEnvironmentScope::Live(
-                        &first_session.services.turn_environments,
+                    environments: McpEnvironmentScope::Selected(
+                        &first_session.services.turn_environments.selections(),
                     ),
                 },
                 /*ready_selected_capability_roots*/ &[],
@@ -1951,10 +1981,16 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
         .await
         .expect("build resumed turn context");
     let resumed_turn = prepared_turn;
-    assert_eq!(resumed_turn.environments.turn_environments().count(), 1);
     assert_eq!(
         resumed_turn
-            .environments
+            .initial_environments
+            .turn_environments()
+            .count(),
+        1
+    );
+    assert_eq!(
+        resumed_turn
+            .initial_environments
             .primary()
             .expect("primary environment")
             .cwd(),
@@ -1962,7 +1998,7 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
     );
     assert_ne!(
         resumed_turn
-            .environments
+            .initial_environments
             .primary()
             .expect("primary environment")
             .cwd(),
@@ -1988,10 +2024,13 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
         .await
         .expect("build forked turn context");
     let forked_turn = prepared_turn;
-    assert_eq!(forked_turn.environments.turn_environments().count(), 1);
+    assert_eq!(
+        forked_turn.initial_environments.turn_environments().count(),
+        1
+    );
     assert_eq!(
         forked_turn
-            .environments
+            .initial_environments
             .primary()
             .expect("primary environment")
             .cwd(),
@@ -1999,7 +2038,7 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
     );
     assert_ne!(
         forked_turn
-            .environments
+            .initial_environments
             .primary()
             .expect("primary environment")
             .cwd(),

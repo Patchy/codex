@@ -62,12 +62,14 @@ use crate::unified_exec::async_watcher::start_streaming_output;
 use crate::unified_exec::clamp_yield_time;
 use crate::unified_exec::generate_chunk_id;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
+use crate::unified_exec::process::OutputBuffers;
 use crate::unified_exec::process::OutputHandles;
 use crate::unified_exec::process::SpawnLifecycleHandle;
 use crate::unified_exec::process::UnifiedExecProcess;
 use crate::unified_exec::shell_snapshot::shell_snapshot_request;
 use crate::unified_exec::take_plugin_metrics_sidecar;
 use crate::unified_exec::trace_id;
+use crate::windows_sandbox::windows_sandbox_level_for_legacy_checks;
 use codex_core_plugins::PLUGIN_METRICS_OUTPUT_ENV_VAR;
 use codex_core_plugins::PluginCommandAttribution;
 use codex_core_plugins::PluginMetricsSidecar;
@@ -120,7 +122,7 @@ fn deterministic_process_ids_forced_for_tests() -> bool {
     FORCE_DETERMINISTIC_PROCESS_IDS.load(Ordering::Relaxed)
 }
 
-fn should_use_deterministic_process_ids() -> bool {
+pub(super) fn should_use_deterministic_process_ids() -> bool {
     cfg!(test) || deterministic_process_ids_forced_for_tests()
 }
 
@@ -393,11 +395,12 @@ fn fail_process_with_message(process: &UnifiedExecProcess, message: String) -> U
 #[allow(clippy::too_many_arguments)]
 async fn emit_failed_initial_exec_end_if_unstored(
     process_started_alive: bool,
+    sandbox_type: Option<codex_protocol::sandbox::SandboxType>,
     context: &UnifiedExecContext,
     request: &ExecCommandRequest,
     cwd: PathUri,
     plugin_attribution: Option<PluginCommandAttribution>,
-    transcript: Arc<tokio::sync::Mutex<HeadTailBuffer>>,
+    output_buffer: Arc<tokio::sync::Mutex<OutputBuffers>>,
     fallback_output: String,
     message: String,
     wall_time: Duration,
@@ -407,6 +410,7 @@ async fn emit_failed_initial_exec_end_if_unstored(
     }
 
     emit_failed_exec_end_for_unified_exec(
+        sandbox_type,
         Arc::clone(&context.session),
         Arc::clone(&context.step_context.turn),
         Arc::clone(&context.step_context.settings.model_info),
@@ -415,7 +419,7 @@ async fn emit_failed_initial_exec_end_if_unstored(
         cwd,
         Some(request.process_id.to_string()),
         plugin_attribution,
-        transcript,
+        output_buffer,
         fallback_output,
         message,
         wall_time,
@@ -554,7 +558,7 @@ impl UnifiedExecProcessManager {
             )
         });
 
-        let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
+        let output_buffer = Arc::clone(&process.output_handles().output_buffer);
         let model_context = context.step_context.model_context();
         let mut event_ctx = ToolEventCtx::new(
             context.session.as_ref(),
@@ -592,7 +596,7 @@ impl UnifiedExecProcessManager {
         );
         emitter.emit(event_ctx, ToolEventStage::Begin).await;
 
-        start_streaming_output(&process, context, Arc::clone(&transcript));
+        start_streaming_output(&process, context);
         let start = Instant::now();
         // Persist live sessions before the initial yield wait so interrupting the
         // turn cannot drop the last Arc and terminate the background process.
@@ -614,7 +618,7 @@ impl UnifiedExecProcessManager {
                 deferred_network_approval.clone(),
                 network_denial_monitor,
                 metrics_sidecar,
-                Arc::clone(&transcript),
+                Arc::clone(&output_buffer),
                 Arc::clone(&initial_exec_command_active),
             )
             .await;
@@ -676,11 +680,12 @@ impl UnifiedExecProcessManager {
             .await;
             emit_failed_initial_exec_end_if_unstored(
                 process_started_alive,
+                process.sandbox_type(),
                 context,
                 &request,
                 cwd.clone(),
                 plugin_attribution.clone(),
-                Arc::clone(&transcript),
+                Arc::clone(&output_buffer),
                 text.clone(),
                 message.clone(),
                 wall_time,
@@ -697,11 +702,12 @@ impl UnifiedExecProcessManager {
             .await;
             emit_failed_initial_exec_end_if_unstored(
                 process_started_alive,
+                process.sandbox_type(),
                 context,
                 &request,
                 cwd.clone(),
                 plugin_attribution.clone(),
-                Arc::clone(&transcript),
+                Arc::clone(&output_buffer),
                 text.clone(),
                 message.clone(),
                 wall_time,
@@ -775,11 +781,12 @@ impl UnifiedExecProcessManager {
             if let Err(message) = finish_result {
                 emit_failed_initial_exec_end_if_unstored(
                     process_started_alive,
+                    process.sandbox_type(),
                     context,
                     &request,
                     cwd.clone(),
                     plugin_attribution.clone(),
-                    Arc::clone(&transcript),
+                    Arc::clone(&output_buffer),
                     text.clone(),
                     message.clone(),
                     wall_time,
@@ -794,6 +801,7 @@ impl UnifiedExecProcessManager {
                 .finish_plugin_metrics(context, exit)
                 .await;
             emit_exec_end_for_unified_exec(
+                process.sandbox_type(),
                 Arc::clone(&context.session),
                 Arc::clone(&context.step_context.turn),
                 Arc::clone(&context.step_context.settings.model_info),
@@ -802,7 +810,7 @@ impl UnifiedExecProcessManager {
                 cwd.clone(),
                 Some(process_id.to_string()),
                 plugin_attribution.clone(),
-                Arc::clone(&transcript),
+                Arc::clone(&output_buffer),
                 text.clone(),
                 exit,
                 wall_time,
@@ -896,11 +904,7 @@ impl UnifiedExecProcessManager {
         };
         let _interaction_guard = locked_process.interaction_lock().lock_owned().await;
         // A queued write must observe strict review enabled while it was waiting.
-        let strict_auto_review = context
-            .session
-            .active_turn_context_and_strict_auto_review()
-            .await
-            .is_some_and(|(_, _, strict)| strict);
+        let strict_auto_review = context.session.strict_auto_review_enabled().await;
         let approval = {
             let store = self.process_store.lock().await;
             let entry = store
@@ -1203,7 +1207,7 @@ impl UnifiedExecProcessManager {
         network_approval: Option<DeferredNetworkApproval>,
         network_denial_monitor: Option<tokio::task::JoinHandle<()>>,
         metrics_sidecar: Option<PluginMetricsSidecar>,
-        transcript: Arc<tokio::sync::Mutex<HeadTailBuffer>>,
+        output_buffer: Arc<tokio::sync::Mutex<OutputBuffers>>,
         initial_exec_command_active: Arc<AtomicBool>,
     ) {
         let plugin_metrics_sidecar =
@@ -1243,7 +1247,7 @@ impl UnifiedExecProcessManager {
             cwd,
             process_id,
             plugin_attribution,
-            transcript,
+            output_buffer,
             started_at,
             network_denial_monitor,
             plugin_metrics_sidecar,
@@ -1277,7 +1281,7 @@ impl UnifiedExecProcessManager {
         let network_policy_decider = network_proxy_launch
             .as_ref()
             .filter(|launch| launch.policy_decision_timeout_ms.is_some())
-            .and_then(|_| network.and_then(NetworkProxy::remote_policy_decider));
+            .and_then(|launch| network?.remote_policy_decider(launch.proxy.allow_local_binding));
         if environment.is_remote() && network.is_some() && network_proxy_launch.is_none() {
             request.exec_server_enforce_managed_network = false;
         }
@@ -1407,7 +1411,6 @@ impl UnifiedExecProcessManager {
                     network_proxy_restricting_sid: network_proxy_restricting_sid.as_deref(),
                     proxy_settings_mode: windows_sandbox_proxy_settings_mode,
                     filesystem_overrides: request.windows_sandbox_filesystem_overrides.as_ref(),
-                    use_private_desktop: request.windows_sandbox_private_desktop,
                 })
             } else {
                 None
@@ -1488,7 +1491,10 @@ impl UnifiedExecProcessManager {
                     approval_policy: context.step_context.settings.approval_policy(),
                     permission_profile: request.turn_environment.permission_profile().clone(),
                     environment_policy: request.turn_environment.config().exec_policy.as_ref(),
-                    windows_sandbox_level: request.turn_environment.config().windows_sandbox_level,
+                    windows_sandbox_level: windows_sandbox_level_for_legacy_checks(
+                        request.turn_environment.config().windows_sandbox_type,
+                        request.turn_environment.config().windows_sandbox_level,
+                    ),
                     sandbox_permissions: if request.additional_permissions_preapproved {
                         crate::sandboxing::SandboxPermissions::UseDefault
                     } else {
@@ -1605,7 +1611,7 @@ impl UnifiedExecProcessManager {
             let mut wait_for_output = None;
             {
                 let mut guard = output_buffer.lock().await;
-                drained_output = std::mem::take(&mut *guard);
+                drained_output = std::mem::take(&mut guard.pending);
                 has_drained_output =
                     drained_output.retained_bytes() > 0 || drained_output.omitted_bytes() > 0;
                 if !has_drained_output {

@@ -22,7 +22,6 @@ impl PreparedGuardianContext {
         config: Config,
         history: &ContextManager,
         node_repl_policy: &GuardianNodeReplPolicy,
-        compaction_model_hash: Option<&str>,
     ) -> anyhow::Result<Self> {
         let (reset_version, history_reset) = parent.history_reset().await;
         // Preparation may have raced with a history reset before capturing the reviewer context.
@@ -33,7 +32,7 @@ impl PreparedGuardianContext {
             GuardianContextMode::from_history(history.conversation_history_snapshot().as_ref());
         let context_policy = ReviewContextPolicy::for_context(context_mode, &config.features);
         let root_authorization_version = context_policy.root_authorization_version(&parent).await;
-        let parent_compaction = context_policy.parent_compaction(history, compaction_model_hash)?;
+        let parent_compaction = context_policy.parent_compaction(history)?;
         let mut key = GuardianReviewSessionReuseKey::from_spawn_config(
             &config,
             parent.inherited_instructions().await,
@@ -103,9 +102,18 @@ impl PreparedGuardianContext {
             internal_parent: Some(crate::thread_manager::InternalSessionParent {
                 thread_id: self.parent.thread_id(),
                 auth_manager: Arc::clone(&self.parent.services.auth_manager),
-                agent_control: self.parent.services.agent_control.clone(),
+                agent_control: crate::agent::control::AgentControlInit::Inherited {
+                    control: Arc::clone(&self.parent.services.agent_control),
+                    runtime: self.parent.services.local_agent_runtime.clone(),
+                },
                 originator: self.context.turn().originator.clone(),
-                inherited_instructions: Some(self.parent.inherited_instructions().await),
+                // Review the same applied instructions captured by the reuse key.
+                // A live provider could advance independently while reviewing this action.
+                inherited_instructions: Some(SessionInstructions {
+                    user: self.key.user_instructions.clone(),
+                    thread: self.key.thread_instructions.clone(),
+                    ..Default::default()
+                }),
             }),
             initial_history: initial_history.unwrap_or(InitialHistory::New),
             environments: Some(self.context.environments().to_selections()),
@@ -216,7 +224,6 @@ pub(super) async fn prepare_review(
         params.spawn_config.clone(),
         &params.parent_history,
         &params.node_repl_policy,
-        params.compaction_model_hash.as_deref(),
     )
     .await?;
     Ok(PreparedReview {
@@ -251,7 +258,6 @@ pub(super) fn prepare_prewarm(
             config.spawn_config,
             &history,
             &config.node_repl_policy,
-            config.compaction_model_hash.as_deref(),
         )
         .await
     })

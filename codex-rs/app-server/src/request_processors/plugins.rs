@@ -65,12 +65,12 @@ pub(crate) struct PluginRequestProcessor {
         Arc<dyn Fn(codex_core_plugins::EffectivePluginsChange) + Send + Sync>,
 }
 
-fn plugin_skills_to_info(
-    skills: &[codex_skills::SkillMetadata],
+fn plugin_skills_to_info<'a>(
+    skills: impl IntoIterator<Item = &'a codex_skills::SkillMetadata>,
     disabled_skill_paths: &HashSet<AbsolutePathBuf>,
 ) -> Vec<SkillSummary> {
     skills
-        .iter()
+        .into_iter()
         .map(|skill| SkillSummary {
             name: skill.name.clone(),
             description: skill.description.clone(),
@@ -157,10 +157,7 @@ fn load_shared_plugin_ids_by_local_path(
 }
 
 fn remote_plugin_service_config(config: &Config) -> RemotePluginServiceConfig {
-    RemotePluginServiceConfig::new(
-        config.chatgpt_base_url.clone(),
-        config.http_client_factory(),
-    )
+    config.plugins_config_input().remote_plugin_service_config()
 }
 
 fn share_context_for_source(
@@ -191,6 +188,7 @@ fn convert_configured_marketplace_plugin_to_plugin_summary(
 ) -> PluginSummary {
     let share_context = share_context_for_source(&plugin.source, shared_plugin_ids_by_local_path);
     PluginSummary {
+        extensions: None,
         id: plugin.id,
         remote_plugin_id: None,
         version: None,
@@ -1023,9 +1021,15 @@ impl PluginRequestProcessor {
             marketplace_path.as_path().parent().map(Path::to_path_buf)
         });
 
-        let config = self.load_latest_config(config_cwd).await?;
+        let mut config = self.load_latest_config(config_cwd).await?;
+        let auth = match self.auth_manager.auth_with_http_client_factory().await {
+            Some((auth, factory)) => {
+                config.application_network_policy = factory.network_policy().clone();
+                Some(auth)
+            }
+            None => None,
+        };
         let plugins_input = config.plugins_config_input();
-        let auth = self.auth_manager.auth().await;
 
         let plugin = match read_source {
             Ok(marketplace_path) => {
@@ -1098,21 +1102,28 @@ impl PluginRequestProcessor {
                     &outcome.plugin.app_category_by_id,
                 )
                 .await;
-                let visible_skills = outcome
-                    .plugin
-                    .skills
-                    .iter()
-                    .filter(|skill| {
-                        skill.matches_product_restriction_for_product(
-                            self.thread_manager.session_source().restriction_product(),
-                        )
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
+                let visible_skills = outcome.plugin.skills.iter().filter(|skill| {
+                    skill.matches_product_restriction_for_product(
+                        self.thread_manager.session_source().restriction_product(),
+                    )
+                });
+                let skills =
+                    plugin_skills_to_info(visible_skills, &outcome.plugin.disabled_skill_paths);
+                let onboarding_skill = if outcome.plugin.enabled
+                    && let Some(path) = outcome.plugin.onboarding_skill.as_ref()
+                {
+                    skills
+                        .iter()
+                        .find(|skill| skill.enabled && skill.path.as_ref() == Some(path))
+                        .cloned()
+                } else {
+                    None
+                };
                 PluginDetail {
                     marketplace_name: outcome.marketplace_name,
                     marketplace_path: outcome.marketplace_path,
                     summary: PluginSummary {
+                        extensions: None,
                         id: outcome.plugin.id,
                         remote_plugin_id: None,
                         version: None,
@@ -1135,10 +1146,8 @@ impl PluginRequestProcessor {
                     },
                     share_url: None,
                     description: outcome.plugin.description,
-                    skills: plugin_skills_to_info(
-                        &visible_skills,
-                        &outcome.plugin.disabled_skill_paths,
-                    ),
+                    skills,
+                    onboarding_skill,
                     hooks: outcome
                         .plugin
                         .hooks
@@ -1480,8 +1489,14 @@ impl PluginRequestProcessor {
             }
         };
         let config_cwd = marketplace_path.as_path().parent().map(Path::to_path_buf);
-        let config = self.load_latest_config(config_cwd.clone()).await?;
-        let auth = self.auth_manager.auth().await;
+        let mut config = self.load_latest_config(config_cwd.clone()).await?;
+        let auth = match self.auth_manager.auth_with_http_client_factory().await {
+            Some((auth, factory)) => {
+                config.application_network_policy = factory.network_policy().clone();
+                Some(auth)
+            }
+            None => None,
+        };
 
         let plugins_manager = self.thread_manager.plugins_manager();
         let marketplace_display = marketplace_path.display().to_string();
@@ -1506,7 +1521,11 @@ impl PluginRequestProcessor {
             }
         };
         let config = match self.load_latest_config(config_cwd).await {
-            Ok(config) => config,
+            Ok(mut reloaded_config) => {
+                // Keep the policy captured with this installation's auth snapshot.
+                reloaded_config.application_network_policy = config.application_network_policy;
+                reloaded_config
+            }
             Err(err) => {
                 warn!(
                     "failed to reload config after plugin install, using current config: {err:?}"
@@ -1561,8 +1580,14 @@ impl PluginRequestProcessor {
         remote_plugin_id: String,
         install_attempt_id: Option<String>,
     ) -> Result<PluginInstallResponse, JSONRPCErrorError> {
-        let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
-        let auth = self.auth_manager.auth().await;
+        let mut config = self.load_latest_config(/*fallback_cwd*/ None).await?;
+        let auth = match self.auth_manager.auth_with_http_client_factory().await {
+            Some((auth, factory)) => {
+                config.application_network_policy = factory.network_policy().clone();
+                Some(auth)
+            }
+            None => None,
+        };
         let plugins_manager = self.thread_manager.plugins_manager();
         let installation = plugins_manager
             .install_remote_plugin(
@@ -2156,6 +2181,7 @@ fn remote_marketplace_to_info(marketplace: RemoteMarketplace) -> PluginMarketpla
 
 fn remote_plugin_summary_to_info(summary: RemoteCatalogPluginSummary) -> PluginSummary {
     PluginSummary {
+        extensions: summary.extensions,
         id: summary.id,
         remote_plugin_id: Some(summary.remote_plugin_id),
         version: summary.version,
@@ -2247,24 +2273,38 @@ fn remote_plugin_detail_to_info(
         })
         .collect();
 
+    let skills = detail
+        .skills
+        .into_iter()
+        .map(|skill| SkillSummary {
+            name: skill.name,
+            description: skill.description,
+            short_description: skill.short_description,
+            interface: skill.interface,
+            path: None,
+            enabled: skill.enabled,
+        })
+        .collect::<Vec<_>>();
+    let onboarding_skill = if detail.summary.enabled
+        && detail.summary.availability == PluginAvailability::Available
+        && let Some(name) = detail.onboarding_skill_name.as_ref()
+    {
+        skills
+            .iter()
+            .find(|skill| skill.enabled && &skill.name == name)
+            .cloned()
+    } else {
+        None
+    };
+
     PluginDetail {
         marketplace_name: detail.marketplace_name,
         marketplace_path: None,
         summary: remote_plugin_summary_to_info(detail.summary),
         share_url: detail.share_url,
         description: detail.description,
-        skills: detail
-            .skills
-            .into_iter()
-            .map(|skill| SkillSummary {
-                name: skill.name,
-                description: skill.description,
-                short_description: skill.short_description,
-                interface: skill.interface,
-                path: None,
-                enabled: skill.enabled,
-            })
-            .collect(),
+        skills,
+        onboarding_skill,
         hooks: Vec::new(),
         apps,
         app_templates,

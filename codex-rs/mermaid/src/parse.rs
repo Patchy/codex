@@ -6,6 +6,7 @@ use super::Graph;
 use super::MAX_EDGES;
 use super::MAX_LABEL;
 use super::RenderError;
+use super::Shape;
 use unicode_width::UnicodeWidthChar;
 use unicode_width::UnicodeWidthStr;
 
@@ -29,7 +30,7 @@ pub(super) fn parse(header: &str, body: &[&str]) -> Result<Graph, RenderError> {
             rest = rest.trim_start();
             let label = if let Some(after) = rest.strip_prefix('|') {
                 let (label, remaining) = after.split_once('|').ok_or(RenderError::Unsupported)?;
-                check_label(label)?;
+                let label = flowchart_label(label)?;
                 rest = remaining;
                 label.to_owned()
             } else {
@@ -59,31 +60,49 @@ fn node(rest: &mut &str, graph: &mut Graph) -> Result<usize, RenderError> {
         return Err(RenderError::Unsupported);
     }
     let declaration = match rest.chars().next() {
-        Some(open @ ('[' | '{')) => {
-            let close = if open == '[' { ']' } else { '}' };
-            let (label, remaining) = rest[1..]
-                .split_once(close)
-                .ok_or(RenderError::Unsupported)?;
-            check_label(label)?;
-            *rest = remaining;
-            Some((label, open == '{'))
-        }
+        Some('[') => Some(("[", "]", Shape::Rectangle)),
+        Some('{') => Some(("{", "}", Shape::Decision)),
+        Some('(') if rest.starts_with("([") => Some(("([", "])", Shape::Stadium)),
         _ => None,
     };
     let index = graph.node(id)?;
-    if let Some((label, decision)) = declaration {
+    if let Some((open, close, shape)) = declaration {
+        let (label, remaining) = rest[open.len()..]
+            .split_once(close)
+            .ok_or(RenderError::Unsupported)?;
+        let label = flowchart_label(label)?;
+        *rest = remaining;
         let node = &mut graph.nodes[index];
-        if node.declared && (node.label != label || node.decision != decision) {
+        if node.declared && (node.label != label || node.shape != shape) {
             return Err(RenderError::Unsupported);
         }
         node.label = label.to_owned();
-        node.decision = decision;
+        node.shape = shape;
         node.declared = true;
     }
     Ok(index)
 }
 
+fn flowchart_label(label: &str) -> Result<&str, RenderError> {
+    let label = if let Some(quoted) = label.strip_prefix('"') {
+        quoted.strip_suffix('"').ok_or(RenderError::Unsupported)?
+    } else {
+        label
+    };
+    check_label_text(label)?;
+    Ok(label)
+}
+
 pub(super) fn check_label(label: &str) -> Result<(), RenderError> {
+    // Only delimited flowchart labels support literal ampersands. Other families must keep
+    // rejecting them so statement splitting cannot turn an entity into truncated label text.
+    if label.contains('&') {
+        return Err(RenderError::Unsupported);
+    }
+    check_label_text(label)
+}
+
+fn check_label_text(label: &str) -> Result<(), RenderError> {
     if label.trim().is_empty()
         || label.chars().any(|ch| {
             ch.is_control()
@@ -95,7 +114,6 @@ pub(super) fn check_label(label: &str) -> Result<(), RenderError> {
                         | '|'
                         | '<'
                         | '>'
-                        | '&'
                         | '"'
                         | '\\'
                         | '┌'

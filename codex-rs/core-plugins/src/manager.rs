@@ -157,6 +157,7 @@ pub struct PluginsConfigInput {
     pub plugins_enabled: bool,
     pub remote_plugin_enabled: bool,
     pub chatgpt_base_url: String,
+    pub product_sku: Option<String>,
     http_client_factory: HttpClientFactory,
 }
 
@@ -168,6 +169,7 @@ impl PluginsConfigInput {
         remote_plugin_enabled: bool,
         chatgpt_base_url: String,
         http_client_factory: HttpClientFactory,
+        product_sku: Option<String>,
     ) -> Self {
         Self {
             config_layer_stack,
@@ -176,6 +178,7 @@ impl PluginsConfigInput {
             remote_plugin_enabled,
             chatgpt_base_url,
             http_client_factory,
+            product_sku,
         }
     }
 
@@ -184,6 +187,7 @@ impl PluginsConfigInput {
         RemotePluginServiceConfig::new(
             self.chatgpt_base_url.clone(),
             self.http_client_factory.clone(),
+            self.product_sku.clone(),
         )
     }
 }
@@ -225,7 +229,7 @@ struct CachedFeaturedPluginIds {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-struct RemoteInstalledPluginsAuthIdentity {
+pub(crate) struct RemoteInstalledPluginsAuthIdentity {
     auth_mode: Option<AuthMode>,
     account_id: Option<String>,
     chatgpt_user_id: Option<String>,
@@ -233,7 +237,7 @@ struct RemoteInstalledPluginsAuthIdentity {
 }
 
 impl RemoteInstalledPluginsAuthIdentity {
-    fn from_auth(auth: Option<&CodexAuth>) -> Self {
+    pub(crate) fn from_auth(auth: Option<&CodexAuth>) -> Self {
         Self {
             auth_mode: auth.map(CodexAuth::api_auth_mode),
             account_id: auth.and_then(CodexAuth::get_account_id),
@@ -449,6 +453,8 @@ pub struct PluginDetail {
     pub enabled: bool,
     pub skills: Vec<SkillMetadata>,
     pub disabled_skill_paths: HashSet<AbsolutePathBuf>,
+    /// Packaged onboarding path; callers apply visibility and enablement.
+    pub onboarding_skill: Option<AbsolutePathBuf>,
     pub hooks: Vec<PluginHookSummary>,
     pub apps: Vec<AppConnectorId>,
     pub app_category_by_id: HashMap<String, String>,
@@ -1417,10 +1423,16 @@ impl PluginsManager {
             }
             return Some(needs_effective_plugins_refresh);
         }
+        let metadata_changed = cache.plugins.as_ref().is_none_or(|previous| {
+            !crate::remote_metadata::installed_plugin_metadata_eq(previous, &plugins)
+        });
         cache.plugins = Some(plugins);
         drop(cache);
-        self.clear_loaded_plugins_cache();
-        Some(true)
+        let changed = needs_effective_plugins_refresh || metadata_changed;
+        if changed {
+            self.clear_loaded_plugins_cache();
+        }
+        Some(changed)
     }
 
     #[cfg(test)]
@@ -2592,6 +2604,7 @@ impl PluginsManager {
                 enabled: plugin.enabled,
                 skills: Vec::new(),
                 disabled_skill_paths: HashSet::new(),
+                onboarding_skill: None,
                 hooks: Vec::new(),
                 apps: Vec::new(),
                 app_category_by_id: HashMap::new(),
@@ -2671,6 +2684,18 @@ impl PluginsManager {
         )
         .await
         .resolve(&skill_config_rules);
+        let onboarding_skill = manifest.paths.onboarding_skill.as_ref().and_then(|path| {
+            let plugin_root = source_path.canonicalize().ok()?;
+            let path = path.canonicalize().ok()?;
+            if !path.as_path().starts_with(plugin_root.as_path()) {
+                return None;
+            }
+            resolved_skills
+                .skills
+                .iter()
+                .any(|skill| skill.path_to_skills_md == path)
+                .then_some(path)
+        });
         let plugin_data_root = self.store.plugin_data_root(&plugin_id);
         let (hook_sources, _hook_load_warnings) = if manifest_format == PluginManifestFormat::Legacy
         {
@@ -2736,6 +2761,7 @@ impl PluginsManager {
             enabled: plugin.enabled,
             skills: resolved_skills.skills,
             disabled_skill_paths: resolved_skills.disabled_skill_paths,
+            onboarding_skill,
             hooks,
             apps,
             app_category_by_id,

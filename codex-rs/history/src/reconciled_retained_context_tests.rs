@@ -47,12 +47,12 @@ fn recovery_preserves_source_identity_acceptance_order_and_checkpoint_gaps() {
         [
             // Existing identities match before requiring an order, including an omitted excerpt.
             (None, initial.clone()),
-            (None, original),
+            (None, original.clone()),
             (Some(4), instruction("Do not deploy after all.")),
             // This steer arrived before the checkpoint-only answer but was recorded later.
             (Some(2), instruction("Make the deployment public.")),
             // A second identical message is a distinct source once the retained one matched.
-            (Some(5), initial),
+            (Some(5), initial.clone()),
         ],
     );
 
@@ -61,7 +61,9 @@ fn recovery_preserves_source_identity_acceptance_order_and_checkpoint_gaps() {
             reconciled
                 .ordered_entries()
                 .map(|(order, entry)| match entry {
-                    RetainedContextEntry::UserMessage(message) => (order, message.text.as_str()),
+                    RetainedContextEntry::UserMessage(message)
+                    | RetainedContextEntry::AssistantMessage(message) =>
+                        (order, message.text.as_str()),
                     RetainedContextEntry::VerifiedAnswer(answer) => {
                         (order, answer.questions[0].answer.as_str())
                     }
@@ -83,6 +85,21 @@ fn recovery_preserves_source_identity_acceptance_order_and_checkpoint_gaps() {
             ],
             true,
         ),
+    );
+    let legacy_instruction = instruction("Only publish to staging.");
+    assert_eq!(
+        reconciled
+            .unmatched_user_messages(
+                [
+                    initial,
+                    original,
+                    instruction("Do not deploy after all."),
+                    legacy_instruction.clone(),
+                ]
+                .into_iter(),
+            )
+            .collect::<Vec<_>>(),
+        vec![legacy_instruction],
     );
     assert_eq!(retained, checkpoint);
 }
@@ -110,7 +127,8 @@ fn recovery_marks_missing_and_conflicting_orders_incomplete() {
                 reconciled
                     .ordered_entries()
                     .map(|(order, entry)| match entry {
-                        RetainedContextEntry::UserMessage(message) =>
+                        RetainedContextEntry::UserMessage(message)
+                        | RetainedContextEntry::AssistantMessage(message) =>
                             (order, message.text.as_str()),
                         RetainedContextEntry::VerifiedAnswer(_) => panic!("unexpected answer"),
                     })

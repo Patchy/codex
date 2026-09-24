@@ -29,7 +29,7 @@ fn test_turn_environment(environment_id: &str) -> crate::session::turn_context::
                 allow_login_shell: true,
                 workspace_roots: Vec::new(),
                 windows_sandbox_level: WindowsSandboxLevel::Disabled,
-                windows_sandbox_private_desktop: true,
+                windows_sandbox_type: SandboxType::None,
                 use_legacy_landlock: false,
                 permission_profile: PermissionProfileSnapshot::legacy(
                     PermissionProfile::read_only(),
@@ -248,8 +248,8 @@ async fn file_system_sandbox_context_preserves_executor_workspace_permissions() 
         workspace_roots: std::slice::from_ref(&sandbox_policy_cwd),
         sandbox_exe: None,
         use_legacy_landlock: true,
+        windows_sandbox_type: SandboxType::WindowsRestrictedToken,
         windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
-        windows_sandbox_private_desktop: true,
         network_denial_cancellation_token: None,
         network_proxy: None,
     };
@@ -278,7 +278,6 @@ async fn file_system_sandbox_context_preserves_executor_workspace_permissions() 
             codex_file_system::WindowsSandboxSelection::Disabled
         }
     );
-    assert_eq!(sandbox.windows_sandbox_private_desktop, true);
     assert_eq!(sandbox.use_legacy_landlock, true);
 }
 
@@ -316,8 +315,8 @@ async fn file_system_sandbox_context_respects_sandbox_request() {
         workspace_roots: std::slice::from_ref(&sandbox_policy_cwd),
         sandbox_exe: None,
         use_legacy_landlock: false,
+        windows_sandbox_type: SandboxType::None,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
-        windows_sandbox_private_desktop: false,
         network_denial_cancellation_token: None,
         network_proxy: None,
     };
@@ -349,7 +348,6 @@ async fn file_system_sandbox_context_respects_sandbox_request() {
             user_home_dir: Some(user_home_dir),
             temporary_directories: None,
             windows_sandbox_selection: codex_file_system::WindowsSandboxSelection::RestrictedToken,
-            windows_sandbox_private_desktop: false,
             windows_sandbox_proxy_settings_mode: None,
             use_legacy_landlock: false,
         })

@@ -3,6 +3,7 @@
 //! checks the previous model when it applies the final selection.
 
 use super::*;
+use crate::style::accent_color;
 
 impl ChatWidget {
     /// Offer the flourish only for a successful primary thread/start without initial work.
@@ -206,6 +207,7 @@ impl ChatWidget {
                 &self.config,
                 &self.local_settings,
                 &model_for_header,
+                self.model_catalog.display_name(&session.model),
                 &session,
                 self.show_welcome_banner,
                 startup_tooltip_override,
@@ -283,9 +285,9 @@ impl ChatWidget {
             vec![
                 "• ".dim(),
                 "Thread forked from ".into(),
-                name.cyan(),
+                name.fg(accent_color()),
                 " (".into(),
-                forked_from_id_text.cyan(),
+                forked_from_id_text.fg(accent_color()),
                 ")".into(),
             ]
             .into()
@@ -293,7 +295,7 @@ impl ChatWidget {
             vec![
                 "• ".dim(),
                 "Thread forked from ".into(),
-                forked_from_id_text.cyan(),
+                forked_from_id_text.fg(accent_color()),
             ]
             .into()
         };

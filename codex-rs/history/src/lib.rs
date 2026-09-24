@@ -1,5 +1,10 @@
 //! Model-history and persisted-rollout domain types.
 
+mod compaction_resume_metadata;
+pub use compaction_resume_metadata::CompactionResumeMetadata;
+pub use compaction_resume_metadata::PreviousTurnSettings;
+pub use compaction_resume_metadata::resume_multi_agent_version;
+
 mod compaction_checkpoint;
 pub use compaction_checkpoint::CompactionCheckpoint;
 
@@ -12,6 +17,8 @@ use std::sync::Arc;
 use codex_protocol::ThreadId;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
+use codex_protocol::mcp::McpAttribution;
+use codex_protocol::mcp::McpAttributionStatus;
 use codex_protocol::mcp::McpResourceOriginCheckpoint;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
@@ -62,6 +69,11 @@ pub struct CodexHarnessMetadata {
     )]
     pub history_truncation_token_limit: Option<usize>,
 
+    /// Bounded assistant text confirmed by a successful messaging tool result.
+    /// Captured after input hooks; untrusted context, never user authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_assistant_message: Option<String>,
+
     /// Whether a response configuration update was created by the Codex harness itself.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub harness_authored_configuration: bool,
@@ -70,17 +82,46 @@ pub struct CodexHarnessMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_model_hash: Option<String>,
 
-    /// Thread acceptance order, independent of when queued user input reaches model history.
+    /// User acceptance or assistant delivery order, independent of queued input recording.
+    /// The serialized name is retained for compatibility with saved history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_input_order: Option<u64>,
 
-    /// Copied parent context stays model-visible but must not become child-local authorization.
+    /// Output generated for compaction is not an original user-visible assistant message.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compaction_output: bool,
+
+    /// Copied parent user/assistant context must not become child-local authorization.
+    /// The serialized field name is retained for compatibility with saved history.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub inherited_user_message: bool,
+
+    /// Cumulative MCP tools/call attribution checkpoint, never model-visible.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_mcp_attribution_checkpoint"
+    )]
+    pub mcp_attribution: Option<McpAttribution>,
 
     /// Sender context captured by the host when this task message was accepted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_user_messages: Option<Box<SenderUserMessages>>,
+}
+
+fn deserialize_mcp_attribution_checkpoint<'de, D>(
+    deserializer: D,
+) -> Result<Option<McpAttribution>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(Some(serde_json::from_value(value).unwrap_or_else(|_| {
+        McpAttribution {
+            status: McpAttributionStatus::AttributionError,
+            sources: Vec::new(),
+        }
+    })))
 }
 
 impl ResponseItemEnvelope {
@@ -214,6 +255,9 @@ pub struct CompactedItem {
     /// `thread/resume` can restore token usage totals from this field without scanning arbitrarily
     /// far past the compaction.
     pub latest_token_usage_record: Option<TokenUsageRecord>,
+    /// Resume metadata for values not represented by the companion rollout records.
+    /// Presence distinguishes explicitly persisted values from legacy fallback reconstruction.
+    pub resume_metadata: Option<CompactionResumeMetadata>,
 }
 
 impl Serialize for CompactedItem {
@@ -504,22 +548,7 @@ fn multi_agent_version_from_items(
         _ => None,
     });
 
-    session_meta_version.or_else(|| {
-        items.iter().rev().find_map(|item| match item {
-            RolloutItem::TurnContext(turn_context) => turn_context.multi_agent_version,
-            RolloutItem::SessionMeta(_)
-            | RolloutItem::ResponseItem(_)
-            | RolloutItem::InterAgentCommunication(_)
-            | RolloutItem::InterAgentCommunicationMetadata { .. }
-            | RolloutItem::Compacted(_)
-            | RolloutItem::TokenUsageRecord(_)
-            | RolloutItem::WorldState(_)
-            | RolloutItem::RetainedContext(_)
-            | RolloutItem::SecurityRiskScore(_)
-            | RolloutItem::RealtimeItem(_)
-            | RolloutItem::EventMsg(_) => None,
-        })
-    })
+    session_meta_version.or_else(|| items.iter().rev().find_map(resume_multi_agent_version))
 }
 
 #[cfg(test)]

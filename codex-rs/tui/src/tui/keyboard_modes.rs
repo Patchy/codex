@@ -1,13 +1,13 @@
 //! Terminal keyboard enhancement setup and teardown helpers.
 //!
-//! The TUI uses crossterm's keyboard enhancement stack while it owns the terminal, but
+//! The TUI pairs pushes and pops on each screen's keyboard enhancement stack, but
 //! process exit gets a stronger reset so the parent shell does not inherit enhanced key
 //! reporting if a terminal misses the normal stack pop.
 //! Windows terminal detection has a deadline, including WSL interop process launch.
 //! Inconclusive detection keeps keyboard enhancements disabled on WSL.
 
 use std::fmt;
-use std::io::stdout;
+use std::io::Write;
 
 use codex_terminal_detection::TerminalName;
 use codex_terminal_detection::terminal_info;
@@ -206,34 +206,35 @@ fn read_windows_vscode_detection_with_timeout(
 #[path = "windows_term_program_tests.rs"]
 mod windows_term_program_tests;
 
-pub(super) fn enable_keyboard_enhancement() {
+/// Restore keyboard reporting and return the mouse policy from the same fresh tmux probe.
+pub(super) fn enable_keyboard_enhancement(writer: &mut impl Write) -> super::tmux::MouseCapture {
+    let tmux_options = super::tmux::options();
     if keyboard_enhancement_disabled() {
-        return;
+        return tmux_options.mouse_capture;
     }
 
     let running_in_tmux_session = running_in_tmux_session();
     let tmux_extended_keys_format = if running_in_tmux_session {
-        read_tmux_extended_keys_format()
+        tmux_options.extended_keys_format.as_deref()
     } else {
         None
     };
 
     let _ = execute!(
-        stdout(),
+        writer,
         DisableModifyOtherKeys,
         PushKeyboardEnhancementFlags(keyboard_enhancement_flags(
             terminal_info().name,
             running_in_tmux_session,
-            tmux_extended_keys_format.as_deref()
+            tmux_extended_keys_format
         ))
     );
 
-    if tmux_should_enable_modify_other_keys_for(
-        running_in_tmux_session,
-        tmux_extended_keys_format.as_deref(),
-    ) {
-        let _ = execute!(stdout(), EnableModifyOtherKeys);
+    if tmux_should_enable_modify_other_keys_for(running_in_tmux_session, tmux_extended_keys_format)
+    {
+        let _ = execute!(writer, EnableModifyOtherKeys);
     }
+    tmux_options.mouse_capture
 }
 
 fn keyboard_enhancement_flags(
@@ -278,48 +279,13 @@ fn tmux_should_enable_modify_other_keys_for(
     running_in_tmux_session && matches!(extended_keys_format, Some("csi-u"))
 }
 
-fn read_tmux_extended_keys_format() -> Option<String> {
-    let executable = codex_utils_path::system_executable("tmux")?;
-    let path = codex_utils_path::system_path().ok()?;
-    for args in [
-        ["display-message", "-p", "#{extended-keys-format}"],
-        ["show-options", "-gqv", "extended-keys-format"],
-    ] {
-        let output = std::process::Command::new(&executable)
-            .env("PATH", &path)
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()?;
-
-        if !output.status.success() {
-            continue;
-        }
-
-        if let Some(value) = String::from_utf8(output.stdout)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-        {
-            return Some(value);
-        }
-    }
-
-    None
+pub(super) fn restore_keyboard_enhancement_stack(writer: &mut impl Write) {
+    let _ = execute!(writer, PopKeyboardEnhancementFlags, DisableModifyOtherKeys);
 }
 
-pub(super) fn restore_keyboard_enhancement_stack() {
+pub(super) fn reset_keyboard_reporting_after_exit(writer: &mut impl Write) {
     let _ = execute!(
-        stdout(),
-        PopKeyboardEnhancementFlags,
-        DisableModifyOtherKeys
-    );
-}
-
-pub(super) fn reset_keyboard_reporting_after_exit() {
-    let _ = execute!(
-        stdout(),
+        writer,
         PopKeyboardEnhancementFlags,
         ResetKeyboardEnhancementFlags,
         DisableModifyOtherKeys

@@ -9,6 +9,7 @@ use crate::responses_metadata::CompactionTurnMetadata;
 use crate::responses_metadata::FORKED_FROM_ORDINAL_EXCLUSIVE_KEY;
 use crate::responses_metadata::INSTALLATION_ID_KEY;
 use crate::responses_metadata::LEGACY_CODE_MODE_TOOL_NAMES_KEY;
+use crate::responses_metadata::MCP_ATTRIBUTION_CLIENT_METADATA_KEY;
 use crate::responses_metadata::NODE_REPL_AUTO_REVIEW_REQUIRED_KEY;
 use crate::responses_metadata::NODE_REPL_DISABLED_KEY;
 use crate::responses_metadata::PARENT_TURN_ID_KEY;
@@ -29,6 +30,7 @@ use codex_analytics::CompactionTrigger;
 use codex_analytics::TurnAnalyticsMetadata;
 use codex_models_manager::model_info::model_info_from_slug;
 use codex_protocol::AgentPath;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::SessionSource;
@@ -180,7 +182,7 @@ async fn detached_memory_responses_metadata_starts_an_independent_root_turn() {
     let turn_id = parsed["turn_id"].as_str().expect("memory turn ID");
     uuid::Uuid::parse_str(turn_id).expect("memory turn ID is a UUID");
     assert_eq!(parsed[ROOT_TURN_ID_KEY], parsed["turn_id"]);
-    let client_metadata = metadata.client_metadata();
+    let client_metadata = metadata.client_metadata(/*include_internal*/ true);
     assert_eq!(
         client_metadata.get("turn_id").map(String::as_str),
         Some(turn_id)
@@ -1099,6 +1101,7 @@ fn responses_api_metadata_rejects_reserved_keys() {
         TURN_TRIGGER_KEY,
         WINDOW_ID_KEY,
         CONTEXT_WINDOW_ID_KEY,
+        MCP_ATTRIBUTION_CLIENT_METADATA_KEY,
     ] {
         assert_eq!(
             validate_extra_metadata(

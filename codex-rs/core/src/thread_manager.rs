@@ -1,7 +1,9 @@
 mod managed;
+mod shared_instructions;
 
 use crate::CodexAppsToolsCache;
-use crate::agent::AgentControl;
+use crate::agent::LocalAgentControl;
+use crate::agent::control::AgentControlInit;
 use crate::agents_md_manager::SessionInstructions;
 use crate::attestation::AttestationProvider;
 use crate::codex_thread::CodexThread;
@@ -21,8 +23,10 @@ use crate::session::resolve_multi_agent_version;
 use crate::session::session::Session;
 use crate::tasks::InterruptedTurnHistoryMarker;
 use crate::tasks::interrupted_turn_history_marker;
+use crate::thread_startup_metadata::ThreadStartupMetadata;
 use codex_agent_graph_store::AgentGraphStore;
 use codex_agent_graph_store::LocalAgentGraphStore;
+use codex_agent_message_board_extension::LocalAgentMessageBoard;
 use codex_analytics::AnalyticsEventsClient;
 use codex_app_server_protocol::ThreadHistoryBuilder;
 use codex_app_server_protocol::TurnStatus;
@@ -106,8 +110,6 @@ use tracing::instrument;
 use tracing::warn;
 
 const THREAD_CREATED_CHANNEL_CAPACITY: usize = 1024;
-// Reject pathological selected cwd values at the environment-selection boundary.
-const MAX_TURN_ENVIRONMENT_CWD_BYTES: usize = 8 * 1024;
 
 /// Test-only override for enabling thread-manager behaviors used by integration
 /// tests.
@@ -239,7 +241,7 @@ pub struct ThreadManager {
 pub struct InternalSessionParent {
     pub(crate) thread_id: ThreadId,
     pub(crate) auth_manager: Arc<AuthManager>,
-    pub(crate) agent_control: AgentControl,
+    pub(crate) agent_control: AgentControlInit,
     pub(crate) originator: String,
     pub(crate) inherited_instructions: Option<SessionInstructions>,
 }
@@ -311,7 +313,7 @@ struct ThreadSpawnRequest {
     startup: Option<Arc<crate::session::startup::SessionStartup>>,
     options: StartThreadOptions,
     auth_manager: Arc<AuthManager>,
-    agent_control: AgentControl,
+    agent_control: AgentControlInit,
     parent_thread_id: Option<ThreadId>,
     parent_originator: Option<String>,
     forked_from_thread_id: Option<ThreadId>,
@@ -326,13 +328,13 @@ impl ThreadSpawnRequest {
     fn new(
         options: StartThreadOptions,
         auth_manager: Arc<AuthManager>,
-        agent_control: AgentControl,
+        agent_control: impl Into<AgentControlInit>,
     ) -> Self {
         Self {
             startup: None,
             options,
             auth_manager,
-            agent_control,
+            agent_control: agent_control.into(),
             parent_thread_id: None,
             parent_originator: None,
             forked_from_thread_id: None,
@@ -378,7 +380,7 @@ fn effective_originator_value(
 pub(crate) struct ResumeThreadWithHistoryOptions {
     pub(crate) config: Config,
     pub(crate) initial_history: InitialHistory,
-    pub(crate) agent_control: AgentControl,
+    pub(crate) agent_control: LocalAgentControl,
     pub(crate) session_source: SessionSource,
     pub(crate) parent_thread_id: Option<ThreadId>,
     pub(crate) environment_selections: Option<Vec<TurnEnvironmentSelection>>,
@@ -389,10 +391,12 @@ pub(crate) struct ResumeThreadWithHistoryOptions {
 }
 
 /// Shared, `Arc`-owned state for [`ThreadManager`]. This `Arc` is required to have a single
-/// `Arc` reference that can be downgraded to by `AgentControl` while preventing every single
+/// `Arc` reference that can be downgraded to by `LocalAgentControl` while preventing every single
 /// function to require an `Arc<&Self>`.
 pub(crate) struct ThreadManagerState {
-    threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>,
+    // Eviction updates this registry and residency together, locking the registry first.
+    pub(crate) threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>,
+    shared_thread_instructions: shared_instructions::SharedThreadInstructionsProviders,
     thread_created_tx: broadcast::Sender<ThreadId>,
     thread_id_generator: ThreadIdGenerator,
     auth_manager: Arc<AuthManager>,
@@ -446,10 +450,23 @@ pub fn thread_store_from_config(
                 .features
                 .enabled(Feature::BackgroundPaginatedRolloutMigration);
             let has_state_db = state_db.is_some();
-            let store = Arc::new(LocalThreadStore::new(
-                LocalThreadStoreConfig::from_config(config),
-                state_db,
-            ));
+            let sqlite = config.sqlite_config().clone();
+            let store = Arc::new(
+                LocalThreadStore::new(LocalThreadStoreConfig::from_config(config), state_db)
+                    .with_thread_data_cleanup(move |thread_ids| {
+                        let sqlite = sqlite.clone();
+                        Box::pin(async move {
+                            let boards = thread_ids.into_iter().map(Into::into).collect::<Vec<_>>();
+                            LocalAgentMessageBoard::delete_boards(&sqlite, &boards)
+                                .await
+                                .map_err(|err| ThreadStoreError::Internal {
+                                    message: format!(
+                                        "failed to delete agent message boards: {err}"
+                                    ),
+                                })
+                        })
+                    }),
+            );
             if has_state_db && background_migration_enabled {
                 let startup_store = Arc::clone(&store);
                 let codex_home = config.codex_home.to_path_buf();
@@ -541,6 +558,7 @@ impl ThreadManager {
         Self {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
+                shared_thread_instructions: Default::default(),
                 thread_created_tx,
                 thread_id_generator: default_thread_id_generator(),
                 models_manager,
@@ -689,6 +707,7 @@ impl ThreadManager {
         Self {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
+                shared_thread_instructions: Default::default(),
                 thread_created_tx,
                 thread_id_generator: default_thread_id_generator(),
                 models_manager: create_model_provider(provider, Some(auth_manager.clone()))
@@ -826,37 +845,6 @@ impl ThreadManager {
             cwd,
             workspace_roots,
         )
-    }
-
-    pub fn validate_environment_selections(
-        &self,
-        environments: &[TurnEnvironmentSelection],
-    ) -> CodexResult<()> {
-        let mut environment_ids = HashSet::with_capacity(environments.len());
-        for environment in environments {
-            if environment.cwd.inferred_native_path_string().len() > MAX_TURN_ENVIRONMENT_CWD_BYTES
-            {
-                return Err(CodexErr::InvalidRequest(
-                    "turn environment working directory exceeds the maximum size".to_string(),
-                ));
-            }
-            if !environment_ids.insert(environment.environment_id.as_str()) {
-                return Err(CodexErr::InvalidRequest(format!(
-                    "duplicate turn environment id `{}`",
-                    environment.environment_id
-                )));
-            }
-            self.state
-                .environment_manager
-                .get_environment(&environment.environment_id)
-                .ok_or_else(|| {
-                    CodexErr::InvalidRequest(format!(
-                        "unknown turn environment id `{}`",
-                        environment.environment_id
-                    ))
-                })?;
-        }
-        Ok(())
     }
 
     pub(crate) fn git_root_discovery(&self) -> Arc<GitRootDiscovery> {
@@ -1002,6 +990,7 @@ impl ThreadManager {
 
         for descendant_id in self
             .agent_control()
+            .runtime
             .list_live_agent_subtree_thread_ids(thread_id)
             .await?
         {
@@ -1071,7 +1060,10 @@ impl ThreadManager {
         options.internal_parent = Some(InternalSessionParent {
             thread_id: parent_thread_id,
             auth_manager: Arc::clone(&parent.session.services.auth_manager),
-            agent_control: parent.session.services.agent_control.clone(),
+            agent_control: AgentControlInit::Inherited {
+                control: Arc::clone(&parent.session.services.agent_control),
+                runtime: parent.session.services.local_agent_runtime.clone(),
+            },
             originator: parent.config_snapshot().await.originator,
             inherited_instructions,
         });
@@ -1213,10 +1205,11 @@ impl ThreadManager {
                 "cannot resume multi-agent v2 child {child_thread_id}: parent {parent_thread_id} is not loaded; resume the parent first"
             ))
         })?;
-        let config = parent.session.get_config().await.as_ref().clone();
-        let agent_control = parent.session.services.agent_control.clone();
-        agent_control
-            .ensure_v2_agent_loaded(config, child_thread_id, Some(parent))
+        parent
+            .session
+            .services
+            .agent_control
+            .ensure_child_loaded(parent_thread_id, child_thread_id)
             .await
     }
 
@@ -1530,16 +1523,16 @@ impl ThreadManager {
         Box::pin(self.state.spawn_thread(request)).await
     }
 
-    pub(crate) fn agent_control(&self) -> AgentControl {
-        AgentControl::new(
+    pub(crate) fn agent_control(&self) -> LocalAgentControl {
+        LocalAgentControl::new(
             Arc::downgrade(&self.state),
             self.state.thread_id_generator.clone(),
             /*rollout_budget*/ None,
         )
     }
 
-    fn agent_control_for_config(&self, config: &Config) -> AgentControl {
-        AgentControl::new(
+    fn agent_control_for_config(&self, config: &Config) -> LocalAgentControl {
+        LocalAgentControl::new(
             Arc::downgrade(&self.state),
             self.state.thread_id_generator.clone(),
             config.rollout_budget.clone(),
@@ -1565,6 +1558,15 @@ impl ThreadManager {
 }
 
 impl ThreadManagerState {
+    pub(crate) fn shared_thread_instructions_provider(
+        &self,
+        root_thread_id: ThreadId,
+        provider: Option<Arc<dyn ThreadInstructionsProvider>>,
+    ) -> Option<Arc<dyn ThreadInstructionsProvider>> {
+        self.shared_thread_instructions
+            .for_root(root_thread_id, provider)
+    }
+
     pub(crate) fn agent_graph_store(&self) -> Option<Arc<dyn AgentGraphStore>> {
         self.agent_graph_store.clone()
     }
@@ -1662,6 +1664,16 @@ impl ThreadManagerState {
         root_turn_id: Option<String>,
     ) -> CodexResult<String> {
         let thread = self.get_thread(thread_id).await?;
+        let residency_guard = if matches!(op, Op::InterAgentCommunication { .. }) {
+            thread
+                .session
+                .services
+                .local_agent_runtime
+                .pin_v2_residency(self, &thread)
+                .await?
+        } else {
+            None
+        };
         if let Some(ops_log) = &self.ops_log
             && let Ok(mut log) = ops_log.lock()
             && let Some(captured_op) = capture_test_op(&op)
@@ -1670,7 +1682,13 @@ impl ThreadManagerState {
         }
         thread
             .io
-            .submit_with_trace(op, /*trace*/ None, parent_turn_id, root_turn_id)
+            .submit_with_trace(
+                op,
+                /*trace*/ None,
+                parent_turn_id,
+                root_turn_id,
+                residency_guard,
+            )
             .await
     }
 
@@ -1732,7 +1750,8 @@ impl ThreadManagerState {
     ///
     /// Fresh roots, cold resumes, and root forks retain the global and any supplied
     /// thread provider. The session's AgentsMdManager loads them at startup and
-    /// subsequent context captures. Subagents inherit only applied parent snapshots.
+    /// subsequent context captures. Subagents inherit applied parent snapshots and
+    /// any thread provider that explicitly opts into sharing with descendants.
     /// A root fork without a provider preserves the live source's thread snapshot,
     /// never its task-bound provider. Hosts must supply a provider for offline forks.
     /// Warm resumes retain the existing session and do not call this function.
@@ -1831,7 +1850,7 @@ impl ThreadManagerState {
     pub(crate) async fn spawn_new_thread(
         &self,
         config: Config,
-        agent_control: AgentControl,
+        agent_control: LocalAgentControl,
     ) -> CodexResult<NewThread> {
         Box::pin(self.spawn_new_thread_with_source(
             config,
@@ -1853,7 +1872,7 @@ impl ThreadManagerState {
     pub(crate) async fn spawn_new_thread_with_source(
         &self,
         config: Config,
-        agent_control: AgentControl,
+        agent_control: LocalAgentControl,
         session_source: SessionSource,
         history_mode: Option<ThreadHistoryMode>,
         parent_thread_id: Option<ThreadId>,
@@ -1932,7 +1951,7 @@ impl ThreadManagerState {
         config: Config,
         initial_history: InitialHistory,
         history_mode: Option<ThreadHistoryMode>,
-        agent_control: AgentControl,
+        agent_control: LocalAgentControl,
         session_source: SessionSource,
         thread_source: Option<ThreadSource>,
         parent_thread_id: Option<ThreadId>,
@@ -1955,6 +1974,7 @@ impl ThreadManagerState {
         };
         let mut request =
             ThreadSpawnRequest::new(options, Arc::clone(&self.auth_manager), agent_control);
+        request.fork_persistence = ForkPersistence::CopiedDeferred;
         request.parent_thread_id = parent_thread_id;
         request.forked_from_thread_id = forked_from_thread_id;
         request.inherited_environments = inherited_environments;
@@ -2061,9 +2081,13 @@ impl ThreadManagerState {
                             resumed.conversation_id
                         )));
                     }
+                    drop(threads);
+                    let session_configured = thread
+                        .startup_metadata()
+                        .to_session_configured_event(initial_history.get_event_msgs());
                     return Ok(NewThread {
                         thread_id: resumed.conversation_id,
-                        session_configured: thread.session_configured(),
+                        session_configured,
                         thread,
                     });
                 }
@@ -2074,8 +2098,9 @@ impl ThreadManagerState {
         if let InitialHistory::Resumed(resumed) = &initial_history
             && initial_history.get_multi_agent_version() == Some(MultiAgentVersion::V2)
             && !session_source.is_non_root_agent()
+            && let AgentControlInit::Local(control) = &agent_control
         {
-            agent_control
+            control
                 .restore_v2_agent_metadata(&config, resumed.conversation_id)
                 .await;
         }
@@ -2278,7 +2303,7 @@ impl ThreadManagerState {
                 let thread = Arc::new(CodexThread::new(
                     session,
                     io,
-                    session_configured.clone(),
+                    ThreadStartupMetadata::from(&session_configured),
                     session_configured.rollout_path.clone(),
                     session_source,
                 ));

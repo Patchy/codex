@@ -11,6 +11,7 @@ use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::tools::sandboxing::ApprovalAction;
 use crate::tools::sandboxing::ToolError;
+use crate::windows_sandbox::windows_sandbox_level_for_legacy_checks;
 use codex_features::Feature;
 use codex_file_system::FileSystemSandboxContext;
 use codex_network_proxy::EnvironmentNetworkPolicy;
@@ -52,10 +53,16 @@ impl TerminalPolicy {
         additional_permissions: Option<AdditionalPermissionProfile>,
     ) -> Self {
         let mut sandbox = environment.sandbox_context(additional_permissions);
-        if matches!(sandbox_source, TerminalSandboxSource::Native) {
+        if matches!(sandbox_source, TerminalSandboxSource::Native)
+            && windows_sandbox_level_for_legacy_checks(
+                environment.config().windows_sandbox_type,
+                environment.config().windows_sandbox_level,
+            ) == codex_protocol::config_types::WindowsSandboxLevel::Disabled
+        {
             // The filesystem helper applies executor defaults, but native process
             // launches honor Disabled. Preserve it so later enablement is detected.
-            sandbox.windows_sandbox_selection = environment.config().windows_sandbox_level.into();
+            sandbox.windows_sandbox_selection =
+                codex_protocol::config_types::WindowsSandboxLevel::Disabled.into();
         }
         Self {
             sandbox,
@@ -108,13 +115,6 @@ impl TerminalPermissions {
         baseline: &PermissionProfile,
     ) -> Result<SandboxPermissions, &'static str> {
         let bypassed = self.launch_permissions.requires_escalated_permissions();
-        if current.environment_network.is_some()
-            && (bypassed || self.policy.environment_network != current.environment_network)
-        {
-            return Err(
-                "this terminal cannot enforce the current environment-owned network restrictions; start a new terminal",
-            );
-        }
         // Approval cannot retrofit denied reads onto a running process. Unless
         // its sandbox still matches, start a new terminal under the current policy.
         if baseline

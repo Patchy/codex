@@ -5,6 +5,9 @@ mod backend;
 use backend::windows::try_lock_file;
 mod client;
 mod install_lock;
+mod launch;
+pub use launch::restart_with_features;
+pub use launch::start_with_features;
 mod managed_install;
 mod prepare_install;
 pub use prepare_install::InstallRequest;
@@ -15,6 +18,7 @@ pub mod telemetry;
 mod thread_recovery;
 mod update_loop;
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -371,7 +375,7 @@ impl Daemon {
         let _operation_lock = self.acquire_operation_lock().await?;
         let selected = self.current_installation()?;
         match command {
-            LifecycleCommand::Start => selected.start().await,
+            LifecycleCommand::Start => selected.start(&BTreeMap::new()).await,
             LifecycleCommand::Restart => selected.restart().await,
             LifecycleCommand::Stop => {
                 let output = selected.stop().await?;
@@ -384,9 +388,9 @@ impl Daemon {
         }
     }
 
-    async fn start(&self) -> Result<LifecycleOutput> {
+    async fn start(&self, feature_overrides: &BTreeMap<String, bool>) -> Result<LifecycleOutput> {
         let mut managed = self.clone();
-        let settings = self.load_settings().await?;
+        let mut settings = self.load_settings().await?;
         let (status, backend, pid, info) = if let Ok(info) = client::probe(&self.socket_path).await
         {
             (
@@ -410,6 +414,12 @@ impl Daemon {
             prepare_install::prepare(self, &settings).await?;
             managed.managed_codex_bin = self.current_managed_codex_bin()?;
             managed.ensure_managed_codex_bin()?;
+            // Only a fresh launch may replace these settings. Keep them for restarts
+            // and updates, without changing the user's config or a running daemon.
+            if settings.feature_overrides != *feature_overrides {
+                settings.feature_overrides = feature_overrides.clone();
+                settings.save(&self.settings_file).await?;
+            }
             let pid = managed.start_managed_backend(&settings).await?;
             (
                 LifecycleStatus::Started,
@@ -428,8 +438,7 @@ impl Daemon {
             .await)
     }
 
-    async fn restart(&self) -> Result<LifecycleOutput> {
-        let settings = self.load_settings().await?;
+    async fn restart_with_settings(&self, settings: DaemonSettings) -> Result<LifecycleOutput> {
         if client::probe(&self.socket_path).await.is_ok()
             && self.running_backend(&settings).await?.is_none()
         {
@@ -456,6 +465,11 @@ impl Daemon {
                 .await?;
         }
 
+        // Persist changed launch settings only after the old process has stopped.
+        // A failed or interrupted drain must not make an unapplied change look current.
+        if self.load_settings().await? != settings {
+            settings.save(&self.settings_file).await?;
+        }
         let pid = managed.start_managed_backend(&settings).await?;
         let info = self.wait_until_ready().await?;
         if let Err(err) = managed.ensure_managed_updater(&settings).await {
@@ -652,7 +666,7 @@ impl Daemon {
             let _ = selected
                 .set_remote_control_locked(RemoteControlMode::Enabled)
                 .await?;
-            let output = selected.start().await?;
+            let output = selected.start(&BTreeMap::new()).await?;
             return Ok(RemoteControlStartOutput::Start(output));
         }
 
@@ -954,6 +968,7 @@ impl Daemon {
             pid_file: self.pid_file.clone(),
             update_pid_file: self.update_pid_file.clone(),
             remote_control_enabled: settings.remote_control_enabled,
+            feature_overrides: settings.feature_overrides.clone(),
         }
     }
 

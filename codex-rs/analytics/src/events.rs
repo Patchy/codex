@@ -1,3 +1,4 @@
+use std::sync::LazyLock;
 use std::time::Instant;
 
 use crate::facts::AppInvocation;
@@ -792,6 +793,7 @@ pub(crate) enum WebSearchActionKind {
 
 #[derive(Serialize)]
 pub(crate) struct CodexCommandExecutionEventParams {
+    pub(crate) sandbox_backend: Option<String>,
     pub(crate) model_slug: Option<String>,
     pub(crate) reasoning_effort: Option<String>,
     #[serde(flatten)]
@@ -1068,6 +1070,8 @@ pub(crate) struct CodexTurnEventParams {
     pub(crate) thread_id: String,
     pub(crate) session_id: String,
     pub(crate) turn_id: String,
+    /// First received active plugin inventory. Null is unknown; [] is observed empty.
+    pub(crate) active_plugin_ids_at_turn_start: Option<Vec<String>>,
     pub(crate) voice_session_id: Option<String>,
     pub(crate) root_turn_id: Option<String>,
     pub(crate) turn_trigger: Option<String>,
@@ -1494,7 +1498,9 @@ fn analytics_hook_source(source: HookSource) -> &'static str {
 }
 
 pub(crate) fn current_runtime_metadata() -> CodexRuntimeMetadata {
-    let os_info = os_info::get();
+    // Runtime metadata is stable; avoid launching OS discovery subprocesses per event.
+    static OS_INFO: LazyLock<os_info::Info> = LazyLock::new(os_info::get);
+    let os_info = &*OS_INFO;
     CodexRuntimeMetadata {
         codex_rs_version: env!("CARGO_PKG_VERSION").to_string(),
         runtime_os: std::env::consts::OS.to_string(),

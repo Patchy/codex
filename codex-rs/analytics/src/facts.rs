@@ -43,6 +43,7 @@ pub struct TrackEventsContext {
     pub thread_id: String,
     pub turn_id: String,
     pub product_client_id: String,
+    pub turn_metadata: Option<Arc<dyn TurnAnalyticsMetadata>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -137,12 +138,14 @@ pub fn build_track_events_context(
     thread_id: String,
     turn_id: String,
     product_client_id: String,
+    turn_metadata: Option<Arc<dyn TurnAnalyticsMetadata>>,
 ) -> TrackEventsContext {
     TrackEventsContext {
         model_slug,
         thread_id,
         turn_id,
         product_client_id,
+        turn_metadata,
     }
 }
 
@@ -187,6 +190,8 @@ pub struct TurnResolvedConfigFact {
     pub turn_id: String,
     pub thread_id: String,
     pub turn_metadata: Arc<dyn TurnAnalyticsMetadata>,
+    /// Observed active plugin inventory. None is unknown; Some([]) is observed empty.
+    pub active_plugin_ids_at_turn_start: Option<Vec<String>>,
     pub num_input_images: usize,
     pub submission_type: Option<TurnSubmissionType>,
     pub ephemeral: bool,
@@ -463,6 +468,7 @@ pub enum CompactionPhase {
     StandaloneTurn,
     PreTurn,
     MidTurn,
+    PostTurn,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]

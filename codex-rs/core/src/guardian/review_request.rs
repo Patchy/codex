@@ -108,7 +108,7 @@ impl ReviewHost for super::super::runtime::ReviewRuntime {
         let root_authorization_version = session
             .services
             .agent_control
-            .root_user_authorization(session.thread_id)
+            .get_guardian_package(session.thread_id)
             .await
             .map(|snapshot| snapshot.authorization_version);
         // Keep the authorization revision even when no cacheable review evidence exists.
@@ -153,8 +153,8 @@ impl ReviewHost for super::super::runtime::ReviewRuntime {
             Arc::clone(&self.session),
             self.context.clone(),
             prepared.request.clone(),
+            self.request.category,
             self.reasons.clone(),
-            guardian_output_schema(),
             Some(cancellation.clone()),
             deadline,
         )
@@ -163,19 +163,18 @@ impl ReviewHost for super::super::runtime::ReviewRuntime {
         let root_authorization_version = prepared.root_authorization_version;
         let user_message_revision = prepared.user_message_revision;
         if matches!(&outcome, GuardianReviewOutcome::Completed(assessment) if assessment.outcome == GuardianAssessmentOutcome::Allow)
-            && ((session.guardian_context_mode == GuardianContextMode::ThreadOwned
-                && (root_authorization_version
+            && ((root_authorization_version
+                != session
+                    .services
+                    .agent_control
+                    .get_guardian_package(session.thread_id)
+                    .await
+                    .map(|snapshot| snapshot.authorization_version)
+                || user_message_revision
                     != session
-                        .services
-                        .agent_control
-                        .root_user_authorization(session.thread_id)
+                        .conversation_history_snapshot()
                         .await
-                        .map(|snapshot| snapshot.authorization_version)
-                    || user_message_revision
-                        != session
-                            .conversation_history_snapshot()
-                            .await
-                            .user_message_revision()))
+                        .user_message_revision())
                 || self.history_reset.is_cancelled()
                 || cancellation.is_cancelled())
         {
