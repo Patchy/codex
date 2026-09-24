@@ -344,6 +344,9 @@ impl ChatWidget {
                 self.open_provider_popup();
                 self.defer_input_until_settings_applied();
             }
+            SlashCommand::Daybreak => {
+                self.open_daybreak_popup();
+            }
             SlashCommand::Plan => {
                 self.apply_plan_slash_command();
             }
@@ -1260,6 +1263,7 @@ impl ChatWidget {
             | SlashCommand::Review
             | SlashCommand::Model
             | SlashCommand::Provider
+            | SlashCommand::Daybreak
             | SlashCommand::Plan
             | SlashCommand::Goal
             | SlashCommand::Side

@@ -181,6 +181,19 @@ impl ChatWidget {
         self.runtime_model_provider_base_url = base_url;
     }
 
+    pub(crate) fn cyber_access_program(
+        &self,
+    ) -> Option<codex_app_server_protocol::CyberAccessProgram> {
+        self.cyber_access_program
+    }
+
+    pub(crate) fn set_cyber_access_program(
+        &mut self,
+        program: Option<codex_app_server_protocol::CyberAccessProgram>,
+    ) {
+        self.cyber_access_program = program;
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn model_catalog(&self) -> Arc<ModelCatalog> {
         self.model_catalog.clone()

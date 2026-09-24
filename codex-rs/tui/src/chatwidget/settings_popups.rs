@@ -74,6 +74,70 @@ impl ChatWidget {
         });
     }
 
+    /// Open a popup to request a cyber access program (Daybreak) on upcoming
+    /// turns. The selection is forwarded on ChatGPT-authenticated turns only;
+    /// the server owns authorization and rejects ungranted programs.
+    pub(crate) fn open_daybreak_popup(&mut self) {
+        use codex_app_server_protocol::CyberAccessProgram;
+
+        if !self.is_session_configured() {
+            self.add_info_message(
+                "Daybreak selection is disabled until startup completes.".to_string(),
+                /*hint*/ None,
+            );
+            return;
+        }
+
+        let current = self.cyber_access_program();
+        let choices: [(Option<CyberAccessProgram>, &str, &str); 4] = [
+            (None, "Automatic", "let the server choose (default)"),
+            (
+                Some(CyberAccessProgram::Standard),
+                "Standard",
+                "explicitly request the standard program",
+            ),
+            (
+                Some(CyberAccessProgram::DaybreakBlue),
+                "Daybreak Blue",
+                "defensive cyber program (requires an active grant)",
+            ),
+            (
+                Some(CyberAccessProgram::DaybreakRed),
+                "Daybreak Red",
+                "offensive cyber program (requires an active grant)",
+            ),
+        ];
+        let items: Vec<SelectionItem> = choices
+            .into_iter()
+            .map(|(program, name, description)| {
+                let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+                    tx.send(AppEvent::UpdateCyberAccessProgram(program));
+                })];
+                SelectionItem {
+                    name: name.to_string(),
+                    description: Some(description.to_string()),
+                    is_current: current == program,
+                    actions,
+                    dismiss_on_select: true,
+                    ..Default::default()
+                }
+            })
+            .collect();
+
+        let mut header = ColumnRenderable::new();
+        header.push(Line::from("Select Cyber Access Program".bold()));
+        header.push(Line::from(
+            "Applies to upcoming turns on ChatGPT auth; ignored on API-key providers.".dim(),
+        ));
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            header: Box::new(header),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+    }
+
     pub(crate) fn open_experimental_popup(&mut self) {
         let Some(thread_id) = self.thread_id() else {
             self.add_info_message(

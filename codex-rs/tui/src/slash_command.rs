@@ -14,6 +14,7 @@ pub enum SlashCommand {
     // more frequently used commands should be listed first.
     Model,
     Provider,
+    Daybreak,
     Ide,
     Permissions,
     Keymap,
@@ -131,6 +132,7 @@ impl SlashCommand {
             SlashCommand::MemoryUpdate => "DO NOT USE",
             SlashCommand::Model => "choose what model and reasoning effort to use",
             SlashCommand::Provider => "switch to another configured model provider",
+            SlashCommand::Daybreak => "select the cyber access program for upcoming turns",
             SlashCommand::Ide => {
                 "include current selection, open files, and other context from your IDE"
             }
@@ -267,6 +269,7 @@ impl SlashCommand {
             | SlashCommand::Resume
             | SlashCommand::Model
             | SlashCommand::Provider
+            | SlashCommand::Daybreak
             | SlashCommand::Permissions
             | SlashCommand::Copy
             | SlashCommand::Raw

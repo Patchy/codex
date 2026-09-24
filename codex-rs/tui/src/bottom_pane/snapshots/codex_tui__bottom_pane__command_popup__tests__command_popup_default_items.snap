@@ -4,6 +4,7 @@ expression: commands
 ---
 /model - choose what model and reasoning effort to use
 /provider - switch to another configured model provider
+/daybreak - select the cyber access program for upcoming turns
 /ide - include current selection, open files, and other context from your IDE
 /permissions - choose what Codex is allowed to do
 /keymap - remap TUI shortcuts

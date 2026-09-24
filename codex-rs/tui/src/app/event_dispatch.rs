@@ -1933,6 +1933,23 @@ impl App {
                 self.chat_widget
                     .set_runtime_model_provider_base_url(base_url);
             }
+            AppEvent::UpdateCyberAccessProgram(program) => {
+                self.chat_widget.set_cyber_access_program(program);
+                let label = match program {
+                    None => "automatic",
+                    Some(codex_app_server_protocol::CyberAccessProgram::Standard) => "standard",
+                    Some(codex_app_server_protocol::CyberAccessProgram::DaybreakBlue) => {
+                        "Daybreak Blue"
+                    }
+                    Some(codex_app_server_protocol::CyberAccessProgram::DaybreakRed) => {
+                        "Daybreak Red"
+                    }
+                };
+                self.chat_widget.add_info_message(
+                    format!("Cyber access program for upcoming turns: {label}"),
+                    Some("Applies on ChatGPT auth only; access is enforced server-side.".to_string()),
+                );
+            }
             AppEvent::AstraSelectedFromModelPicker { .. } => unreachable!("picker event unwrapped"),
             AppEvent::BackgroundVoiceError { thread_id, message } => {
                 if self.chat_widget.thread_id() == Some(thread_id) {

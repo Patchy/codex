@@ -504,6 +504,7 @@ impl App {
                 .runtime_model_provider_base_url()
                 .map(str::to_string),
         );
+        chat_widget.set_cyber_access_program(self.chat_widget.cyber_access_program());
         chat_widget.snapshot_local_images = self.app_server_target.uses_remote_workspace();
         chat_widget.set_local_worktree_operations(self.chat_widget.local_worktree_operations);
         chat_widget.windows_sandbox_local_server = self.chat_widget.windows_sandbox_local_server;

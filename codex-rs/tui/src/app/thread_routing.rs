@@ -884,6 +884,7 @@ impl App {
                             collaboration_mode.clone(),
                             *personality,
                             final_output_json_schema.clone(),
+                            self.chat_widget.cyber_access_program(),
                         )
                         .await?;
                     if self.active_thread_id == Some(thread_id)

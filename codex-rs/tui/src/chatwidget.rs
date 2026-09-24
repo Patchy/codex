@@ -543,6 +543,9 @@ pub(crate) struct ChatWidget {
     status_account_display: Option<StatusAccountDisplay>,
     /// Resolved lazily by the app layer (AppEvent::RefreshRuntimeModelProviderBaseUrl).
     runtime_model_provider_base_url: Option<String>,
+    /// Cyber access program requested on upcoming turns (`None` = automatic).
+    /// Session-scoped and OAuth-only; authorization stays server-owned.
+    cyber_access_program: Option<codex_app_server_protocol::CyberAccessProgram>,
     pub(crate) remote_connection: Option<RemoteConnectionStatus>,
     /// Remote app servers cannot read image paths on the TUI host.
     pub(crate) snapshot_local_images: bool,

@@ -137,6 +137,7 @@ impl ChatWidget {
             initial_user_message,
             status_account_display,
             runtime_model_provider_base_url: None,
+            cyber_access_program: None,
             remote_connection: None,
             snapshot_local_images: false,
             pending_image_submission: None,

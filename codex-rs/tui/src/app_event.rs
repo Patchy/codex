@@ -1152,6 +1152,11 @@ pub(crate) enum AppEvent {
     /// server-confirmed provider switch.
     RefreshRuntimeModelProviderBaseUrl,
 
+    /// Select the cyber access program requested on upcoming turns
+    /// (`None` = automatic). ChatGPT-authenticated turns only; the server
+    /// still owns authorization.
+    UpdateCyberAccessProgram(Option<codex_app_server_protocol::CyberAccessProgram>),
+
     /// Apply a final Astra picker action and offer the flourish only if it changed the model on
     /// its original task. Automatic model updates do not use this event.
     AstraSelectedFromModelPicker {
