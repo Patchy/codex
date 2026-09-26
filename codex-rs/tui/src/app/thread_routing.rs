@@ -1287,6 +1287,21 @@ impl App {
             self.agent_navigation.mark_stopped(thread_id);
         }
 
+        // Release the buffered replay events once a background thread closes.
+        // Each store can pin up to capacity × payload (MBs per busy agent)
+        // and nothing else ever trims closed background threads — the
+        // unbounded growth behind openai/codex#23260. The channel entry is
+        // kept (cd handling and the agent picker rely on it); only the
+        // buffered payloads and the listener task are dropped.
+        if is_thread_closed
+            && notification.is_none()
+            && self.active_thread_id != Some(thread_id)
+            && !self.side_threads.contains_key(&thread_id)
+        {
+            self.abort_thread_event_listener(thread_id);
+            store.lock().await.release_replay_buffer();
+        }
+
         // Settings snapshots do not belong in the transcript queue: apply them in receive order.
         if let Some(ServerNotification::ThreadSettingsUpdated(settings)) = notification.as_ref()
             && self.active_thread_id == Some(thread_id)

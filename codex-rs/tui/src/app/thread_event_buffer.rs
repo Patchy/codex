@@ -51,6 +51,19 @@ impl ThreadEventStore {
         self.evict_overflowing_events();
     }
 
+    /// Permanently drains the replay buffer for a closed background thread.
+    ///
+    /// Buffered notifications can pin large `ItemCompleted` payloads long
+    /// after an agent finishes (openai/codex#23260). Zeroing the capacity
+    /// evicts everything with the usual bookkeeping and keeps the buffer
+    /// empty if stragglers arrive; the channel entry itself survives so
+    /// navigation, cd handling, and later thread switches keep working
+    /// (transcripts backfill from server history).
+    pub(super) fn release_replay_buffer(&mut self) {
+        self.capacity = 0;
+        self.evict_overflowing_events();
+    }
+
     fn evict_overflowing_events(&mut self) {
         while self.buffer.len() > self.capacity
             || self.buffered_agent_message_delta_bytes > MAX_BUFFERED_AGENT_MESSAGE_DELTA_BYTES

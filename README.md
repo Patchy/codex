@@ -1,3 +1,42 @@
+# Patchy's codex fork
+
+Soft fork of [openai/codex](https://github.com/openai/codex). `main` mirrors
+upstream; everything custom lives on the [`patchy`](../../tree/patchy) branch,
+which tracks upstream continuously.
+
+What's different here:
+
+- **Live subagent panel** — running agents pinned above the composer with
+  status, elapsed time, turn counts, and latest activity. Works with both
+  multi-agent v1 and v2.
+- **Agent dashboard** — `/panel` or `Alt+A` opens a full-screen view of every
+  agent in the session with per-agent stats, live-refreshing.
+- **Mouse support** — wheel scrolls overlays and (in alt-screen mode) the
+  session; capture is scoped so inline mode keeps native terminal
+  scrollback and selection.
+- **Memory leak fix** — frees event buffers for closed background agents
+  (upstream [#23260](https://github.com/openai/codex/issues/23260); also on
+  the [`upstream-mem-fix`](../../tree/upstream-mem-fix) branch as a clean
+  single commit).
+- **Working nix build** — upstream's flake is fixed: pinned toolchain from
+  `rust-toolchain.toml`, corrected git-dep hashes, prebuilt V8 handling.
+
+Install with nix:
+
+```shell
+nix run github:Patchy/codex/patchy
+```
+
+Or build from source (Rust 1.95+):
+
+```shell
+cargo build --release -p codex-cli --manifest-path codex-rs/Cargo.toml
+```
+
+Upstream's README follows.
+
+---
+
 <p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
 <p align="center">
   <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
