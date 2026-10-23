@@ -35,7 +35,7 @@ pub fn project_rollout_line(line: &RolloutLine) -> ThreadHistoryChangeSet {
         RolloutItem::EventMsg(EventMsg::TurnComplete(event)) => ThreadHistoryChangeSet {
             changed_turns: vec![ThreadHistoryTurnMetadata {
                 turn_id: event.turn_id.clone(),
-                root_turn_id: None,
+                root_turn_id: event.root_turn_id.clone(),
                 status: if event.error.is_some() {
                     TurnStatus::Failed
                 } else {
@@ -60,9 +60,14 @@ pub fn project_rollout_line(line: &RolloutLine) -> ThreadHistoryChangeSet {
             ThreadHistoryChangeSet {
                 changed_turns: vec![ThreadHistoryTurnMetadata {
                     turn_id: turn_id.clone(),
-                    root_turn_id: None,
+                    root_turn_id: event.root_turn_id.clone(),
                     status: TurnStatus::Interrupted,
-                    error: None,
+                    error: event.error.as_ref().map(|error| TurnError {
+                        message: error.message.clone(),
+                        codex_error_info: error.codex_error_info.clone().map(Into::into),
+                        misalignment: error.misalignment.clone().map(Into::into),
+                        additional_details: None,
+                    }),
                     started_at: event.started_at,
                     completed_at: event.completed_at,
                     duration_ms: event.duration_ms,

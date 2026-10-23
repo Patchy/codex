@@ -116,7 +116,7 @@ impl ChatComposer {
             .len()
             .try_into()
             .unwrap_or(u16::MAX)
-            .min(textarea_rect.height.saturating_sub(1));
+            .min(textarea_rect.height.saturating_sub(2));
         let remote_images_separator = u16::from(remote_images_height > 0);
         let consumed = remote_images_height.saturating_add(remote_images_separator);
         let remote_images_rect = Rect {
@@ -183,11 +183,7 @@ impl ChatComposer {
             .try_into()
             .unwrap_or(u16::MAX);
         let remote_images_separator = u16::from(remote_images_height > 0);
-        self.prompt_suggestion_lines(inner_width, options)
-            .map_or_else(
-                || self.draft.textarea.desired_height(inner_width),
-                |lines| u16::try_from(lines.len()).unwrap_or(u16::MAX),
-            )
+        self.draft.textarea.desired_height(inner_width)
             + remote_images_height
             + remote_images_separator
             + self.status_surface_height(options)

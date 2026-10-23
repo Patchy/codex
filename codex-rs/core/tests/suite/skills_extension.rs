@@ -11,10 +11,15 @@ use codex_config::ConfigRequirements;
 use codex_config::ConfigRequirementsToml;
 use codex_core::StartThreadOptions;
 use codex_core::TurnInputRequest;
+use codex_core::WaitForEnvironmentToolConfig;
 use codex_core::config::Config;
+use codex_core::config::Constrained;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::EnvironmentManager;
+use codex_exec_server::ExecParams;
+use codex_exec_server::ExecProcessEvent;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
+use codex_exec_server::ProcessId;
 use codex_exec_server::RemoveOptions;
 use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::ExtensionEventSink;
@@ -24,6 +29,9 @@ use codex_extension_api::ExtensionWarning;
 use codex_extension_api::SkillInvocationContributor;
 use codex_extension_api::SkillInvocationInput;
 use codex_features::Feature;
+use codex_history::InitialHistory;
+use codex_history::ResumedHistory;
+use codex_history::RolloutItem;
 use codex_login::CodexAuth;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_models_manager::bundled_models_response;
@@ -34,6 +42,8 @@ use codex_otel::OtelSettings;
 use codex_otel::THREAD_SKILLS_KEPT_TOTAL_METRIC;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
+use codex_protocol::mcp_policy::EnvironmentMcpPolicy;
+use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::TruncationPolicyConfig;
@@ -43,12 +53,18 @@ use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
+use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::TurnSettingsUpdate;
 use codex_protocol::protocol::TurnSettingsUpdateOutcome;
+use codex_protocol::request_permissions::PermissionGrantScope;
+use codex_protocol::request_permissions::RequestPermissionProfile;
+use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::user_input::UserInput;
 use codex_skills_extension::ExecutorSkillProvider;
 use codex_skills_extension::HostSkillProvider;
@@ -71,11 +87,14 @@ use codex_skills_extension::provider::SkillListQuery;
 use codex_skills_extension::provider::SkillProviderFuture;
 use codex_skills_extension::provider::SkillReadRequest;
 use codex_skills_extension::provider::SkillSearchRequest;
+use codex_thread_store::LoadThreadHistoryParams;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use codex_utils_string::approx_token_count;
 use core_test_support::apps_test_server::AppsTestServer;
 use core_test_support::apps_test_server::apps_enabled_builder;
+use core_test_support::context_snapshot;
+use core_test_support::context_snapshot::ContextSnapshotOptions;
 use core_test_support::responses;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
@@ -86,6 +105,7 @@ use core_test_support::skip_if_no_network;
 use core_test_support::skip_if_remote;
 use core_test_support::skip_if_target_windows;
 use core_test_support::skip_if_wine_exec;
+use core_test_support::test_codex::environment_config_for_selection;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::test_env;
 use core_test_support::test_codex::turn_permission_fields;
@@ -118,8 +138,8 @@ struct StaticSkillProvider {
     main_prompt_contents: Option<String>,
 }
 
-struct CatalogSkillProvider {
-    catalog: SkillCatalog,
+pub(super) struct CatalogSkillProvider {
+    pub(super) catalog: SkillCatalog,
 }
 
 struct PausedCatalogSkillProvider {
@@ -296,6 +316,7 @@ const EXECUTOR_CATALOG: [(&str, &str); 6] = [
 
 fn executor_catalog(skills: &[(&str, &str)]) -> SkillCatalog {
     SkillCatalog {
+        is_partial: false,
         entries: skills
             .iter()
             .map(|(name, description)| {
@@ -915,6 +936,7 @@ async fn production_turn_aliases_executor_skill_roots() -> Result<()> {
     )
     .await;
     let catalog = SkillCatalog {
+        is_partial: false,
         entries: ["search", "review", "summarize"]
             .into_iter()
             .map(|name| {
@@ -1102,7 +1124,7 @@ async fn opted_in_executor_provider_skips_host_discovery_but_injects_discovered_
             // Keep the trace fixture's legacy mode: paginated SQLite workers can close
             // spans through a different subscriber than this test's scoped collector.
             history_mode: Some(codex_protocol::protocol::ThreadHistoryMode::Legacy),
-            environments: Some(vec![environment.clone()]),
+            environments: Some(vec![environment.clone().into_request()]),
             thread_extension_init,
             ..StartThreadOptions::new(executor_config)
         })
@@ -1349,15 +1371,17 @@ async fn executor_only_provider_preserves_structured_repo_skill_without_discover
 enum ExecutorReferenceRead {
     Allowed,
     Denied,
+    Granted,
     Continuation,
     EditedContinuation,
     DeniedContinuation,
 }
 
-/// Live references and continuation pages use current permissions, including after discovery
+/// Live references and continuation pages use the step's captured permissions after discovery
 /// materialized the main prompt. Continuations preserve the cached snapshot across file edits.
 #[test_case(ExecutorReferenceRead::Allowed; "full disk read")]
 #[test_case(ExecutorReferenceRead::Denied; "denied reference")]
+#[test_case(ExecutorReferenceRead::Granted; "grant captured by the next model step")]
 #[test_case(ExecutorReferenceRead::Continuation; "unchanged continuation")]
 #[test_case(ExecutorReferenceRead::EditedContinuation; "edited continuation")]
 #[test_case(ExecutorReferenceRead::DeniedContinuation; "denied continuation")]
@@ -1368,7 +1392,9 @@ async fn executor_skill_tool_reads_references_under_current_permissions(
     skip_if_no_network!(Ok(()));
     if matches!(
         read,
-        ExecutorReferenceRead::Denied | ExecutorReferenceRead::DeniedContinuation
+        ExecutorReferenceRead::Denied
+            | ExecutorReferenceRead::Granted
+            | ExecutorReferenceRead::DeniedContinuation
     ) {
         skip_if_target_windows!(
             Ok(()),
@@ -1378,16 +1404,17 @@ async fn executor_skill_tool_reads_references_under_current_permissions(
 
     const REFERENCE_CONTENTS: &str = "Live executor reference instructions.";
     let contents = match read {
-        ExecutorReferenceRead::Allowed | ExecutorReferenceRead::Denied => {
-            REFERENCE_CONTENTS.to_string()
-        }
+        ExecutorReferenceRead::Allowed
+        | ExecutorReferenceRead::Denied
+        | ExecutorReferenceRead::Granted => REFERENCE_CONTENTS.to_string(),
         ExecutorReferenceRead::Continuation
         | ExecutorReferenceRead::EditedContinuation
         | ExecutorReferenceRead::DeniedContinuation => "reference line\n".repeat(800),
     };
-    let reference_access = match read {
+    let restricted_path_access = match read {
         ExecutorReferenceRead::Denied => FileSystemAccessMode::Deny,
         ExecutorReferenceRead::Allowed
+        | ExecutorReferenceRead::Granted
         | ExecutorReferenceRead::Continuation
         | ExecutorReferenceRead::EditedContinuation
         | ExecutorReferenceRead::DeniedContinuation => FileSystemAccessMode::Read,
@@ -1448,14 +1475,61 @@ async fn executor_skill_tool_reads_references_under_current_permissions(
         ),
         ("reference.md", contents.as_str()),
     ] {
+        let directory = if name == "reference.md" && matches!(read, ExecutorReferenceRead::Granted)
+        {
+            &selection.cwd
+        } else {
+            &skill_dir
+        };
         file_system
             .write_file(
-                &skill_dir.join(name)?,
+                &directory.join(name)?,
                 contents.as_bytes().to_vec(),
                 Default::default(),
                 /*sandbox*/ None,
             )
             .await?;
+    }
+    if matches!(read, ExecutorReferenceRead::Granted) {
+        // The package directory must be listable for discovery. Put the reference outside it so
+        // it still requires a separate grant; create the link on the executor, including remotely.
+        let process = test
+            .executor_environment()
+            .environment()
+            .get_exec_backend()
+            .start(ExecParams {
+                process_id: ProcessId::from("link-grant-reference"),
+                metadata: None,
+                argv: ["/bin/ln", "-s", "../reference.md", "skill/reference.md"]
+                    .map(str::to_string)
+                    .to_vec(),
+                cwd: selection.cwd.clone(),
+                env_policy: None,
+                shell_snapshot: None,
+                env: Default::default(),
+                tty: false,
+                pipe_stdin: false,
+                arg0: None,
+                sandbox: None,
+                enforce_managed_network: false,
+                managed_network: None,
+                network_proxy: None,
+            })
+            .await?
+            .process;
+        let mut events = process.subscribe_events();
+        loop {
+            match events.recv().await? {
+                ExecProcessEvent::Exited { exit_code, .. } => {
+                    assert_eq!(exit_code, 0, "link the reference on the executor");
+                    break;
+                }
+                ExecProcessEvent::Output(_) => {}
+                event @ (ExecProcessEvent::Closed { .. } | ExecProcessEvent::Failed(_)) => {
+                    panic!("reference symlink process did not exit: {event:?}")
+                }
+            }
+        }
     }
     let package = format!(
         "skill://reference-root/{}",
@@ -1470,10 +1544,26 @@ async fn executor_skill_tool_reads_references_under_current_permissions(
         id: "reference-root".to_string(),
         location: CapabilityRootLocation::Environment {
             environment_id: selection.environment_id.clone(),
-            path: selection.cwd.clone(),
+            path: if matches!(read, ExecutorReferenceRead::Granted) {
+                skill_dir.clone()
+            } else {
+                selection.cwd.clone()
+            },
         },
     }]);
     let mut config = test.config.clone();
+    if matches!(read, ExecutorReferenceRead::Granted) {
+        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+        config.features.enable(Feature::RequestPermissionsTool)?;
+    }
+    let (root_access, restricted_path) = if matches!(read, ExecutorReferenceRead::Granted) {
+        (FileSystemAccessMode::Deny, policy_skill_dir.clone())
+    } else {
+        (
+            FileSystemAccessMode::Read,
+            policy_skill_dir.join("reference.md")?,
+        )
+    };
     config
         .permissions
         .set_permission_profile(PermissionProfile::from_runtime_permissions(
@@ -1482,13 +1572,13 @@ async fn executor_skill_tool_reads_references_under_current_permissions(
                     FileSystemPath::Special {
                         value: FileSystemSpecialPath::Root,
                     },
-                    FileSystemAccessMode::Read,
+                    root_access,
                 ),
                 FileSystemSandboxEntry::new(
                     FileSystemPath::Path {
-                        path: policy_skill_dir.join("reference.md")?,
+                        path: restricted_path,
                     },
-                    reference_access,
+                    restricted_path_access,
                 ),
             ]),
             NetworkSandboxPolicy::Restricted,
@@ -1496,28 +1586,64 @@ async fn executor_skill_tool_reads_references_under_current_permissions(
     let thread = test
         .thread_manager
         .start_thread(StartThreadOptions {
-            environments: Some(vec![selection]),
+            environments: Some(vec![selection.into_request()]),
             thread_extension_init,
             ..StartThreadOptions::new(config)
         })
         .await?;
-    let response = responses::mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-1"),
-                responses::ev_function_call_with_namespace(
-                    "read-reference",
-                    "skills",
-                    "read",
-                    &json!({ "package": package, "resource": resource }).to_string(),
-                ),
-                ev_completed("resp-1"),
-            ]),
-            sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
-        ],
-    )
-    .await;
+    let requested_permissions = RequestPermissionProfile {
+        file_system: Some(FileSystemPermissions::from_read_write_path_uris(
+            Some(vec![if matches!(read, ExecutorReferenceRead::Granted) {
+                policy_skill_dir
+                    .parent()
+                    .expect("skill directory has a parent")
+                    .join("reference.md")?
+            } else {
+                policy_skill_dir.join("reference.md")?
+            }]),
+            /*write*/ None,
+        )),
+        ..Default::default()
+    };
+    let mut response_sequence = Vec::new();
+    if matches!(read, ExecutorReferenceRead::Granted) {
+        // Separate responses ensure the denied read finishes before approval can be requested.
+        response_sequence.push(sse(vec![
+            ev_response_created("resp-before-grant"),
+            responses::ev_function_call_with_namespace(
+                "read-before-grant",
+                "skills",
+                "read",
+                &json!({"package": package, "resource": resource}).to_string(),
+            ),
+            ev_completed("resp-before-grant"),
+        ]));
+        response_sequence.push(sse(vec![
+            ev_response_created("resp-grant"),
+            responses::ev_function_call(
+                "grant-reference",
+                "request_permissions",
+                &json!({"reason": "Read", "permissions": requested_permissions}).to_string(),
+            ),
+            ev_completed("resp-grant"),
+        ]));
+    }
+    // The next model step captures any newly approved permissions.
+    response_sequence.push(sse(vec![
+        ev_response_created("resp-read"),
+        responses::ev_function_call_with_namespace(
+            "read-reference",
+            "skills",
+            "read",
+            &json!({ "package": package, "resource": resource }).to_string(),
+        ),
+        ev_completed("resp-read"),
+    ]));
+    response_sequence.push(sse(vec![
+        ev_response_created("resp-2"),
+        ev_completed("resp-2"),
+    ]));
+    let response = responses::mount_sse_sequence(&server, response_sequence).await;
     thread
         .thread
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
@@ -1525,16 +1651,53 @@ async fn executor_skill_tool_reads_references_under_current_permissions(
             text_elements: Vec::new(),
         }]))
         .await?;
+    if matches!(read, ExecutorReferenceRead::Granted) {
+        let event = wait_for_event(&thread.thread, |event| {
+            matches!(
+                event,
+                EventMsg::RequestPermissions(_) | EventMsg::TurnComplete(_)
+            )
+        })
+        .await;
+        let EventMsg::RequestPermissions(request) = event else {
+            panic!("expected request_permissions before completion: {event:?}");
+        };
+        thread
+            .thread
+            .submit(Op::RequestPermissionsResponse {
+                id: request.call_id,
+                response: RequestPermissionsResponse {
+                    permissions: requested_permissions,
+                    scope: PermissionGrantScope::Turn,
+                    strict_auto_review: false,
+                },
+            })
+            .await?;
+    }
     wait_for_event(&thread.thread, |event| {
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
-    let output = response.requests()[1]
+    let output = response
+        .requests()
+        .last()
+        .expect("final model request includes the reference read")
         .function_call_output_text("read-reference")
         .expect("skills.read should return a tool result");
+    if matches!(read, ExecutorReferenceRead::Granted) {
+        assert_eq!(
+            response.requests()[1]
+                .function_call_output_text("read-before-grant")
+                .expect("the earlier skills.read should return a tool result"),
+            "failed to read skill resource",
+        );
+    }
     if matches!(read, ExecutorReferenceRead::Denied) {
         assert_eq!(output, "failed to read skill resource");
-    } else if matches!(read, ExecutorReferenceRead::Allowed) {
+    } else if matches!(
+        read,
+        ExecutorReferenceRead::Allowed | ExecutorReferenceRead::Granted
+    ) {
         assert_eq!(
             serde_json::from_str::<Value>(&output)?,
             json!({
@@ -1640,7 +1803,9 @@ async fn executor_skill_tool_reads_references_under_current_permissions(
             ExecutorReferenceRead::DeniedContinuation => {
                 assert_eq!(output, "failed to read skill resource")
             }
-            ExecutorReferenceRead::Allowed | ExecutorReferenceRead::Denied => {
+            ExecutorReferenceRead::Allowed
+            | ExecutorReferenceRead::Denied
+            | ExecutorReferenceRead::Granted => {
                 unreachable!("single-page cases handled above")
             }
         }
@@ -1668,6 +1833,7 @@ async fn explicit_executor_skill_prompt_rejects_oversized_resource() -> Result<(
         )
         .await?;
     let catalog = SkillCatalog {
+        is_partial: false,
         entries: vec![SkillCatalogEntry::new(
             SkillPackageId("skill://prompt-limit/live".to_string()),
             SkillAuthority::new(SkillSourceKind::Executor, "prompt-limit"),
@@ -1785,6 +1951,7 @@ async fn executor_skill_invocation_is_environment_scoped_and_deduplicated() -> R
     std::fs::write(&skill_path, "executor skill contents\n")?;
     let skill_uri = PathUri::from_host_native_path(&skill_path)?;
     let catalog = SkillCatalog {
+        is_partial: false,
         entries: vec![
             SkillCatalogEntry::new(
                 SkillPackageId("skill://other-root/demo".to_string()),
@@ -1867,7 +2034,7 @@ async fn executor_skill_invocation_is_environment_scoped_and_deduplicated() -> R
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn production_turn_aliases_combined_skill_catalogs_under_shared_budget() -> Result<()> {
+async fn production_turn_aliases_catalogs_with_separate_cloud_budget() -> Result<()> {
     const EXECUTOR_ROOT: &str =
         "skill://integration-executor/workspace/plugins/cache/executor-plugin/1.0.0/skills";
     const CLOUD_ROOT: &str = "skill://plugin_connector_1p_2330815c823c8191941e5dc465bb899f";
@@ -1894,6 +2061,7 @@ async fn production_turn_aliases_combined_skill_catalogs_under_shared_budget() -
 
     let resource_catalog =
         |kind: SkillSourceKind, authority: &str, root: &str, prefix: &str| SkillCatalog {
+            is_partial: false,
             entries: ["search", "review", "summarize"]
                 .into_iter()
                 .map(|suffix| {
@@ -2044,6 +2212,7 @@ async fn assert_catalog_model_switch(max_context_tokens: Option<usize>) -> Resul
     .expect("metrics provider");
     let skill_count = 800;
     let catalog = SkillCatalog {
+        is_partial: false,
         entries: (0..skill_count)
             .map(|index| {
                 let name = format!("skill-{index:03}");
@@ -2491,6 +2660,7 @@ async fn production_turn_uses_provider_host_catalog_and_core_snapshot_injection(
     let provider_description = "This skill comes from the extension host provider.";
     let provider_contents = "# Provider instructions that Core must not inject.";
     let provider_catalog = SkillCatalog {
+        is_partial: false,
         entries: vec![
             SkillCatalogEntry::new(
                 SkillPackageId(skill_resource.clone()),
@@ -2605,6 +2775,7 @@ async fn production_turn_suppresses_only_the_superseded_host_skill_prompt() -> R
     let provider_resource = "skill://test/first-host/SKILL.md";
     let provider_contents = "FIRST_PROVIDER_BODY";
     let catalog = SkillCatalog {
+        is_partial: false,
         entries: vec![
             SkillCatalogEntry::new(
                 SkillPackageId("test/first-host".to_string()),
@@ -2856,31 +3027,20 @@ async fn production_turn_keeps_full_executor_only_catalog_when_it_fits() -> Resu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn production_turn_keeps_cloud_world_state_incremental_across_turns() -> Result<()> {
+async fn production_turn_keeps_rebalanced_catalogs_stable_after_compaction_and_resume() -> Result<()>
+{
     let server = responses::start_mock_server().await;
-    let response = responses::mount_sse_sequence(
-        &server,
-        ["resp-1", "resp-2"]
-            .into_iter()
-            .map(|response_id| {
-                sse(vec![
-                    ev_response_created(response_id),
-                    ev_completed(response_id),
-                ])
-            })
-            .collect(),
-    )
-    .await;
     let skill_name = "cloud-search";
-    let skill_description = "Search available company knowledge.";
+    let skill_description = "Search available company knowledge. ".repeat(40);
     let skill_resource = "skill://codex_apps/cloud-search/SKILL.md";
     let catalog = SkillCatalog {
+        is_partial: false,
         entries: vec![
             SkillCatalogEntry::new(
                 SkillPackageId("cloud/cloud-search".to_string()),
                 SkillAuthority::new(SkillSourceKind::Cloud, CODEX_APPS_MCP_SERVER_NAME),
                 skill_name,
-                skill_description,
+                skill_description.as_str(),
                 SkillResourceId::new(skill_resource),
             )
             .with_display_path(skill_resource),
@@ -2890,7 +3050,11 @@ async fn production_turn_keeps_cloud_world_state_incremental_across_turns() -> R
     let mut extensions = ExtensionRegistryBuilder::<Config>::new();
     install_with_providers(
         &mut extensions,
-        SkillProviders::new().with_cloud_provider(Arc::new(CatalogSkillProvider { catalog })),
+        SkillProviders::new()
+            .with_cloud_provider(Arc::new(CatalogSkillProvider { catalog }))
+            .with_executor_provider(Arc::new(CatalogSkillProvider {
+                catalog: executor_catalog(&EXECUTOR_CATALOG),
+            })),
         |config: &Config| SkillsExtensionConfig {
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
@@ -2900,24 +3064,135 @@ async fn production_turn_keeps_cloud_world_state_incremental_across_turns() -> R
         },
     );
     let mut builder = test_codex()
+        .with_exec_server_url("none")
         .with_extensions(Arc::new(extensions.build()))
+        .with_model_info_override("gpt-5.5", |model_info| {
+            model_info.context_window = Some(12_000);
+            model_info.max_context_window = None;
+        })
         .with_config(|config| {
             configure_catalog_test(config);
             config.cloud_skill_enabled = true;
+            config.model_provider.name = "Skills compaction test".to_string();
+            config.model_post_turn_compact_threshold_percent = 50;
+            config
+                .features
+                .enable(Feature::DeferredExecutor)
+                .expect("enable deferred executor");
+            config
+                .features
+                .disable(Feature::ExecutorCapabilityDiscovery)
+                .expect("disable executor capability discovery");
         });
-    let test = builder.build_with_auto_env(&server).await?;
+    // The executor below runs in this process, so use host-local workspace paths.
+    let test = builder.build(&server).await?;
+    // Use a real remote transport: cloud skills are disabled for local attachments.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let executor_address = listener.local_addr()?;
+    let executor_url = format!("ws://{executor_address}");
+    drop(listener);
+    let runtime_paths = codex_exec_server::ExecServerRuntimeOptions::new(
+        std::env::current_exe()?,
+        /*codex_linux_sandbox_exe*/ None,
+    )?;
+    let http_client_factory = test.config.http_client_factory();
+    let server_url = executor_url.clone();
+    let executor = tokio::spawn(async move {
+        codex_exec_server::run_main(&server_url, runtime_paths, http_client_factory).await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while tokio::net::TcpStream::connect(executor_address)
+            .await
+            .is_err()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    test.thread_manager
+        .environment_manager()
+        .upsert_environment(
+            "skills-executor".to_string(),
+            executor_url,
+            /*connect_timeout*/ None,
+        )?;
+    let pending_selection = TurnEnvironmentSelection {
+        selected_capability_roots: Default::default(),
+        environment_id: "skills-executor".to_string(),
+        cwd: PathUri::from_abs_path(&test.config.cwd),
+        workspace_roots: vec![PathUri::from_abs_path(&test.config.cwd)],
+        config: EnvironmentConfigState::Pending,
+    };
+    let mut thread_extension_init = ExtensionDataInit::default();
+    thread_extension_init.insert(WaitForEnvironmentToolConfig {
+        tool_description: "Wait for the selected environment.".to_string(),
+        environment_id_description: "Selected environment ID.".to_string(),
+    });
     let cloud_thread = test
         .thread_manager
         .start_thread(StartThreadOptions {
-            environments: Some(Vec::new()),
+            environments: Some(vec![pending_selection.clone().into_request()]),
+            thread_extension_init: thread_extension_init.clone(),
             ..StartThreadOptions::new(test.config.clone())
         })
         .await?;
+    let response = responses::mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                responses::ev_function_call(
+                    "wait-for-skills",
+                    "wait_for_environment",
+                    &json!({ "environment_id": pending_selection.environment_id }).to_string(),
+                ),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+            // Cross the post-turn threshold only after the allocation has stabilized.
+            sse(vec![
+                ev_response_created("resp-3"),
+                responses::ev_completed_with_tokens("resp-3", /*total_tokens*/ 7_000),
+            ]),
+            sse(vec![
+                ev_response_created("compact"),
+                responses::ev_assistant_message("summary", "The available skills were inspected."),
+                ev_completed("compact"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-4"),
+                responses::ev_function_call(
+                    "wait-for-resumed-skills",
+                    "wait_for_environment",
+                    &json!({ "environment_id": pending_selection.environment_id }).to_string(),
+                ),
+                ev_completed("resp-4"),
+            ]),
+            sse(vec![ev_response_created("resp-5"), ev_completed("resp-5")]),
+        ],
+    )
+    .await;
 
-    for prompt in [
+    let mut ready_config = environment_config_for_selection(&test.config, &pending_selection);
+    // This fixture supplies its own skill catalogs; do not inherit the executor host's MCP servers.
+    ready_config.mcp_policy = Some(EnvironmentMcpPolicy {
+        servers: Some(Default::default()),
+        ..Default::default()
+    });
+    ready_config.selected_capability_roots = vec![SelectedCapabilityRoot {
+        id: "skills".to_string(),
+        location: CapabilityRootLocation::Environment {
+            environment_id: pending_selection.environment_id.clone(),
+            path: pending_selection.cwd.clone(),
+        },
+    }];
+    for (turn_index, prompt) in [
         "Inspect the available skills.",
         "Inspect the available skills again.",
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         cloud_thread
             .thread
             .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
@@ -2925,25 +3200,145 @@ async fn production_turn_keeps_cloud_world_state_incremental_across_turns() -> R
                 text_elements: Vec::new(),
             }]))
             .await?;
+        if turn_index == 0 {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while response.requests().is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await?;
+            assert!(
+                cloud_thread
+                    .thread
+                    .inspect_selected_capability_roots()
+                    .ready_roots
+                    .is_empty()
+            );
+            cloud_thread
+                .thread
+                .environment_ready(&pending_selection, ready_config.clone())
+                .await?;
+        }
         core_test_support::wait_for_event(&cloud_thread.thread, |event| {
             matches!(event, EventMsg::TurnComplete(_))
         })
         .await;
     }
 
+    cloud_thread.thread.shutdown_and_wait().await?;
+    let history = test
+        .thread_store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id: cloud_thread.session_configured.thread_id,
+            include_archived: true,
+        })
+        .await?;
+    let checkpoint = history
+        .items
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            RolloutItem::WorldState(checkpoint) => Some(checkpoint),
+            _ => None,
+        })
+        .expect("compaction retains an allocation checkpoint");
+    assert!(checkpoint.full);
+    assert!(checkpoint.state["cloud_skills"]["allocation"].is_object());
+    let resumed = test
+        .thread_manager
+        .start_thread(StartThreadOptions {
+            initial_history: InitialHistory::Resumed(ResumedHistory {
+                history_revision: history.revision,
+                conversation_id: history.thread_id,
+                history: Arc::new(history.items),
+                rollout_path: cloud_thread.session_configured.rollout_path.clone(),
+            }),
+            environments: Some(vec![pending_selection.clone().into_request()]),
+            thread_extension_init,
+            ..StartThreadOptions::new(test.config.clone())
+        })
+        .await?;
+    resumed
+        .thread
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Inspect the skills after resuming.".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while response.requests().len() < 5 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    assert!(
+        resumed
+            .thread
+            .inspect_selected_capability_roots()
+            .ready_roots
+            .is_empty()
+    );
+    resumed
+        .thread
+        .environment_ready(&pending_selection, ready_config)
+        .await?;
+    wait_for_event(&resumed.thread, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    resumed.thread.shutdown_and_wait().await?;
+    executor.abort();
     let requests = response.requests();
-    assert_eq!(requests.len(), 2);
-    let expected_line =
-        format!("- {skill_name}: {skill_description} (cloud package: cloud/cloud-search)");
+    assert_eq!(requests.len(), 6);
+    let first_developer_text = requests[0].message_input_texts("developer").join("\n");
+    let expected_line = first_developer_text
+        .lines()
+        .find(|line| line.starts_with("- cloud-search:"))
+        .unwrap_or_else(|| {
+            panic!("pending request should advertise cloud skill: {first_developer_text}")
+        });
+    let ready_developer_text = requests[1].message_input_texts("developer").join("\n");
+    let ready_line = ready_developer_text
+        .lines()
+        .rfind(|line| line.starts_with("- cloud-search:"))
+        .expect("ready cloud catalog");
+    let ready_executor_lines = ready_developer_text
+        .lines()
+        .filter(|line| line.starts_with("- exec-"))
+        .collect::<Vec<_>>();
+    assert_ne!(expected_line, ready_line);
+    assert!(
+        EXECUTOR_CATALOG
+            .iter()
+            .all(|(name, _)| ready_developer_text.contains(&format!("- {name}:")))
+    );
     for (index, request) in requests.iter().enumerate() {
         let developer_texts = request.message_input_texts("developer");
-        let occurrences = developer_texts
+        let cloud_lines = developer_texts
             .iter()
-            .map(|text| text.matches(&expected_line).count())
-            .sum::<usize>();
+            .flat_map(|text| text.lines())
+            .filter(|line| line.starts_with("- cloud-search:"))
+            .collect::<Vec<_>>();
         assert_eq!(
-            occurrences, 1,
-            "request {index} should contain the cloud catalog exactly once: {developer_texts:?}"
+            cloud_lines,
+            match index {
+                0 => vec![expected_line],
+                1..=3 => vec![expected_line, ready_line],
+                _ => vec![ready_line],
+            },
+            "request {index} should only append cloud text when rebalancing prevents omissions",
+        );
+        assert_eq!(
+            developer_texts
+                .iter()
+                .flat_map(|text| text.lines())
+                .filter(|line| line.starts_with("- exec-"))
+                .collect::<Vec<_>>(),
+            if index == 0 {
+                Vec::new()
+            } else {
+                ready_executor_lines.clone()
+            },
         );
         assert!(
             developer_texts
@@ -2951,6 +3346,22 @@ async fn production_turn_keeps_cloud_world_state_incremental_across_turns() -> R
                 .any(|text| text.contains("Read a skill package directly with `skills.read"))
         );
     }
+
+    insta::assert_snapshot!(
+        // The in-process executor uses the host OS. Windows guidance appears when it is ready.
+        if cfg!(windows) {
+            "cloud_skills_across_executor_readiness_windows"
+        } else {
+            "cloud_skills_across_executor_readiness"
+        },
+        context_snapshot::format_request_history_snapshot(
+            "Cloud skills rebalance once to retain every executor skill. Post-turn compaction installs both catalogs and their allocation before resume; the saved catalogs remain visible while the executor reconnects.",
+            &requests,
+            &ContextSnapshotOptions::default()
+                .rewrite_known_segments()
+                .include_request_settings(),
+        )
+    );
 
     Ok(())
 }
@@ -3128,6 +3539,7 @@ async fn production_turn_fairly_shortens_extension_catalog_descriptions() -> Res
     let source_kind = SkillSourceKind::Custom("test".to_string());
     let description = "x".repeat(1_025);
     let catalog = SkillCatalog {
+        is_partial: false,
         entries: (0..10)
             .map(|index| {
                 let name = format!("skill-{index:02}");

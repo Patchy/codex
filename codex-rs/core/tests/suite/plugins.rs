@@ -1,10 +1,14 @@
 #![allow(clippy::unwrap_used)]
 
+use core_test_support::test_codex::local_requests;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Result;
+use codex_analytics::AnalyticsEventsClient;
+use codex_analytics::PluginMeasurementRow;
+use codex_analytics::PluginMeasurementsInput;
 use codex_config::LoaderOverrides;
 use codex_core::TurnInputRequest;
 use codex_core::config::Config;
@@ -24,6 +28,7 @@ use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
 use codex_protocol::config_types::TrustLevel;
+use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
@@ -58,14 +63,11 @@ use core_test_support::skip_if_target_windows;
 use core_test_support::stdio_server_bin;
 use core_test_support::submit_thread_settings;
 use core_test_support::test_codex::TestCodex;
-use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
 use core_test_support::wait_for_mcp_server;
-use core_test_support::zsh_fork::zsh_fork_runtime;
-use core_test_support::zsh_fork::zsh_fork_test_builder;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use test_case::test_case;
@@ -363,12 +365,107 @@ fn searched_plugin_tools(
     )
 }
 
-#[test_case(false; "classic shell")]
-#[test_case(true; "zsh-fork shell")]
+#[tokio::test]
+async fn shared_analytics_client_preserves_session_products() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    Mock::given(path("/codex/analytics-events/events"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let client = AnalyticsEventsClient::new(
+        codex_core::test_support::auth_manager_from_auth(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        ),
+        server.uri(),
+        /*analytics_enabled*/ Some(true),
+    );
+    let mut products = [Some("aeon"), Some("tpp"), None];
+    let mut sessions = Vec::new();
+    for product in products {
+        sessions.push(
+            test_codex()
+                .with_analytics_events_client(client.clone())
+                .with_config(move |config| {
+                    config.apps_mcp_product_sku = product.map(str::to_string);
+                })
+                .build_with_auto_env(&server)
+                .await?,
+        );
+    }
+    // All Sessions have registered before events are interleaved on their shared client.
+    let mut expected = Vec::new();
+    for (position, index) in [0, 1, 2, 0, 0].into_iter().enumerate() {
+        if position == 4 {
+            client.flush().await;
+            let session = &mut sessions[0];
+            session.codex.ensure_rollout_materialized().await;
+            session.codex.shutdown_and_wait().await?;
+            session
+                .thread_manager
+                .remove_thread(&session.session_configured.thread_id)
+                .await;
+            let mut config = session.config.clone();
+            config.analytics_enabled = Some(false);
+            let resumed = session
+                .thread_manager
+                .resume_legacy_thread_from_rollout(
+                    config,
+                    session.codex.rollout_path().expect("rollout path"),
+                    session.thread_manager.auth_manager(),
+                    /*parent_trace*/ None,
+                    ClientMcpExtensions::default(),
+                )
+                .await?;
+            assert_eq!(resumed.thread_id, session.session_configured.thread_id);
+            session.codex = resumed.thread;
+            products[0] = None;
+        }
+        let thread_id = sessions[index].session_configured.thread_id.to_string();
+        client.track_plugin_measurements(PluginMeasurementsInput {
+            thread_id: thread_id.clone(),
+            turn_id: "turn".into(),
+            item_id: "item".into(),
+            originator: "test_client".into(),
+            model_slug: None,
+            reasoning_effort: None,
+            plugin_id: "sample@test".into(),
+            execution_id: "execution".into(),
+            operation: "build".into(),
+            rows: vec![PluginMeasurementRow {
+                measurement_name: "duration_ms".into(),
+                number_value: 1.0,
+                dimensions: Default::default(),
+            }],
+        });
+        expected.push((thread_id, products[index].map(str::to_string)));
+    }
+    client.flush().await;
+    let mut actual = Vec::new();
+    for request in server.received_requests().await.unwrap_or_default() {
+        if request.url.path() != "/codex/analytics-events/events" {
+            continue;
+        }
+        let product = request
+            .headers
+            .get("x-openai-product-sku")
+            .map(|value| value.to_str().unwrap().to_string());
+        let body: serde_json::Value = serde_json::from_slice(&request.body)?;
+        for event in body["events"].as_array().unwrap() {
+            if event["event_type"] == "codex_plugin_measurement_event" {
+                let thread_id = event["event_params"]["thread_id"].as_str().unwrap();
+                actual.push((thread_id.to_string(), product.clone()));
+            }
+        }
+    }
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn persisted_remote_plugin_command_attribution_flows_through_turn_context(
-    zsh_fork: bool,
-) -> Result<()> {
+async fn persisted_remote_plugin_command_attribution_flows_through_turn_context() -> Result<()> {
     skip_if_target_windows!(Ok(()), "executes a POSIX shell script");
     skip_if_no_network!(Ok(()));
     skip_if_remote!(
@@ -392,14 +489,7 @@ async fn persisted_remote_plugin_command_attribution_flows_through_turn_context(
         plugin_root.join("analytics.yaml"),
         "version: 1\noperations: {scan: {path: ./scripts/run.sh, measurements: {files_scanned: {}}}}\n",
     )?;
-    let builder = if zsh_fork {
-        let Some(runtime) = zsh_fork_runtime("zsh-fork plugin measurement test")? else {
-            return Ok(());
-        };
-        zsh_fork_test_builder(runtime, AskForApproval::Never)
-    } else {
-        test_codex()
-    };
+    let builder = test_codex();
     let command = shlex::try_join(["/bin/sh", script_path.to_string_lossy().as_ref()])?;
     let call_id = "remote-plugin-command";
     let arguments = serde_json::to_string(&serde_json::json!({
@@ -442,7 +532,7 @@ async fn persisted_remote_plugin_command_attribution_flows_through_turn_context(
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(cwd)),
+                environments: Some(local_requests(cwd)),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
@@ -584,7 +674,7 @@ printf 'STDIN_OK\n'
         });
     // Exercise both native and executor-managed sandboxes with the same plugin fixture.
     let _executor = if environment_id == codex_exec_server::REMOTE_ENVIRONMENT_ID {
-        let executor = super::multi_exec_server_sandbox::ExecServerProcess::start().await?;
+        let executor = core_test_support::exec_server::ExecServerProcess::start().await?;
         builder = builder.with_exec_server_url(executor.websocket_url.clone());
         Some(executor)
     } else {
@@ -642,7 +732,7 @@ async fn remote_plugin_measurements_require_the_frontend_version() -> Result<()>
     skip_if_no_network!(Ok(()));
     // This fixture needs a real remote transport with separately controlled frontend
     // and executor caches, rather than the runner's automatic executor selection.
-    let executor = super::multi_exec_server_sandbox::ExecServerProcess::start().await?;
+    let executor = core_test_support::exec_server::ExecServerProcess::start().await?;
     let server = start_mock_server().await;
     let home = Arc::new(TempDir::new()?);
     let frontend_script = write_remote_plugin_script_and_config(home.as_ref());
@@ -1137,15 +1227,19 @@ async fn legacy_plugin_skill_prompt_remains_complete() -> Result<()> {
     Ok(())
 }
 
-#[test_case(None, true, true, (true, false); "enabled remote supersedes bundled")]
-#[test_case(Some("tpp"), true, true, (true, false); "configured work sku")]
-#[test_case(None, false, true, (false, false); "disabled remote does not reactivate bundled")]
-#[test_case(None, true, false, (false, true); "missing remote bundle preserves bundled")]
+#[test_case("sites", None, true, true, (true, false); "sites enabled remote supersedes bundled")]
+#[test_case("sites", Some("tpp"), true, true, (true, false); "sites configured work sku")]
+#[test_case("sites", None, false, true, (false, false); "sites disabled remote does not reactivate bundled")]
+#[test_case("sites", None, true, false, (false, true); "sites missing remote bundle preserves bundled")]
+#[test_case("visualize", None, true, true, (true, false); "visualize enabled remote supersedes bundled")]
+#[test_case("visualize", None, false, true, (false, false); "visualize disabled remote does not reactivate bundled")]
+#[test_case("visualize", None, true, false, (false, true); "visualize missing remote bundle preserves bundled")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sites_compatibility_guard_in_agent_turn(
+async fn bundled_plugin_compatibility_guard_in_agent_turn(
+    plugin_name: &str,
     product_sku: Option<&str>,
     remote_enabled: bool,
-    cache_remote_sites: bool,
+    cache_remote_plugin: bool,
     expected_skills: (bool, bool),
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -1160,16 +1254,16 @@ async fn sites_compatibility_guard_in_agent_turn(
         .and(header("OAI-Product-Sku", product_sku.unwrap_or("codex")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "plugins": [{
-                "id": "plugins~plugin_connector_1p_689987207de08191979cf68eca2941c6",
-                "name": "sites",
+                "id": format!("plugins~Plugin_{plugin_name}"),
+                "name": plugin_name,
                 "scope": "GLOBAL",
                 "status": "ENABLED",
                 "installation_policy": "AVAILABLE",
                 "authentication_policy": "ON_USE",
                 "release": {
                     "version": "local",
-                    "display_name": "Sites",
-                    "description": "Sites",
+                    "display_name": plugin_name,
+                    "description": plugin_name,
                     "interface": {},
                 },
                 "enabled": remote_enabled,
@@ -1182,28 +1276,30 @@ async fn sites_compatibility_guard_in_agent_turn(
     let codex_home = Arc::new(TempDir::new()?);
     std::fs::write(
         codex_home.path().join("config.toml"),
-        r#"[features]
+        format!(
+            r#"[features]
 plugins = true
 remote_plugin = true
 
-[plugins."sites@openai-bundled"]
+[plugins."{plugin_name}@openai-bundled"]
 enabled = true
-"#,
+"#
+        ),
     )?;
     for (marketplace, skill) in [
-        ("openai-bundled", "bundled-sites"),
-        ("openai-curated-remote", "remote-sites"),
+        ("openai-bundled", "bundled-skill"),
+        ("openai-curated-remote", "remote-skill"),
     ] {
-        if marketplace == "openai-curated-remote" && !cache_remote_sites {
+        if marketplace == "openai-curated-remote" && !cache_remote_plugin {
             continue;
         }
         let root = codex_home
             .path()
-            .join(format!("plugins/cache/{marketplace}/sites/local"));
+            .join(format!("plugins/cache/{marketplace}/{plugin_name}/local"));
         std::fs::create_dir_all(root.join(".codex-plugin"))?;
         std::fs::write(
             root.join(".codex-plugin/plugin.json"),
-            r#"{"name":"sites"}"#,
+            format!(r#"{{"name":"{plugin_name}"}}"#),
         )?;
         let skill_dir = root.join("skills").join(skill);
         std::fs::create_dir_all(&skill_dir)?;
@@ -1233,7 +1329,7 @@ enabled = true
 
     test.codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-            text: "Inspect the available Sites skills.".to_string(),
+            text: format!("Inspect the available {plugin_name} skills."),
             text_elements: Vec::new(),
         }]))
         .await?;
@@ -1246,11 +1342,11 @@ enabled = true
     let developer_text = requests[0].message_input_texts("developer").join("\n");
     assert_eq!(
         (
-            developer_text.contains("sites:remote-sites"),
-            developer_text.contains("sites:bundled-sites"),
+            developer_text.contains(&format!("{plugin_name}:remote-skill")),
+            developer_text.contains(&format!("{plugin_name}:bundled-skill")),
         ),
         expected_skills,
-        "unexpected Sites skills in developer prompt: {developer_text:?}"
+        "unexpected {plugin_name} skills in developer prompt: {developer_text:?}"
     );
     Ok(())
 }
@@ -1312,7 +1408,10 @@ async fn agent_plugin_root_mcp_stdio_tool_round_trip_expands_reserved_paths_and_
         }
     };
     let stdio_server_name = format!("test_stdio_server{}", std::env::consts::EXE_SUFFIX);
-    std::fs::copy(stdio_server, plugin_root.join(&stdio_server_name))?;
+    codex_utils_cargo_bin::copy_executable(
+        std::path::Path::new(&stdio_server),
+        &plugin_root.join(&stdio_server_name),
+    )?;
     let mcp_config = serde_json::json!({
         "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
         "mcpServers": {
@@ -1654,6 +1753,97 @@ enabled = true
         assert!(!target_skills.contains("api description after"));
     }
 
+    Ok(())
+}
+
+#[test_case(true; "apps enabled")]
+#[test_case(false; "apps disabled without direct MCP fallback")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn curated_agent_plugin_app_routing_reaches_turns(apps_enabled: bool) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let apps_server = AppsTestServer::mount_with_connector_name(&server, "Google Calendar").await?;
+    let mock = mount_plugin_tool_search_turn(&server).await;
+    let codex_home = Arc::new(TempDir::new()?);
+    let plugin_root = codex_home
+        .path()
+        .join("plugins/cache/openai-curated-remote/sample/local");
+    std::fs::create_dir_all(&plugin_root)?;
+    let command_name = format!("test_stdio_server{}", std::env::consts::EXE_SUFFIX);
+    codex_utils_cargo_bin::copy_executable(
+        std::path::Path::new(&stdio_server_bin()?),
+        &plugin_root.join(&command_name),
+    )?;
+    std::fs::write(
+        plugin_root.join("plugin.json"),
+        r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"sample","extensions":{"com.openai":{"apps":"./.app.json"}}}"#,
+    )?;
+    std::fs::write(
+        plugin_root.join(".app.json"),
+        r#"{"apps":{"calendar":{"id":"calendar"}}}"#,
+    )?;
+    let mcp_server = serde_json::json!({
+        "type": "stdio",
+        "command": format!("./{command_name}"),
+    });
+    std::fs::write(
+        plugin_root.join("mcp.json"),
+        serde_json::json!({
+            "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+            "mcpServers": {"calendar": mcp_server, "sample": mcp_server},
+        })
+        .to_string(),
+    )?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        format!(
+            "[features]\nplugins = true\napps = {apps_enabled}\n[plugins.\"{SAMPLE_REMOTE_PLUGIN_CONFIG_NAME}\"]\nenabled = true\n"
+        ),
+    )?;
+    let mut builder = test_codex()
+        .with_home(codex_home)
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(move |config| {
+            config
+                .features
+                .set_enabled(Feature::Apps, apps_enabled)
+                .expect("test config should allow feature update");
+            config.chatgpt_base_url = apps_server.chatgpt_base_url;
+        });
+    let test = builder.build_with_remote_and_local_env(&server).await?;
+    assert!(test.config.features.enabled(Feature::Plugins));
+    assert_eq!(test.config.features.enabled(Feature::Apps), apps_enabled);
+    wait_for_mcp_server(&test.codex, "sample").await?;
+
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Mention {
+            name: "sample".into(),
+            path: format!("plugin://{SAMPLE_REMOTE_PLUGIN_CONFIG_NAME}"),
+        }]))
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let requests = mock.requests();
+    let (calendar_tool, echo_tool) = searched_plugin_tools(&requests[1]);
+    assert_eq!(calendar_tool.is_some(), apps_enabled);
+    if let Some(calendar_tool) = calendar_tool {
+        assert_plugin_provenance(&calendar_tool);
+    }
+    assert_plugin_provenance(&echo_tool.expect("unrelated MCP tool remains available"));
+    // Disabling Apps must not restore the matching direct MCP connection.
+    assert!(requests[0].tool_by_name("mcp__calendar", "echo").is_none());
+    let mcp_output = requests[1].tool_search_output(PLUGIN_MCP_SEARCH_CALL_ID);
+    assert!(namespace_child_tool(&mcp_output, "mcp__calendar", "echo").is_none());
+    let apps_connected = server
+        .received_requests()
+        .await
+        .expect("recorded app endpoint requests")
+        .iter()
+        .any(|request| request.url.path().trim_end_matches('/') == "/api/codex/ps/mcp");
+    assert_eq!(apps_connected, apps_enabled);
     Ok(())
 }
 

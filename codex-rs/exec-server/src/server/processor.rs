@@ -1,4 +1,3 @@
-use std::io;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -9,12 +8,11 @@ use tokio_util::task::AbortOnDropHandle;
 use tracing::debug;
 use tracing::warn;
 
-use crate::ExecServerRuntimePaths;
+use crate::ExecServerRuntimeOptions;
 use crate::LocalFileSystem;
 use crate::connection::CHANNEL_CAPACITY;
 use crate::connection::JsonRpcConnection;
 use crate::connection::JsonRpcConnectionEvent;
-use crate::discover_v2::capability_locations::CapabilityLocationRequest;
 use crate::discover_v2::capability_manager::CapabilityManager;
 use crate::rpc::RpcCallError;
 use crate::rpc::RpcNotificationSender;
@@ -31,63 +29,24 @@ use crate::telemetry::ConnectionTransport;
 use crate::telemetry::ExecServerTelemetry;
 use crate::telemetry::ExecutorRegistration;
 use codex_http_client::HttpClientFactory;
-use codex_utils_path_uri::PathUri;
 
 #[derive(Clone)]
 pub(crate) struct ConnectionProcessor {
     capability_manager: Arc<CapabilityManager>,
     capability_prewarm: Arc<AbortOnDropHandle<()>>,
     session_registry: Arc<SessionRegistry>,
-    runtime_paths: ExecServerRuntimePaths,
+    runtime_paths: ExecServerRuntimeOptions,
     telemetry: ExecServerTelemetry,
     http_client_factory: HttpClientFactory,
     request_dispatch_mode: RequestDispatchMode,
 }
 
 impl ConnectionProcessor {
-    #[cfg(test)]
-    pub(crate) fn new(runtime_paths: ExecServerRuntimePaths) -> Self {
-        Self::new_with_location_request(
-            runtime_paths,
-            ExecServerTelemetry::default(),
-            codex_http_client::HttpClientFactory::new(
-                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
-            ),
-            RequestDispatchMode::Inline,
-            // Connection-only tests must not scan the real user home.
-            Err(io::Error::other(
-                "capability home paths not supplied by this test",
-            )),
-        )
-    }
-
     pub(crate) fn new_with_telemetry(
-        runtime_paths: ExecServerRuntimePaths,
+        runtime_paths: ExecServerRuntimeOptions,
         telemetry: ExecServerTelemetry,
         http_client_factory: HttpClientFactory,
         request_dispatch_mode: RequestDispatchMode,
-    ) -> Self {
-        let request =
-            codex_utils_home_dir::find_codex_home().map(|codex_home| CapabilityLocationRequest {
-                codex_home: PathUri::from_abs_path(&codex_home),
-                user_home: dirs::home_dir()
-                    .and_then(|home| PathUri::from_host_native_path(home).ok()),
-            });
-        Self::new_with_location_request(
-            runtime_paths,
-            telemetry,
-            http_client_factory,
-            request_dispatch_mode,
-            request,
-        )
-    }
-
-    fn new_with_location_request(
-        runtime_paths: ExecServerRuntimePaths,
-        telemetry: ExecServerTelemetry,
-        http_client_factory: HttpClientFactory,
-        request_dispatch_mode: RequestDispatchMode,
-        request: io::Result<CapabilityLocationRequest>,
     ) -> Self {
         // Library callers may bypass CLI startup. Capture the version before serving clients.
         let _ = BuildInfo::get();
@@ -97,11 +56,7 @@ impl ConnectionProcessor {
         // Start before any client connects; all sessions share these inert global locations.
         let prewarm = tokio::spawn(async move {
             // Home resolution failures are nonfatal, just like scan failures.
-            let result = match request {
-                Ok(request) => manager.prewarm_locations(request).await.map(|_| ()),
-                Err(error) => Err(error),
-            };
-            if let Err(error) = result {
+            if let Err(error) = manager.prewarm_locations().await {
                 tracing::warn!(error_kind = ?error.kind(), "capability location prewarming unavailable");
             }
         });
@@ -157,7 +112,7 @@ async fn run_connection(
     executor_registration: Option<Arc<ExecutorRegistration>>,
 ) {
     let ConnectionProcessor {
-        capability_manager: _capability_manager,
+        capability_manager,
         capability_prewarm: _capability_prewarm,
         session_registry,
         runtime_paths,
@@ -179,6 +134,7 @@ async fn run_connection(
     let requests = notifications.request_sender();
     let mut handler = ExecServerHandler::new(
         session_registry,
+        capability_manager,
         notifications,
         runtime_paths,
         http_client_factory,
@@ -342,7 +298,7 @@ mod tests {
 
     use super::complete_queued_client_responses;
     use super::run_connection;
-    use crate::ExecServerRuntimePaths;
+    use crate::ExecServerRuntimeOptions;
     use crate::ProcessId;
     use crate::connection::JsonRpcConnection;
     use crate::connection::JsonRpcConnectionEvent;
@@ -370,67 +326,36 @@ mod tests {
     use crate::rpc_server_requests::RpcServerRequestSender;
     use crate::server::session_registry::SessionRegistry;
 
-    #[tokio::test]
-    async fn startup_prewarms_without_a_client_connection() -> anyhow::Result<()> {
-        let paths = ExecServerRuntimePaths::new(
-            std::env::current_exe()?,
-            /*codex_linux_sandbox_exe*/ None,
-        )?;
-        let directory = tempfile::tempdir()?;
-        let request = crate::discover_v2::capability_locations::CapabilityLocationRequest {
-            codex_home: PathUri::from_host_native_path(directory.path().join("codex"))?,
-            user_home: Some(PathUri::from_host_native_path(
-                directory.path().join("home"),
-            )?),
-        };
-        let skill_root = directory.path().join("codex/skills");
-        std::fs::create_dir_all(&skill_root)?;
-        let mut processor = super::ConnectionProcessor::new_with_location_request(
-            paths,
-            crate::ExecServerTelemetry::default(),
-            codex_http_client::HttpClientFactory::new(
-                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
-            ),
-            crate::server::RequestDispatchMode::Inline,
-            Ok(request.clone()),
-        );
-        Arc::get_mut(&mut processor.capability_prewarm)
-            .ok_or_else(|| anyhow::anyhow!("startup task unexpectedly shared"))?
-            .await?;
-        let cloned_processor = processor.clone();
-        assert!(Arc::ptr_eq(
-            &processor.capability_manager,
-            &cloned_processor.capability_manager,
-        ));
-        let manager = &processor.capability_manager;
-        // Removing the fixture proves startup retained it before any later call.
-        std::fs::remove_dir(&skill_root)?;
-        let (first, second) = tokio::try_join!(
-            manager.prewarm_locations(request.clone()),
-            manager.prewarm_locations(request.clone()),
-        )?;
-        assert!(std::ptr::eq(first, second));
-        assert_eq!(first.0, request);
-        let expected_root = request.codex_home.join("skills")?;
-        assert!(
-            first
-                .1
-                .locations
-                .iter()
-                .any(|location| location.root == expected_root)
-        );
-        let mut different_request = request.clone();
-        different_request.codex_home = request.codex_home.join("different")?;
-        let Err(error) = manager.prewarm_locations(different_request).await else {
-            anyhow::bail!("different home paths must not reuse cached locations");
-        };
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(std::ptr::eq(
-            first,
-            manager.prewarm_locations(request).await?,
-        ));
-        processor.shutdown().await;
-        Ok(())
+    impl super::ConnectionProcessor {
+        // Discovery tests supply fixture homes without changing the process environment.
+        pub(crate) async fn seed_capability_locations(
+            &self,
+            request: crate::discover_v2::capability_locations::CapabilityLocationRequest,
+        ) -> std::io::Result<()> {
+            self.capability_manager
+                .seed_prewarmed_locations(request)
+                .await
+        }
+
+        // Connection-only tests do not prewarm or scan the real user home.
+        pub(crate) fn new(runtime_paths: ExecServerRuntimeOptions) -> Self {
+            let telemetry = crate::ExecServerTelemetry::default();
+            Self {
+                capability_manager: crate::discover_v2::capability_manager::CapabilityManager::new(
+                    crate::LocalFileSystem::with_runtime_paths(runtime_paths.clone()),
+                ),
+                capability_prewarm: Arc::new(tokio_util::task::AbortOnDropHandle::new(
+                    tokio::spawn(async {}),
+                )),
+                session_registry: SessionRegistry::new(telemetry.clone()),
+                runtime_paths,
+                telemetry,
+                http_client_factory: codex_http_client::HttpClientFactory::new(
+                    codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+                ),
+                request_dispatch_mode: crate::server::RequestDispatchMode::Inline,
+            }
+        }
     }
 
     #[tokio::test]
@@ -637,8 +562,8 @@ mod tests {
         (client_writer, BufReader::new(client_reader).lines(), task)
     }
 
-    fn test_runtime_paths() -> ExecServerRuntimePaths {
-        ExecServerRuntimePaths::new(
+    fn test_runtime_paths() -> ExecServerRuntimeOptions {
+        ExecServerRuntimeOptions::new(
             std::env::current_exe().expect("current exe"),
             /*codex_linux_sandbox_exe*/ None,
         )

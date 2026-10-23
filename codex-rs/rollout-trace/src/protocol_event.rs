@@ -59,7 +59,11 @@ pub(crate) fn codex_turn_trace_event(
                 context_turn_id: codex_turn_id.clone(),
                 payload: RawTraceEventPayload::CodexTurnEnded {
                     codex_turn_id,
-                    status: ExecutionStatus::Completed,
+                    status: if event.error.is_some() {
+                        ExecutionStatus::Failed
+                    } else {
+                        ExecutionStatus::Completed
+                    },
                 },
             })
         }
@@ -76,6 +80,12 @@ pub(crate) fn codex_turn_trace_event(
                 },
             })
         }
+        EventMsg::RawResponseItem(event) => Some(CodexTurnTraceEvent {
+            context_turn_id: default_turn_id.to_string(),
+            payload: RawTraceEventPayload::HistoryItemAccepted {
+                item_id: event.item.id()?.to_string(),
+            },
+        }),
         _ => None,
     }
 }
@@ -220,12 +230,9 @@ struct ExecCommandEndTracePayload<'a> {
     source: ExecCommandSource,
     #[serde(skip_serializing_if = "Option::is_none")]
     interaction_input: Option<&'a str>,
-    stdout: &'a str,
-    stderr: &'a str,
     aggregated_output: &'a str,
     exit_code: i32,
     duration: Duration,
-    formatted_output: &'a str,
     status: &'a ExecCommandStatus,
 }
 
@@ -243,12 +250,9 @@ impl<'a> From<&'a ExecCommandEndEvent> for ExecCommandEndTracePayload<'a> {
             parsed_cmd,
             source,
             interaction_input,
-            stdout,
-            stderr,
             aggregated_output,
             exit_code,
             duration,
-            formatted_output,
             status,
         } = event;
         Self {
@@ -263,12 +267,9 @@ impl<'a> From<&'a ExecCommandEndEvent> for ExecCommandEndTracePayload<'a> {
             parsed_cmd,
             source: *source,
             interaction_input: interaction_input.as_deref(),
-            stdout,
-            stderr,
             aggregated_output,
             exit_code: *exit_code,
             duration: *duration,
-            formatted_output,
             status,
         }
     }
@@ -407,6 +408,7 @@ pub(crate) fn tool_runtime_trace_event(event: &EventMsg) -> Option<ToolRuntimeTr
         | EventMsg::DynamicToolCallRequest(_)
         | EventMsg::DynamicToolCallResponse(_)
         | EventMsg::ElicitationRequest(_)
+        | EventMsg::ElicitationAbandoned(_)
         | EventMsg::ApplyPatchApprovalRequest(_)
         | EventMsg::GuardianAssessment(_)
         | EventMsg::DeprecationNotice(_)
@@ -419,6 +421,7 @@ pub(crate) fn tool_runtime_trace_event(event: &EventMsg) -> Option<ToolRuntimeTr
         | EventMsg::ShutdownComplete
         | EventMsg::EnteredReviewMode(_)
         | EventMsg::ExitedReviewMode(_)
+        | EventMsg::PrivateSessionEvent(_)
         | EventMsg::RawResponseItem(_)
         | EventMsg::RawResponseCompleted(_)
         | EventMsg::ItemStarted(_)
@@ -486,6 +489,7 @@ pub(crate) fn wrapped_protocol_event_type(event: &EventMsg) -> Option<&'static s
         | EventMsg::DynamicToolCallRequest(_)
         | EventMsg::DynamicToolCallResponse(_)
         | EventMsg::ElicitationRequest(_)
+        | EventMsg::ElicitationAbandoned(_)
         | EventMsg::ApplyPatchApprovalRequest(_)
         | EventMsg::GuardianAssessment(_)
         | EventMsg::DeprecationNotice(_)
@@ -498,6 +502,7 @@ pub(crate) fn wrapped_protocol_event_type(event: &EventMsg) -> Option<&'static s
         | EventMsg::PlanUpdate(_)
         | EventMsg::EnteredReviewMode(_)
         | EventMsg::ExitedReviewMode(_)
+        | EventMsg::PrivateSessionEvent(_)
         | EventMsg::RawResponseItem(_)
         | EventMsg::RawResponseCompleted(_)
         | EventMsg::ItemStarted(_)

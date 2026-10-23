@@ -272,6 +272,7 @@ async fn rollout_paths_for_thread(
 async fn create_paginated_thread(store: &LocalThreadStore, thread_id: ThreadId) {
     store
         .create_thread(CreateThreadParams {
+            attached_thread: false,
             creator_user_id: Some("creator-user".to_string()),
             creator_account_id: Some("creator-account".to_string()),
             session_id: thread_id.into(),
@@ -321,6 +322,7 @@ async fn turn_ids(store: &LocalThreadStore, thread_id: ThreadId) -> Vec<String> 
 
 fn turn_started(turn_id: &str) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+        turn_attribution: None,
         turn_id: turn_id.to_string(),
         root_turn_id: None,
         trace_id: None,
@@ -332,6 +334,7 @@ fn turn_started(turn_id: &str) -> RolloutItem {
 
 fn turn_completed(turn_id: &str) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+        root_turn_id: None,
         turn_id: turn_id.to_string(),
         last_agent_message: None,
         error: None,

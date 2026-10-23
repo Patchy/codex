@@ -214,7 +214,7 @@ async fn responses_websocket_preserves_credit_usage_metadata() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn responses_websocket_omits_raw_tool_metadata_for_openai_named_custom_endpoint() {
+async fn responses_websocket_preserves_raw_tool_metadata_for_openai_custom_endpoint() {
     skip_if_no_network!();
 
     let server = start_websocket_server(vec![vec![vec![
@@ -238,11 +238,7 @@ async fn responses_websocket_omits_raw_tool_metadata_for_openai_named_custom_end
     output.append_executed_tool_calls(vec![call]);
     output.mark_tool_calls_complete();
     let prompt = prompt_with_input(vec![output.clone()]);
-    let mut expected = serde_json::to_value(&output).unwrap();
-    expected["internal_chat_message_metadata_passthrough"]["executed_tool_calls"][0]
-        .as_object_mut()
-        .unwrap()
-        .remove("tool_result_metadata");
+    let expected = serde_json::to_value(&output).unwrap();
 
     let mut client_session = harness.client.new_session();
     stream_until_complete_with_model_info(
@@ -618,7 +614,11 @@ async fn responses_websocket_resume_prewarm_reuses_and_repairs_connection() -> a
             requests: vec![
                 vec![ev_response_created("warm-1"), ev_completed("warm-1")],
                 vec![ev_response_created("resp-1"), ev_completed("resp-1")],
-                vec![ev_response_created("resp-2"), ev_completed("resp-2")],
+                vec![
+                    ev_response_created("resp-2"),
+                    ev_assistant_message("msg_2", "ready to continue"),
+                    ev_completed("resp-2"),
+                ],
             ],
             response_headers: Vec::new(),
             accept_delay: None,
@@ -650,8 +650,8 @@ async fn responses_websocket_resume_prewarm_reuses_and_repairs_connection() -> a
 
     // A healthy warm resume skips preparation; only the user turn reloads instructions.
     let instruction_loads = instructions.load_count();
-    test.codex.prewarm().await;
-    test.codex.prewarm().await;
+    test.codex.prewarm_with_history().await;
+    test.codex.prewarm_with_history().await;
     test.submit_text_turn("continue").await?;
 
     assert_eq!(instructions.load_count(), instruction_loads + 1);
@@ -666,7 +666,18 @@ async fn responses_websocket_resume_prewarm_reuses_and_repairs_connection() -> a
     );
     let connection = server.single_connection();
     assert_eq!(connection.len(), 3);
+    let prewarm = connection[0].body_json();
+    assert_eq!(prewarm["input"].as_array().unwrap().len(), 1);
+    assert_eq!(prewarm["input"][0]["role"], "developer");
     assert_eq!(connection[2].body_json()["previous_response_id"], "resp-1");
+    let mut expected_history = connection
+        .iter()
+        .flat_map(|request| request.body_json()["input"].as_array().unwrap().clone())
+        .collect::<Vec<_>>();
+    expected_history.push(serde_json::to_value(assistant_message_item(
+        "2",
+        "ready to continue",
+    ))?);
 
     // Turn idle does not synchronize with the reader observing the server's close.
     // Retry resume until it sees the close; pending attempts must still share one socket.
@@ -674,8 +685,8 @@ async fn responses_websocket_resume_prewarm_reuses_and_repairs_connection() -> a
     let instruction_loads = instructions.load_count();
     let warmup = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            test.codex.prewarm().await;
-            test.codex.prewarm().await;
+            test.codex.prewarm_with_history().await;
+            test.codex.prewarm_with_history().await;
             tokio::select! {
                 request = server.wait_for_request(/*connection_index*/ 1, /*request_index*/ 0) => break request,
                 _ = tokio::time::sleep(Duration::from_millis(10)) => {}
@@ -686,6 +697,14 @@ async fn responses_websocket_resume_prewarm_reuses_and_repairs_connection() -> a
     assert!(instructions.load_count() > instruction_loads);
     assert_eq!(warmup.body_json()["generate"], false);
     assert!(warmup.body_json().get("previous_response_id").is_none());
+    let mut actual_history: Vec<ResponseItem> =
+        serde_json::from_value(warmup.body_json()["input"].clone())?;
+    let mut expected_history: Vec<ResponseItem> = serde_json::from_value(json!(expected_history))?;
+    for item in actual_history.iter_mut().chain(&mut expected_history) {
+        item.clear_internal_chat_message_metadata_passthrough();
+    }
+    assert_eq!(actual_history, expected_history);
+    assert!(warmup.body_json().get("prompt_cache_options").is_none());
 
     test.submit_text_turn("continue after reconnect").await?;
     assert_eq!(server.handshakes().len(), 2);
@@ -2031,18 +2050,13 @@ async fn responses_lite_websocket_uses_incremental_create_on_prefix() {
     let second = connection.get(1).expect("missing request").body_json();
     let first_input = first["input"].as_array().expect("request input");
 
-    assert_eq!(first_input.len(), 3);
+    assert_eq!(first_input.len(), 2);
     assert!(
         first_input[0]["id"]
             .as_str()
-            .is_some_and(|id| id.starts_with("at_"))
-    );
-    assert!(
-        first_input[1]["id"]
-            .as_str()
             .is_some_and(|id| id.starts_with("msg_"))
     );
-    assert_eq!(first_input[2]["id"], "msg_supplied");
+    assert_eq!(first_input[1]["id"], "msg_supplied");
     assert_eq!(second["previous_response_id"].as_str(), Some("resp-1"));
     assert_eq!(
         second["input"],
@@ -2226,12 +2240,36 @@ async fn responses_websocket_uses_previous_response_id_when_prefix_after_complet
     server.shutdown().await;
 }
 
+#[test_case::test_case(vec![message_item("different")], "input_mismatch", "message"; "rewritten")]
+#[test_case::test_case(
+    vec![ResponseItem::Compaction {
+        id: None,
+        encrypted_content: "compacted".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    }],
+    "input_mismatch",
+    "compaction"; "replaced"
+)]
+#[test_case::test_case(
+    vec![message_item("hello"), assistant_message_item("1", "changed output")],
+    "input_mismatch",
+    "message"; "rewritten server output"
+)]
+#[test_case::test_case(vec![message_item("hello")], "input_shortened", "none"; "missing server output")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn responses_websocket_creates_on_non_prefix() {
+async fn responses_websocket_creates_on_non_prefix(
+    input: Vec<ResponseItem>,
+    reason: &str,
+    current_item_type: &str,
+) {
     skip_if_no_network!();
 
     let server = start_websocket_server(vec![vec![
-        vec![ev_response_created("resp-1"), ev_completed("resp-1")],
+        vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg_1", "assistant output"),
+            ev_completed("resp-1"),
+        ],
         vec![ev_response_created("resp-2"), ev_completed("resp-2")],
     ]])
     .await;
@@ -2239,7 +2277,7 @@ async fn responses_websocket_creates_on_non_prefix() {
     let harness = websocket_harness(&server).await;
     let mut client_session = harness.client.new_session();
     let prompt_one = prompt_with_input(vec![message_item("hello")]);
-    let prompt_two = prompt_with_input(vec![message_item("different")]);
+    let prompt_two = prompt_with_input(input);
 
     stream_until_complete(&mut client_session, &harness, &prompt_one).await;
     stream_until_complete(&mut client_session, &harness, &prompt_two).await;
@@ -2251,23 +2289,30 @@ async fn responses_websocket_creates_on_non_prefix() {
     assert_eq!(second["type"].as_str(), Some("response.create"));
     assert_eq!(second["model"].as_str(), Some(MODEL));
     assert_eq!(second["stream"], serde_json::Value::Bool(true));
+    assert_eq!(second.get("previous_response_id"), None);
     assert_eq!(
         second["input"],
         serde_json::to_value(&prompt_two.input).unwrap()
     );
 
-    assert_continuation_metrics(
+    assert_continuation_metrics_with_item_types(
         &harness.session_telemetry,
         &[
-            (["full", "other", "generation"], 1),
-            (["full", "no_previous_request", "generation"], 1),
+            (
+                ["full", reason, "generation", "message", current_item_type],
+                1,
+            ),
+            (
+                ["full", "no_previous_request", "generation", "none", "none"],
+                1,
+            ),
         ],
     );
     server.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn responses_websocket_creates_when_non_input_request_fields_change() {
+async fn responses_websocket_creates_when_instructions_change() {
     skip_if_no_network!();
 
     let server = start_websocket_server(vec![vec![
@@ -2294,16 +2339,30 @@ async fn responses_websocket_creates_when_non_input_request_fields_change() {
 
     assert_eq!(second["type"].as_str(), Some("response.create"));
     assert_eq!(second.get("previous_response_id"), None);
+    assert_eq!(second["input"][0]["role"], "developer");
     assert_eq!(
-        second["input"],
-        serde_json::to_value(&prompt_two.input).expect("serialize full input")
+        second["input"][0]["content"][0]["text"],
+        "base instructions two"
+    );
+    assert_eq!(
+        &second["input"].as_array().unwrap()[1..],
+        serde_json::to_value(&prompt_two.input)
+            .unwrap()
+            .as_array()
+            .unwrap()
     );
 
-    assert_continuation_metrics(
+    assert_continuation_metrics_with_item_types(
         &harness.session_telemetry,
         &[
-            (["full", "no_previous_request", "generation"], 1),
-            (["full", "other", "generation"], 1),
+            (
+                ["full", "no_previous_request", "generation", "none", "none"],
+                1,
+            ),
+            (
+                ["full", "input_mismatch", "generation", "message", "message"],
+                1,
+            ),
         ],
     );
     server.shutdown().await;
@@ -2351,9 +2410,15 @@ async fn responses_websocket_v2_creates_with_previous_response_id_on_prefix() {
     server.shutdown().await;
 }
 
+#[test_case::test_case(None, Some(json!({"type": "object", "properties": {}})), "text_changed"; "output schema")]
+#[test_case::test_case(Some("changed-model"), None, "model_changed"; "model")]
+#[test_case::test_case(Some("changed-model"), Some(json!({"type": "object"})), "model_changed"; "first changed property")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn responses_websocket_v2_creates_without_previous_response_id_when_non_input_fields_change()
-{
+async fn responses_websocket_v2_creates_without_previous_response_id_when_non_input_fields_change(
+    model: Option<&str>,
+    output_schema: Option<serde_json::Value>,
+    reason: &str,
+) {
     skip_if_no_network!();
 
     let server = start_websocket_server(vec![vec![
@@ -2364,15 +2429,23 @@ async fn responses_websocket_v2_creates_without_previous_response_id_when_non_in
 
     let harness = websocket_harness_with_v2(&server, /*runtime_metrics_enabled*/ true).await;
     let mut session = harness.client.new_session();
-    let prompt_one =
-        prompt_with_input_and_instructions(vec![message_item("hello")], "base instructions one");
-    let prompt_two = prompt_with_input_and_instructions(
-        vec![message_item("hello"), message_item("second")],
-        "base instructions two",
-    );
+    let prompt_one = prompt_with_input(vec![message_item("hello")]);
+    let mut prompt_two = prompt_with_input(vec![message_item("hello"), message_item("second")]);
+    prompt_two.output_schema = output_schema;
+    let mut model_info = harness.model_info.clone();
+    if let Some(model) = model {
+        model_info.slug = model.to_string();
+    }
 
     stream_until_complete(&mut session, &harness, &prompt_one).await;
-    stream_until_complete(&mut session, &harness, &prompt_two).await;
+    stream_until_complete_with_model_info(
+        &mut session,
+        &harness,
+        &prompt_two,
+        &model_info,
+        "resp-2",
+    )
+    .await;
 
     let connection = server.single_connection();
     assert_eq!(connection.len(), 2);
@@ -2385,6 +2458,13 @@ async fn responses_websocket_v2_creates_without_previous_response_id_when_non_in
         serde_json::to_value(&prompt_two.input).expect("serialize full input")
     );
 
+    assert_continuation_metrics(
+        &harness.session_telemetry,
+        &[
+            (["full", "no_previous_request", "generation"], 1),
+            (["full", reason, "generation"], 1),
+        ],
+    );
     server.shutdown().await;
 }
 
@@ -2581,6 +2661,8 @@ async fn responses_websocket_v2_sets_openai_beta_header() {
 
 fn message_item(text: &str) -> ResponseItem {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".into(),
         content: vec![ContentItem::InputText { text: text.into() }],
@@ -2591,9 +2673,15 @@ fn message_item(text: &str) -> ResponseItem {
 
 fn assistant_message_item(id: &str, text: &str) -> ResponseItem {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: Some(ResponseItemId::with_suffix("msg", id)),
         role: "assistant".into(),
-        content: vec![ContentItem::OutputText { text: text.into() }],
+        content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
+            text: text.into(),
+        }],
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     }
@@ -2602,6 +2690,7 @@ fn assistant_message_item(id: &str, text: &str) -> ResponseItem {
 fn prompt_with_input(input: Vec<ResponseItem>) -> Prompt {
     let mut prompt = Prompt::default();
     prompt.input = input;
+    prompt.base_instructions.text.clear();
     prompt
 }
 
@@ -2643,6 +2732,8 @@ fn websocket_provider_with_connect_timeout(
         requires_openai_auth: false,
         supports_websockets: true,
         supports_standalone_web_search: false,
+        capabilities: None,
+        include_internal_metadata: false,
     }
 }
 
@@ -2787,6 +2878,7 @@ async fn websocket_harness_with_provider_options_and_auth(
         config
             .features
             .enabled(Feature::ConcurrentReasoningSummaries),
+        config.features.enabled(Feature::OutputTokenReplay),
         /*attestation_provider*/ None,
         http_client_factory,
         config.workspace_routing_context(),
@@ -2857,6 +2949,17 @@ async fn responses_websocket_restored_history_metric(fork: bool) -> anyhow::Resu
 }
 
 fn assert_continuation_metrics(telemetry: &SessionTelemetry, expected: &[([&str; 3], u64)]) {
+    let expected = expected
+        .iter()
+        .map(|([mode, reason, phase], count)| ([*mode, *reason, *phase, "none", "none"], *count))
+        .collect::<Vec<_>>();
+    assert_continuation_metrics_with_item_types(telemetry, &expected);
+}
+
+fn assert_continuation_metrics_with_item_types(
+    telemetry: &SessionTelemetry,
+    expected: &[([&str; 5], u64)],
+) {
     use opentelemetry_sdk::metrics::data::AggregatedMetrics;
     use opentelemetry_sdk::metrics::data::MetricData;
 
@@ -2876,7 +2979,14 @@ fn assert_continuation_metrics(telemetry: &SessionTelemetry, expected: &[([&str;
     let mut actual: Vec<_> = sum
         .data_points()
         .map(|point| {
-            let tags = ["mode", "reason", "phase"].map(|key| {
+            let tags = [
+                "mode",
+                "reason",
+                "phase",
+                "previous_item_type",
+                "current_item_type",
+            ]
+            .map(|key| {
                 point
                     .attributes()
                     .find(|attr| attr.key.as_str() == key)

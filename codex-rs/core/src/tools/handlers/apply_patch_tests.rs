@@ -55,25 +55,8 @@ async fn invocation_for_payload(payload: ToolPayload) -> ToolInvocation {
         tool_name: codex_tools::ToolName::plain("apply_patch"),
         source: crate::tools::context::ToolCallSource::Direct,
         payload,
+        environments: Default::default(),
     }
-}
-
-#[tokio::test]
-async fn file_update_mode_follows_preserve_line_endings_feature() {
-    let (_, mut turn) = make_session_and_context().await;
-    assert_eq!(
-        apply_patch_file_update_mode(&turn),
-        codex_apply_patch::ApplyPatchFileUpdateMode::NormalizeToLf
-    );
-
-    Arc::make_mut(&mut turn.config)
-        .features
-        .enable(codex_features::Feature::ApplyPatchPreserveLineEndings)
-        .expect("feature should be enabled");
-    assert_eq!(
-        apply_patch_file_update_mode(&turn),
-        codex_apply_patch::ApplyPatchFileUpdateMode::PreserveLineEndings
-    );
 }
 
 #[tokio::test]

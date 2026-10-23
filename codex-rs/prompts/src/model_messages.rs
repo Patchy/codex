@@ -1,5 +1,5 @@
 //! Resolves model-owned messages from catalog values and bundled defaults.
-//! Resolution preserves sparse catalog data, empty strings, and source identity.
+//! Resolution preserves sparse catalog data and source identity, with family-specific validation.
 //! Prompt composition and runtime settings remain with consumers; each accessor
 //! selects and resolves only the requested message family.
 
@@ -15,11 +15,13 @@ use permissions::ResolvedPermissionMessages;
 
 mod collaboration;
 mod guardian;
+mod incremental_tools;
 mod multi_agent;
 pub(crate) mod permissions;
 
 pub use collaboration::ResolvedCollaborationModeMessages;
 pub use guardian::ResolvedAutoReviewMessages;
+pub use incremental_tools::ResolvedIncrementalToolMessages;
 pub use multi_agent::ResolvedMultiAgentMessages;
 
 /// Text together with whether it was supplied by the catalog, even when it equals the default.
@@ -54,12 +56,14 @@ const REMINDER_MESSAGE_TEMPLATE: &str = concat!(
     "Once reset, message items in current context window will be cleared in the new window, but notes and history items will be persistent across windows."
 );
 const PERSISTENT_INSTRUCTIONS: &str = include_str!("../templates/persistent_mode.md");
+const CONTENT_FILTER_GUIDANCE: &str = "Your previous response was blocked by a content filter. Do not treat this as a transient failure or try to reproduce or work around the blocked content through repeated attempts, altered formatting, splitting, encoding, tools, subagents, or later wakes. Briefly explain the limitation and offer a permitted alternative. Continue unrelated authorized work.";
+const MAX_CONTENT_FILTER_GUIDANCE_BYTES: usize = 512;
 
 /// Resolves model-owned text from catalog overrides or bundled defaults, one family at a time.
 ///
 /// The view borrows the consumer's captured model metadata without resolving any families.
 /// Missing values select bundled text or retain delegation to consumer-owned settings.
-/// Explicit empty strings remain overrides.
+/// Explicit empty strings remain overrides unless a message family validates them.
 #[derive(Debug, Clone, Copy)]
 pub struct ResolvedModelMessages<'a> {
     catalog_messages: Option<&'a ModelMessages>,
@@ -140,6 +144,27 @@ impl<'a> ResolvedModelMessages<'a> {
             })
     }
 
+    /// Selects native history definitions; missing fields delegate to the tool owner.
+    pub fn history(self) -> Option<&'a codex_protocol::openai_models::HistoryToolMessages> {
+        self.catalog_messages?.tools.as_ref()?.history.as_ref()
+    }
+
+    /// Selects native notes definitions; missing fields delegate to the tool owner.
+    pub fn notes(self) -> Option<&'a codex_protocol::openai_models::NotesToolMessages> {
+        self.catalog_messages?.tools.as_ref()?.notes.as_ref()
+    }
+
+    /// Selects context-window control definitions independently of runtime tool names.
+    pub fn context_management(
+        self,
+    ) -> Option<&'a codex_protocol::openai_models::ContextManagementToolMessages> {
+        self.catalog_messages?
+            .tools
+            .as_ref()?
+            .context_management
+            .as_ref()
+    }
+
     /// Resolves optional confirmation policies, leaving missing values to actor defaults.
     pub fn confirmation_policies(&self) -> Option<&'a ConfirmationPolicies> {
         self.catalog_messages
@@ -202,6 +227,26 @@ impl<'a> ResolvedModelMessages<'a> {
             .as_ref()
     }
 
+    /// Selects per-function guidance restricted to the default `functions` namespace.
+    pub fn functions_namespace_functions_description_prefixes(
+        &self,
+    ) -> Option<&'a std::collections::BTreeMap<String, String>> {
+        self.catalog_messages?
+            .tools
+            .as_ref()?
+            .functions_namespace_functions_description_prefixes
+            .as_ref()
+    }
+
+    /// Resolves bounded incremental catalog wording for an owned world-state section.
+    pub fn incremental_tools(&self) -> ResolvedIncrementalToolMessages {
+        ResolvedIncrementalToolMessages::new(
+            self.catalog_messages
+                .and_then(|messages| messages.tools.as_ref())
+                .and_then(|tools| tools.incremental_tools.as_ref()),
+        )
+    }
+
     /// Selects Code Mode messages; bundled text and runtime composition belong to the tool owner.
     pub fn code_mode(&self) -> Option<&'a CodeModeToolMessages> {
         self.catalog_messages?.tools.as_ref()?.code_mode.as_ref()
@@ -222,5 +267,15 @@ impl<'a> ResolvedModelMessages<'a> {
         self.catalog_messages
             .and_then(|messages| messages.persistent_instructions.as_deref())
             .unwrap_or(PERSISTENT_INSTRUCTIONS)
+    }
+
+    /// Resolves bounded recovery guidance, falling back without truncating instructions.
+    pub fn content_filter_guidance(&self) -> &'a str {
+        self.catalog_messages
+            .and_then(|messages| messages.content_filter_guidance.as_deref())
+            .filter(|text| {
+                !text.trim().is_empty() && text.len() <= MAX_CONTENT_FILTER_GUIDANCE_BYTES
+            })
+            .unwrap_or(CONTENT_FILTER_GUIDANCE)
     }
 }

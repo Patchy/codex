@@ -103,7 +103,6 @@ async fn refreshed_active_reasoning_accepts_later_deltas_and_complete_summary() 
                     turns: vec![turn],
                     blocks_direct_input: false,
                     task_tools_available: false,
-                    reasoning_summary: None,
                 },
                 &mut snapshot,
             )
@@ -305,6 +304,7 @@ fn evicted_voice_delegation_marker_still_suppresses_private_replay() {
     let mut resumed = ThreadEventStore::new(/*capacity*/ 1);
     resumed.set_turns(vec![Turn {
         id: "voice-turn".into(),
+        root_turn_id: None,
         items: vec![voice_request],
         items_view: codex_app_server_protocol::TurnItemsView::Summary,
         status: TurnStatus::InProgress,
@@ -346,6 +346,7 @@ fn saved_voice_turn_suppresses_reasoning_without_hiding_typed_reasoning() {
     };
     let turn = |id: &str, items| Turn {
         id: id.into(),
+        root_turn_id: None,
         items,
         items_view: codex_app_server_protocol::TurnItemsView::Full,
         status: TurnStatus::Completed,
@@ -391,6 +392,7 @@ fn snapshot_keeps_typed_output_before_voice_handoff_in_the_same_turn() {
     let mut store = ThreadEventStore::new(/*capacity*/ 8);
     store.set_turns(vec![Turn {
         id: "shared".into(),
+        root_turn_id: None,
         items: vec![typed.clone(), marker.clone(), private.clone()],
         items_view: codex_app_server_protocol::TurnItemsView::Full,
         status: TurnStatus::InProgress,

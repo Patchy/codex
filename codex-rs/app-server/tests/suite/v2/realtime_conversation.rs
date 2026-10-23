@@ -15,6 +15,10 @@ use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemsListParams;
+use codex_app_server_protocol::ThreadItemsListResponse;
+use codex_app_server_protocol::ThreadReadParams;
+use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadRealtimeAppendAudioParams;
 use codex_app_server_protocol::ThreadRealtimeAppendAudioResponse;
 use codex_app_server_protocol::ThreadRealtimeAppendSpeechParams;
@@ -50,10 +54,13 @@ use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadTimelineEntry;
 use codex_app_server_protocol::ThreadTimelineListParams;
 use codex_app_server_protocol::ThreadTimelineListResponse;
+use codex_app_server_protocol::ThreadTurnsListParams;
+use codex_app_server_protocol::ThreadTurnsListResponse;
 use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStartedNotification;
+use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::TurnSteerParams;
 use codex_app_server_protocol::TurnSteerResponse;
 use codex_app_server_protocol::UserInput as V2UserInput;
@@ -86,6 +93,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 use test_case::test_case;
 use test_case::test_matrix;
+use tokio::sync::Notify;
 use tokio::time::timeout;
 use uuid::Uuid;
 use wiremock::Match;
@@ -404,6 +412,7 @@ impl RealtimeE2eHarness {
                 realtime_end_instructions: None,
                 prompt: Some(Some("backend prompt".to_string())),
                 realtime_session_id: None,
+                voice_session_id: None,
                 transport: Some(ThreadRealtimeStartTransport::Webrtc {
                     sdp: offer_sdp.to_string(),
                 }),
@@ -466,6 +475,7 @@ impl RealtimeE2eHarness {
                 realtime_end_instructions: None,
                 prompt: Some(Some("backend prompt".to_string())),
                 realtime_session_id: None,
+                voice_session_id: None,
                 transport: None,
                 version: None,
                 voice: None,
@@ -504,6 +514,7 @@ impl RealtimeE2eHarness {
                 realtime_end_instructions: None,
                 prompt: Some(Some("backend prompt".to_string())),
                 realtime_session_id: None,
+                voice_session_id: None,
                 transport: None,
                 version: Some(RealtimeConversationVersion::V3),
                 voice: None,
@@ -722,6 +733,7 @@ async fn realtime_conversation_streams_timeline_items() -> Result<()> {
             realtime_end_instructions: None,
             prompt: None,
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -920,6 +932,7 @@ async fn realtime_conversation_streams_v2_notifications() -> Result<()> {
             realtime_end_instructions: None,
             prompt: None,
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: Some(RealtimeVoice::Cedar),
@@ -1266,6 +1279,16 @@ async fn realtime_timeline_splits_accepted_steering_and_persists_promoted_artifa
         .read_notification::<TurnStartedNotification>("turn/started")
         .await?;
 
+    // The initial user item also seals realtime transcript segments. Wait for
+    // it before speaking so only the steering under test can split this segment.
+    let initial_message = harness
+        .read_notification::<ItemCompletedNotification>("item/completed")
+        .await?;
+    assert!(matches!(
+        initial_message.item,
+        ThreadItem::UserMessage { .. }
+    ));
+
     harness
         .append_text(harness.thread_id.clone(), "Trigger speech")
         .await?;
@@ -1294,6 +1317,7 @@ async fn realtime_timeline_splits_accepted_steering_and_persists_promoted_artifa
                 additional_context: None,
                 client_user_message_id: None,
                 responsesapi_client_metadata: None,
+                responsesapi_client_metadata_patch: None,
             })
             .await?;
         let rejected = timeout(
@@ -1326,6 +1350,7 @@ async fn realtime_timeline_splits_accepted_steering_and_persists_promoted_artifa
             additional_context: None,
             client_user_message_id: Some("accepted-steer".to_string()),
             responsesapi_client_metadata: None,
+            responsesapi_client_metadata_patch: None,
         })
         .await?;
     let accepted: TurnSteerResponse =
@@ -1490,6 +1515,7 @@ async fn realtime_start_can_skip_startup_context() -> Result<()> {
             realtime_end_instructions: None,
             prompt: None,
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -1588,6 +1614,7 @@ async fn realtime_text_output_modality_requests_text_output_and_final_transcript
             realtime_end_instructions: None,
             prompt: None,
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -1704,6 +1731,7 @@ async fn realtime_list_voices_returns_supported_names() -> Result<()> {
                     RealtimeVoice::Marin,
                     RealtimeVoice::Cedar,
                 ],
+                v3: RealtimeVoicesList::builtin().v3,
                 default_v1: RealtimeVoice::Cove,
                 default_v2: RealtimeVoice::Marin,
             },
@@ -1713,16 +1741,32 @@ async fn realtime_list_voices_returns_supported_names() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn realtime_conversation_stop_emits_closed_notification() -> Result<()> {
+#[test_matrix([ThreadHistoryMode::Paginated, ThreadHistoryMode::Legacy], [false, true])]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn realtime_conversation_stop_emits_closed_notification(
+    history_mode: ThreadHistoryMode,
+    running: bool,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
-    let responses_server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let responses_server = MockServer::start().await;
+    let (response_tx, response_rx) = mpsc::channel();
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses$"))
+        .respond_with(GatedSseResponse {
+            gate_rx: Mutex::new(Some(response_rx)),
+            response: create_final_assistant_message_sse_response("Done.")?,
+        })
+        .mount(&responses_server)
+        .await;
     let realtime_server = start_websocket_server(vec![vec![
-        vec![json!({
-            "type": "session.updated",
-            "session": { "id": "sess_backend", "instructions": "backend prompt" }
-        })],
+        vec![
+            json!({
+                "type": "session.updated",
+                "session": { "id": "sess_backend", "instructions": "backend prompt" }
+            }),
+            json!({"type": "conversation.input_transcript.delta", "delta": "final words"}),
+        ],
         vec![],
     ]])
     .await;
@@ -1742,16 +1786,38 @@ async fn realtime_conversation_stop_emits_closed_notification() -> Result<()> {
     login_with_api_key(&mut mcp, "sk-test-key").await?;
 
     let thread_start_request_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            history_mode: Some(history_mode),
+            ..Default::default()
+        })
         .await?;
     let thread_start: ThreadStartResponse =
         timeout(DEFAULT_TIMEOUT, mcp.read_response(thread_start_request_id)).await??;
+
+    let running_turn_id = if running {
+        let request = mcp
+            .send_turn_start_request(TurnStartParams {
+                thread_id: thread_start.thread.id.clone(),
+                input: vec![V2UserInput::Text {
+                    text: "keep working".into(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            })
+            .await?;
+        let response: TurnStartResponse =
+            timeout(DEFAULT_TIMEOUT, mcp.read_response(request)).await??;
+        read_notification::<ItemCompletedNotification>(&mut mcp, "item/completed").await?;
+        Some(response.turn.id)
+    } else {
+        None
+    };
 
     let start_request_id = mcp
         .send_thread_realtime_start_request(ThreadRealtimeStartParams {
             client_managed_handoffs: None,
             delegation_ack_filler: None,
-            flush_transcript_tail_on_session_end: None,
+            flush_transcript_tail_on_session_end: Some(true),
             codex_responses_as_items: None,
             codex_response_item_prefix: None,
             codex_response_handoff_mode: None,
@@ -1766,8 +1832,9 @@ async fn realtime_conversation_stop_emits_closed_notification() -> Result<()> {
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
-            version: None,
+            version: Some(RealtimeConversationVersion::V1),
             voice: None,
         })
         .await?;
@@ -1777,6 +1844,12 @@ async fn realtime_conversation_stop_emits_closed_notification() -> Result<()> {
     let started =
         read_notification::<ThreadRealtimeStartedNotification>(&mut mcp, "thread/realtime/started")
             .await?;
+    let transcript = read_notification::<ThreadRealtimeTranscriptDeltaNotification>(
+        &mut mcp,
+        "thread/realtime/transcript/delta",
+    )
+    .await?;
+    assert_eq!(transcript.delta, "final words");
 
     let stop_request_id = mcp
         .send_thread_realtime_stop_request(ThreadRealtimeStopParams {
@@ -1794,6 +1867,84 @@ async fn realtime_conversation_stop_emits_closed_notification() -> Result<()> {
         closed.reason.as_deref(),
         Some("requested" | "transport_closed")
     ));
+
+    // The parent's handback uses this API immediately after Closed, even when
+    // the child's model response is still blocked on response_tx above.
+    let turns = if history_mode == ThreadHistoryMode::Paginated {
+        let request = mcp
+            .send_thread_items_list_request(ThreadItemsListParams {
+                thread_id: started.thread_id.clone(),
+                turn_id: None,
+                cursor: None,
+                limit: None,
+                sort_direction: None,
+            })
+            .await?;
+        let items: ThreadItemsListResponse =
+            timeout(DEFAULT_TIMEOUT, mcp.read_response(request)).await??;
+        let tails = items.data.iter().filter(|entry| matches!(
+            &entry.item, ThreadItem::UserMessage { content, .. }
+            if content.iter().any(|part| matches!(part, V2UserInput::Text { text, .. }
+                if text.contains("<source>transcript_tail_flush</source>") && text.contains("user: final words")))
+        )).collect::<Vec<_>>();
+        assert_eq!(tails.len(), 1);
+        if let Some(id) = &running_turn_id {
+            assert_eq!(&tails[0].turn_id, id);
+        }
+        let request = mcp
+            .send_thread_turns_list_request(ThreadTurnsListParams {
+                thread_id: started.thread_id.clone(),
+                cursor: None,
+                limit: None,
+                sort_direction: None,
+                items_view: None,
+            })
+            .await?;
+        let turns: ThreadTurnsListResponse =
+            timeout(DEFAULT_TIMEOUT, mcp.read_response(request)).await??;
+        assert_eq!(tails[0].turn_id, turns.data[0].id);
+        turns.data
+    } else {
+        let request = mcp
+            .send_thread_read_request(ThreadReadParams {
+                thread_id: started.thread_id.clone(),
+                include_turns: true,
+            })
+            .await?;
+        let history: ThreadReadResponse =
+            timeout(DEFAULT_TIMEOUT, mcp.read_response(request)).await??;
+        assert_eq!(history.thread.turns.iter().flat_map(|turn| &turn.items).filter(|item| matches!(
+            item, ThreadItem::UserMessage { content, .. }
+            if content.iter().any(|part| matches!(part, V2UserInput::Text { text, .. }
+                if text.contains("<source>transcript_tail_flush</source>") && text.contains("user: final words")))
+        )).count(), 1);
+        history.thread.turns
+    };
+    assert_eq!(turns.len(), 1);
+    assert_eq!(
+        turns[0].status,
+        if running {
+            TurnStatus::InProgress
+        } else {
+            TurnStatus::Completed
+        }
+    );
+    assert_eq!(Uuid::parse_str(&turns[0].id)?.get_version_num(), 7);
+
+    response_tx.send(())?;
+    if running {
+        let completed =
+            read_notification::<TurnCompletedNotification>(&mut mcp, "turn/completed").await?;
+        assert_eq!(Some(completed.turn.id), running_turn_id);
+    }
+    assert_eq!(
+        responses_server
+            .received_requests()
+            .await
+            .expect("request recording is enabled")
+            .len(),
+        usize::from(running)
+    );
 
     realtime_server.shutdown().await;
     Ok(())
@@ -1840,6 +1991,7 @@ async fn realtime_mode_uses_client_instructions_on_entry_and_exit() -> Result<()
             realtime_end_instructions: Some(end_instructions.to_string()),
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -2126,6 +2278,7 @@ async fn realtime_webrtc_start_emits_sdp_notification() -> Result<()> {
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: Some(ThreadRealtimeStartTransport::Webrtc {
                 sdp: "v=offer\r\n".to_string(),
             }),
@@ -2318,6 +2471,7 @@ async fn existing_call_attaches_without_reinitializing_the_client_session(
     expected_handshake_uri: &str,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
+    let voice_session_id = "voice-session-client-owned";
 
     let mut harness = RealtimeE2eHarness::new(
         RealtimeTestVersion::V1,
@@ -2345,6 +2499,7 @@ async fn existing_call_attaches_without_reinitializing_the_client_session(
             realtime_end_instructions: None,
             prompt: None,
             realtime_session_id: realtime_session_id.map(str::to_string),
+            voice_session_id: Some(voice_session_id.to_string()),
             transport: Some(ThreadRealtimeStartTransport::ExistingCall {
                 call_id: "rtc_existing".to_string(),
             }),
@@ -2381,6 +2536,14 @@ async fn existing_call_attaches_without_reinitializing_the_client_session(
     assert_eq!(
         harness.realtime_server.single_handshake().uri(),
         expected_handshake_uri
+    );
+    assert_eq!(
+        harness
+            .realtime_server
+            .single_handshake()
+            .header("voice-session-id")
+            .as_deref(),
+        Some(voice_session_id)
     );
     assert!(
         harness.realtime_server.single_connection().is_empty(),
@@ -2434,6 +2597,7 @@ async fn existing_call_rejects_client_owned_session_configuration(option: &str) 
         realtime_end_instructions: None,
         prompt: None,
         realtime_session_id: None,
+        voice_session_id: None,
         transport: Some(ThreadRealtimeStartTransport::ExistingCall {
             call_id: "rtc_existing".to_string(),
         }),
@@ -3606,6 +3770,8 @@ async fn websocket_v2_background_agent_steering_ack_requests_response_create() -
     // the background-agent handoff stays active while realtime sends a second
     // tool call that should steer the active task.
     let main_loop_responses_server = responses::start_mock_server().await;
+    let request_received = Arc::new(Notify::new());
+    let notify_request_received = Arc::clone(&request_received);
     let (gate_completed_tx, gate_completed_rx) = mpsc::channel();
     let gated_response = responses::sse(vec![
         responses::ev_response_created("resp-1"),
@@ -3614,6 +3780,10 @@ async fn websocket_v2_background_agent_steering_ack_requests_response_create() -
     ]);
     Mock::given(method("POST"))
         .and(path_regex(".*/responses$"))
+        .and(move |_: &WiremockRequest| {
+            notify_request_received.notify_one();
+            true
+        })
         .respond_with(GatedSseResponse {
             gate_rx: Mutex::new(Some(gate_completed_rx)),
             response: gated_response,
@@ -3629,8 +3799,11 @@ async fn websocket_v2_background_agent_steering_ack_requests_response_create() -
             vec![
                 session_updated("sess_v2_steering_ack"),
                 v2_background_agent_tool_call("call_active", "start a task"),
-                v2_background_agent_tool_call("call_steer", "steer the active task"),
             ],
+            vec![v2_background_agent_tool_call(
+                "call_steer",
+                "steer the active task",
+            )],
             vec![],
             vec![],
             vec![],
@@ -3647,22 +3820,40 @@ async fn websocket_v2_background_agent_steering_ack_requests_response_create() -
         .await?;
     assert_eq!(turn_started.thread_id, harness.thread_id);
 
-    // Phase 2: the second tool call happens while `call_active` is still
-    // running, so app-server sends a steering acknowledgement as a function-call
-    // output for the second call.
+    // Phase 2: wait for the first model request, then use an audio frame to
+    // release the scripted steering call while the first response remains blocked.
+    timeout(DEFAULT_TIMEOUT, request_received.notified()).await?;
+    harness.append_audio(harness.thread_id.clone()).await?;
+    assert_eq!(
+        harness.sideband_outbound_request(/*request_index*/ 1).await["type"],
+        "input_audio_buffer.append",
+    );
     assert_v2_function_call_output(
-        &harness.sideband_outbound_request(/*request_index*/ 1).await,
+        &harness.sideband_outbound_request(/*request_index*/ 2).await,
         "call_steer",
         V2_STEERING_ACKNOWLEDGEMENT,
     );
 
     // Phase 3: realtime needs a `response.create` after the steering
     // acknowledgement so it can surface that acknowledgement to the user.
-    assert_v2_response_create(&harness.sideband_outbound_request(/*request_index*/ 2).await);
+    assert_v2_response_create(&harness.sideband_outbound_request(/*request_index*/ 3).await);
 
-    // Phase 4: release the gated delegated turn. Codex should then continue
-    // the same run with the steering text included in the follow-up Responses
-    // request, proving realtime did not merely acknowledge and drop it.
+    // Phase 4: the handoff notification follows core admission; the acknowledgement
+    // above does not. Wait for routing before releasing the first response.
+    timeout(
+        DEFAULT_TIMEOUT,
+        harness.mcp.read_stream_until_matching_notification(
+            "steering handoff routed",
+            |notification| {
+                notification.method == "thread/realtime/itemAdded"
+                    && notification.params.as_ref().is_some_and(|params| {
+                        params["item"]["type"] == "handoff_request"
+                            && params["item"]["handoff_id"] == "call_steer"
+                    })
+            },
+        ),
+    )
+    .await??;
     let _ = gate_completed_tx.send(());
     let turn_completed = harness
         .read_notification::<TurnCompletedNotification>("turn/completed")
@@ -3672,9 +3863,14 @@ async fn websocket_v2_background_agent_steering_ack_requests_response_create() -
     let requests = harness.main_loop_responses_requests().await?;
     assert_eq!(requests.len(), 2);
     assert!(
+        !response_request_contains_text(&requests[0], "steer the active task"),
+        "first Responses request should precede steering: {}",
+        requests[0],
+    );
+    assert!(
         response_request_contains_text(&requests[1], "steer the active task"),
-        "follow-up Responses request should contain steering prompt: {}",
-        requests[1]
+        "second Responses request should contain steering prompt: {}",
+        requests[1],
     );
 
     harness.shutdown().await;
@@ -3954,6 +4150,7 @@ async fn realtime_webrtc_start_surfaces_backend_error() -> Result<()> {
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: Some(ThreadRealtimeStartTransport::Webrtc {
                 sdp: "v=offer\r\n".to_string(),
             }),

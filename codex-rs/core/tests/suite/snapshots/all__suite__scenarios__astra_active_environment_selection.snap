@@ -6,15 +6,15 @@ Scenario: Astra starts in one workspace, switches for the next step of the activ
 
 ## Window 1
 -- request 1 (turn) --
-00:additional_tools/developer (3; hash=b1e101cdca5088a0):
-        - namespace/functions; hash=dead25325ac79c67
+00:additional_tools/developer (3; hash=62160ed28e692c35):
+        - namespace/functions; hash=4261ffb241688b3d
           - custom/exec
           - function/wait
           - function/request_user_input
           - function/request_user_input_async
         - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
           - function/sleep
-        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=fd994b11525da73c
+        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=2c8d6295978dbe63
           - function/followup_task
           - function/interrupt_agent
           - function/list_agents
@@ -90,7 +90,7 @@ Scenario: Astra starts in one workspace, switches for the next step of the activ
 
     There are 4 available concurrency slots, meaning that up to 4 agents can be active at once, including you.
 
-    Full-history forks (`fork_turns` omitted or `"all"`) inherit the parent model and reasoning effort and d...ne"` or a positive integer string.</multi_agent_role> [hash=c7f52e90688299ce]
+    Full-history forks (`fork_turns` omitted or `"all"`) inherit the parent model and reasoning effort and d... so, set `fork_turns` to `"none"`.</multi_agent_role> [hash=d5928243dc643bcc]
 04:message/developer:
     <multi_agent_mode>Any earlier instruction enabling proactive multi-agent delegation no longer applies. D...elegation, or parallel agent work.</multi_agent_mode> [hash=2b6e037067b4390c]
 05:message/user:
@@ -103,10 +103,11 @@ Scenario: Astra starts in one workspace, switches for the next step of the activ
     </environment_context>
 06:message/user:
     Ask before continuing in the other workspace.
+07:configuration_update:reasoning={"effort":"low"}
 -- request 2 (turn) --
-07:function_call/functions.request_user_input:{"questions":[{"header":"Continue","id":"continue","options":[{"description":"Continue working.","label"...o"}],"question":"Continue in the other workspace?"}]} [hash=028e565351844d96]
-08:function_call_output:{"answers":{"continue":{"answers":["Yes"]}}}
-09:message/user:
+08:function_call/functions.request_user_input:{"questions":[{"header":"Continue","id":"continue","options":[{"description":"Continue working.","label"...o"}],"question":"Continue in the other workspace?"}]} [hash=028e565351844d96]
+09:function_call_output:{"answers":{"continue":{"answers":["Yes"]}}}
+10:message/user:
     <environment_context>
       <cwd><CWD>/other-workspace</cwd>
       <shell><HOST_SHELL></shell>
@@ -115,9 +116,9 @@ Scenario: Astra starts in one workspace, switches for the next step of the activ
       <filesystem><workspace_roots><root><CWD>/other-workspace</root></workspace_roots><permission_profile t...ntry></file_system></permission_profile></filesystem> [hash=0be8191a0451377a]
     </environment_context>
 -- request 3 (turn) --
-10:message/assistant:
+11:message/assistant:
     I continued in the other workspace.
-11:message/user:
+12:message/user:
     <environment_context>
       <cwd><CWD></cwd>
       <shell><HOST_SHELL></shell>
@@ -125,5 +126,5 @@ Scenario: Astra starts in one workspace, switches for the next step of the activ
       <timezone><HOST_TIMEZONE></timezone>
       <filesystem><workspace_roots><root><CWD></root></workspace_roots><permission_profile type="managed"><f...ntry></file_system></permission_profile></filesystem> [hash=e8c1de60307d0a3d]
     </environment_context>
-12:message/user:
+13:message/user:
     Which workspace are you using now?

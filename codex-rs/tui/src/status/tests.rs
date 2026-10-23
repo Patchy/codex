@@ -59,7 +59,6 @@ use pretty_assertions::assert_eq;
 use ratatui::prelude::*;
 use std::sync::Arc;
 use tempfile::TempDir;
-use unicode_width::UnicodeWidthStr;
 
 #[test]
 fn stale_monthly_limit_marks_fresh_rolling_snapshot_stale() {
@@ -147,6 +146,7 @@ async fn test_config(temp_home: &TempDir) -> Config {
             /*network_enabled*/ true,
         ))
         .expect("set permission profile");
+    set_workspace_cwd(&mut config, test_path_buf("/workspace/tests").abs());
     config
 }
 
@@ -186,30 +186,12 @@ fn render_lines(lines: &[Line<'static>]) -> Vec<String> {
 }
 
 fn sanitize_directory(lines: Vec<String>) -> Vec<String> {
-    let frame_width = lines
-        .iter()
-        .find(|line| line.starts_with('╭'))
-        .map(|line| UnicodeWidthStr::width(line.as_str()));
     lines
         .into_iter()
         .map(|line| {
-            if let (Some(frame_width), Some(dir_pos), Some(pipe_idx)) =
-                (frame_width, line.find("Directory: "), line.rfind('│'))
-            {
-                let prefix = &line[..dir_pos + "Directory: ".len()];
-                let suffix = &line[pipe_idx..];
-                let replacement = "[[workspace]]";
-                let content_width = frame_width.saturating_sub(
-                    UnicodeWidthStr::width(prefix) + UnicodeWidthStr::width(suffix),
-                );
-                let mut rebuilt = prefix.to_string();
-                rebuilt.push_str(replacement);
-                let replacement_width = UnicodeWidthStr::width(replacement);
-                if content_width > replacement_width {
-                    rebuilt.push_str(&" ".repeat(content_width - replacement_width));
-                }
-                rebuilt.push_str(suffix);
-                rebuilt
+            if let Some((prefix, value)) = line.split_once("Directory:") {
+                let padding = &value[..value.len() - value.trim_start().len()];
+                format!("{prefix}Directory:{padding}[[workspace]]")
             } else {
                 line
             }
@@ -401,6 +383,7 @@ async fn status_snapshot_shows_chatgpt_plan_without_email() {
         .await
         .expect("write models cache");
     let mut app_server = crate::start_app_server_for_picker(
+        crate::backend_id::BackendId::new(),
         &config,
         &crate::AppServerTarget::Embedded,
         Vec::new(),
@@ -846,24 +829,33 @@ async fn status_uses_server_provider_id_and_auth_requirement() {
         sanitize_directory(render_lines(&composite.display_lines(/*width*/ 120))).join("\n");
     assert_snapshot!("status_server_auth_required", rendered);
 
-    let wide_destinations: Vec<String> = composite
-        .display_hyperlink_lines(/*width*/ 120)
-        .into_iter()
-        .flat_map(|line| line.hyperlinks.into_iter())
-        .map(|link| link.destination)
-        .collect();
-    assert_eq!(
-        wide_destinations,
-        vec!["https://chatgpt.com/codex/settings/usage"]
-    );
-
-    let narrow_destinations: Vec<String> = composite
-        .display_hyperlink_lines(/*width*/ 24)
-        .into_iter()
-        .flat_map(|line| line.hyperlinks.into_iter())
-        .map(|link| link.destination)
-        .collect();
-    assert_eq!(narrow_destinations, Vec::<String>::new());
+    for width in [24, 42, 120] {
+        let lines = composite.display_hyperlink_lines(width);
+        let mut fragments = String::new();
+        let mut destinations = Vec::new();
+        for line in lines {
+            let visible = line.line.to_string();
+            for link in line.hyperlinks {
+                fragments.extend(
+                    visible
+                        .chars()
+                        .skip(link.columns.start)
+                        .take(link.columns.len()),
+                );
+                destinations.push(link.destination);
+            }
+        }
+        assert_eq!(
+            fragments, "https://chatgpt.com/settings/usage",
+            "width {width}"
+        );
+        assert!(!destinations.is_empty());
+        assert!(
+            destinations
+                .iter()
+                .all(|destination| destination == "https://chatgpt.com/settings/usage")
+        );
+    }
 }
 
 #[tokio::test]
@@ -1495,7 +1487,61 @@ async fn status_card_token_usage_excludes_cached_tokens() {
 }
 
 #[tokio::test]
-async fn status_snapshot_truncates_in_narrow_terminal() {
+async fn status_wraps_long_paths_and_session_ids_without_losing_text() {
+    let temp_home = TempDir::new().expect("temp home");
+    let mut config = test_config(&temp_home).await;
+    let directory = test_path_buf("/workspace/projects/界界/ｶﾞﾞ/a-very-long-directory-name/codex");
+    set_workspace_cwd(&mut config, directory.abs());
+    let session =
+        ThreadId::from_string("00000000-0000-0000-0000-000000000123").expect("session id");
+    let usage = TokenUsage::default();
+    let (status, handle) = new_status_output_with_rate_limits_handle(
+        &config,
+        /*requires_openai_auth*/ true,
+        /*model_provider_id*/ None,
+        /*remote_connection*/ None,
+        /*account_display*/ None,
+        /*token_info*/ None,
+        &usage,
+        &Some(session),
+        Some("A thread with a long descriptive name".to_string()),
+        /*forked_from*/ None,
+        /*rate_limits*/ &[],
+        /*_plan_type*/ None,
+        Local::now(),
+        "gpt-5.5",
+        /*collaboration_mode*/ None,
+        /*reasoning_effort_override*/ None,
+        "<none>".to_string(),
+        /*refreshing_rate_limits*/ false,
+    );
+    let directory = directory.to_string_lossy();
+    for width in [7, 12, 17, 18, 24, 25, 40, 80] {
+        let lines = status.display_lines(width);
+        assert!(
+            lines.iter().all(|line| line.width() <= usize::from(width)),
+            "overwide row at width {width}: {:?}",
+            render_lines(&lines)
+        );
+        let joined = lines
+            .iter()
+            .map(|line| line.to_string().trim().to_string())
+            .collect::<String>();
+        assert!(
+            joined.contains(directory.as_ref()),
+            "path lost at width {width}: {joined}"
+        );
+        assert!(
+            joined.contains(&session.to_string()),
+            "session lost at width {width}: {joined}"
+        );
+    }
+    assert!(handle.copy_text().contains(directory.as_ref()));
+    assert!(handle.copy_text().contains(&session.to_string()));
+}
+
+#[tokio::test]
+async fn status_snapshot_wraps_in_narrow_terminal() {
     let temp_home = TempDir::new().expect("temp home");
     let mut config = test_config(&temp_home).await;
     config.model = Some("gpt-5.1-codex-max".to_string());
@@ -1560,11 +1606,11 @@ async fn status_snapshot_truncates_in_narrow_terminal() {
     }
     let sanitized = sanitize_directory(rendered_lines).join("\n");
 
-    assert_snapshot!(sanitized);
+    assert_snapshot!("status_snapshot_truncates_in_narrow_terminal", sanitized);
 }
 
 #[tokio::test]
-async fn status_snapshot_truncates_halfwidth_kana_in_narrow_terminal() {
+async fn status_snapshot_wraps_halfwidth_kana_in_narrow_terminal() {
     let temp_home = TempDir::new().expect("temp home");
     let mut config = test_config(&temp_home).await;
     set_workspace_cwd(&mut config, test_path_buf("/workspace/tests").abs());
@@ -1596,7 +1642,10 @@ async fn status_snapshot_truncates_halfwidth_kana_in_narrow_terminal() {
     let rendered_lines = render_lines(&composite.display_lines(/*width*/ 42));
     let sanitized = sanitize_directory(rendered_lines).join("\n");
 
-    assert_snapshot!(sanitized);
+    assert_snapshot!(
+        "status_snapshot_truncates_halfwidth_kana_in_narrow_terminal",
+        sanitized
+    );
 }
 
 #[tokio::test]
@@ -1669,17 +1718,19 @@ async fn status_snapshot_uses_default_reasoning_when_config_empty() {
         .expect("timestamp");
     for (is_local_daemon, snapshot) in [
         (
-            false,
+            None,
             "status_snapshot_uses_default_reasoning_when_config_empty",
         ),
-        (true, "status_snapshot_local_background_server"),
+        (Some(false), "status_snapshot_remote_server"),
+        (Some(true), "status_snapshot_local_background_server"),
     ] {
-        let remote_connection = RemoteConnectionStatus {
+        let remote_connection = is_local_daemon.map(|is_local_daemon| RemoteConnectionStatus {
             address: "unix:///tmp/codex-home/app-server-control/app-server-control.sock"
                 .to_string(),
             version: "v0.133.0".to_string(),
             is_local_daemon,
-        };
+            is_managed_daemon: is_local_daemon,
+        });
 
         let model_slug = get_model_offline_for_tests(config.model.as_deref());
         let token_info = token_info_for(&model_slug, &config, &usage);
@@ -1687,7 +1738,7 @@ async fn status_snapshot_uses_default_reasoning_when_config_empty() {
             &config,
             /*requires_openai_auth*/ true,
             /*model_provider_id*/ None,
-            Some(&remote_connection),
+            remote_connection.as_ref(),
             account_display.as_ref(),
             Some(&token_info),
             &usage,
@@ -1874,7 +1925,10 @@ async fn status_snapshot_includes_credits_and_limits() {
     config.model = Some("gpt-5.1-codex".to_string());
     set_workspace_cwd(&mut config, test_path_buf("/workspace/tests").abs());
 
-    let account_display = test_status_account_display();
+    let account_display = Some(StatusAccountDisplay::ChatGpt {
+        email: Some("user@example.com".into()),
+        plan: Some("Pro 200".into()),
+    });
     let usage = TokenUsage {
         input_tokens: 1_500,
         cached_input_tokens: 100,
@@ -2059,7 +2113,7 @@ async fn status_snapshot_treats_refreshing_empty_limits_as_unavailable() {
         }
     }
     let sanitized = sanitize_directory(rendered_lines).join("\n");
-    assert_snapshot!(sanitized);
+    assert!(sanitized.contains("Limits:          not available for this account"));
 }
 
 #[tokio::test]

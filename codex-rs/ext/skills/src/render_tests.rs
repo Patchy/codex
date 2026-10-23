@@ -9,6 +9,7 @@ use crate::provider::SkillProvider;
 use codex_exec_server::LOCAL_FS;
 use codex_extension_api::ContextualUserFragment;
 use codex_protocol::protocol::SkillScope;
+use codex_protocol_test_support::ContentItemTestExt;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
@@ -20,6 +21,25 @@ use crate::catalog_prompt::render_available_skills_body;
 use crate::loader::HostSkillRoot;
 use crate::loader::load_and_merge_host_skill_roots;
 
+fn render_combined_available_skills(
+    executor_catalog: &SkillCatalog,
+    cloud_catalog: &SkillCatalog,
+    host_catalog: &SkillCatalog,
+    budget: SkillMetadataBudget,
+    include_skills_usage_instructions: bool,
+) -> RenderedSkillCatalogs {
+    render_prepared_skill_catalogs(
+        &PreparedSkillCatalog::new(
+            executor_catalog,
+            SkillCatalogRenderPolicy::ExtensionCompatible,
+        ),
+        &PreparedSkillCatalog::new(cloud_catalog, SkillCatalogRenderPolicy::ExtensionCompatible),
+        &PreparedSkillCatalog::new(host_catalog, SkillCatalogRenderPolicy::CoreCompatible),
+        budget,
+        include_skills_usage_instructions,
+    )
+}
+
 #[test]
 fn skill_prompt_contents_are_bounded_at_utf8_boundaries() {
     let contents = format!("{}é", "a".repeat(MAX_SKILL_PROMPT_BYTES - 1));
@@ -28,6 +48,63 @@ fn skill_prompt_contents_are_bounded_at_utf8_boundaries() {
 
     assert_eq!(bounded.len(), MAX_SKILL_PROMPT_BYTES - 1);
     assert_eq!(truncated, true);
+}
+
+#[test]
+fn prebudget_dedup_can_choose_full_locators_over_preserved_aliases() {
+    let hidden_root = format!("skill://executor/{}", "long-package-root/".repeat(40));
+    let mut hidden = entry(
+        "demo:hidden",
+        "Hidden duplicate.",
+        /*short_description*/ None,
+    )
+    .with_alias_root(hidden_root.clone());
+    hidden.authority.kind = SkillSourceKind::Executor;
+    hidden.id = SkillPackageId(format!("{hidden_root}/hidden"));
+    let mut visible = entry(
+        "other:visible",
+        "Keep this description.",
+        /*short_description*/ None,
+    )
+    .with_alias_root("skill://short");
+    visible.authority.kind = SkillSourceKind::Executor;
+    visible.id = SkillPackageId("skill://short/visible".to_string());
+    let executor = SkillCatalog {
+        is_partial: false,
+        entries: vec![hidden.clone(), visible],
+        warnings: Vec::new(),
+    };
+    hidden.authority.kind = SkillSourceKind::Cloud;
+    let cloud = SkillCatalog {
+        is_partial: false,
+        entries: vec![hidden],
+        warnings: Vec::new(),
+    };
+    let mut prepared =
+        PreparedSkillCatalog::new(&executor, SkillCatalogRenderPolicy::ExtensionCompatible);
+    prepared.prefer_cloud_skills(&cloud);
+    let rendered = prepared
+        .render(
+            SkillMetadataBudget::Characters(300),
+            /*include_skills_usage_instructions*/ false,
+        )
+        .expect("remaining executor skill should render");
+    assert!(rendered.skill_root_lines.is_empty());
+    assert_eq!(
+        rendered.skill_lines,
+        vec![
+            "- other:visible: Keep this description. (executor package: skill://short/visible)"
+                .to_string(),
+        ]
+    );
+    assert_eq!(
+        rendered.report,
+        SkillRenderReport {
+            total_count: 1,
+            included_count: 1,
+            ..Default::default()
+        }
+    );
 }
 
 fn entry(name: &str, description: &str, short_description: Option<&str>) -> SkillCatalogEntry {
@@ -58,6 +135,7 @@ fn entry_with_path(
 #[test]
 fn ordering_follows_render_policy() {
     let catalog = SkillCatalog {
+        is_partial: false,
         entries: [
             ("repo-zeta", SkillScope::Repo, "/skills/repo-zeta/SKILL.md"),
             (
@@ -104,6 +182,7 @@ fn ordering_follows_render_policy() {
         )
         .expect("catalog should render")
         .body()
+        .expect_text()
     };
 
     assert_eq!(
@@ -141,6 +220,7 @@ fn ordering_follows_render_policy() {
 #[test]
 fn description_selection_follows_render_policy() {
     let catalog = SkillCatalog {
+        is_partial: false,
         entries: vec![
             entry("shortened", "full description", Some("short description")),
             entry(
@@ -168,7 +248,7 @@ fn description_selection_follows_render_policy() {
     .expect("catalog should render");
 
     assert_eq!(
-        core.body(),
+        core.body().expect_text(),
         render_available_skills_body(
             SkillPromptKind::Unaliased,
             &[],
@@ -179,7 +259,7 @@ fn description_selection_follows_render_policy() {
         )
     );
     assert_eq!(
-        extension.body(),
+        extension.body().expect_text(),
         render_available_skills_body(
             SkillPromptKind::Unaliased,
             &[],
@@ -221,6 +301,7 @@ fn catalog_budget_uses_context_percentage_or_character_fallback() {
 fn host_only_prompts_preserve_existing_behavior_with_and_without_aliases() {
     let root = "/Users/test/.codex/plugins/cache/openai-curated/host-plugin/1.0.0/skills-with-a-long-shared-root";
     let unaliased_catalog = SkillCatalog {
+        is_partial: false,
         entries: [
             ("alpha", "Alpha skill."),
             ("beta", "Beta skill."),
@@ -235,6 +316,7 @@ fn host_only_prompts_preserve_existing_behavior_with_and_without_aliases() {
         warnings: Vec::new(),
     };
     let catalog = SkillCatalog {
+        is_partial: false,
         entries: [
             ("alpha", "Alpha skill."),
             ("beta", "Beta skill."),
@@ -257,7 +339,7 @@ fn host_only_prompts_preserve_existing_behavior_with_and_without_aliases() {
         SkillMetadataBudget::Characters(usize::MAX),
     )
     .expect("unaliased host catalog should render");
-    insta::assert_snapshot!(unaliased.body(), @r###"
+    insta::assert_snapshot!(unaliased.body().expect_text(), @r###"
 
     ## Skills
     A skill is a set of instructions provided through a `SKILL.md` source. Below is the list of skills that can be used. Each entry includes a name, description, and source locator. `file` locators are on the host filesystem, `executor package` locators are owned by their execution environment, `cloud package` locators are opaque package identifiers, and `custom resource` locators use their provider's access mechanism.
@@ -292,7 +374,7 @@ fn host_only_prompts_preserve_existing_behavior_with_and_without_aliases() {
         SkillMetadataBudget::Characters(200),
     )
     .expect("aliased host catalog should render");
-    insta::assert_snapshot!(aliased.body(), @r###"
+    insta::assert_snapshot!(aliased.body().expect_text(), @r###"
 
     ## Skills
     A skill is a set of local instructions to follow that is stored in a `SKILL.md` file. Below is the list of skills that can be used. Each entry includes a name, description, and a short path that can be expanded into an absolute path using the skill roots table.
@@ -327,6 +409,7 @@ fn host_only_prompts_preserve_existing_behavior_with_and_without_aliases() {
 fn path_aliases_are_used_without_budget_pressure_when_they_reduce_prompt_size() {
     let root = "/Users/test/.codex/plugins/cache/openai-curated/example/hash/skills";
     let catalog = SkillCatalog {
+        is_partial: false,
         entries: vec![
             entry("alpha", "Alpha skill.", /*short_description*/ None)
                 .with_display_path(format!("{root}/alpha/SKILL.md"))
@@ -346,8 +429,13 @@ fn path_aliases_are_used_without_budget_pressure_when_they_reduce_prompt_size() 
     )
     .expect("catalog should render");
 
-    assert!(fragment.body().contains("### Skill roots"));
-    assert!(fragment.body().contains("(file: r0/alpha/SKILL.md)"));
+    assert!(fragment.body().expect_text().contains("### Skill roots"));
+    assert!(
+        fragment
+            .body()
+            .expect_text()
+            .contains("(file: r0/alpha/SKILL.md)")
+    );
 }
 
 #[test]
@@ -362,6 +450,7 @@ fn path_aliases_retain_every_skill_under_budget_pressure() {
         })
         .collect::<Vec<_>>();
     let catalog = SkillCatalog {
+        is_partial: false,
         entries,
         warnings: Vec::new(),
     };
@@ -378,7 +467,7 @@ fn path_aliases_retain_every_skill_under_budget_pressure() {
             SkillLine::with_locator(
                 entry,
                 SkillCatalogRenderPolicy::ExtensionCompatible,
-                render_skill_locator_with_aliases(entry, &plan),
+                render_skill_locator_with_aliases(entry, &plan, &mut HashSet::new()),
             )
             .minimum_cost(SkillMetadataBudget::Characters(usize::MAX)),
         )
@@ -398,7 +487,7 @@ fn path_aliases_retain_every_skill_under_budget_pressure() {
         SkillMetadataBudget::Characters(alias_minimum),
     )
     .expect("catalog should render");
-    let body = fragment.body();
+    let body = fragment.body().expect_text();
 
     assert!(body.contains(&format!("- `r0` = `{root}`")));
     assert!(body.contains("(file: r0/skill-0/SKILL.md)"));
@@ -421,7 +510,10 @@ fn executor_aliases_preserve_literal_backslashes_in_package_ids() {
     .with_alias_root(root);
     let plan = build_alias_plan(&[&entry]).expect("alias plan should build");
 
-    assert_eq!(render_skill_locator_with_aliases(&entry, &plan), "e0/demo");
+    assert_eq!(
+        render_skill_locator_with_aliases(&entry, &plan, &mut HashSet::new()),
+        "e0/demo"
+    );
 }
 
 #[tokio::test]
@@ -473,6 +565,7 @@ async fn host_alias_roots_follow_core_discovery_order() -> Result<(), Box<dyn st
             include_cloud_skills: false,
             mcp_resources: None,
             executor_capability_discovery: None,
+            executor_capability_discovery_v2: None,
         })
         .await?;
     let mut entries = catalog.entries.iter().collect::<Vec<_>>();
@@ -520,6 +613,7 @@ fn mixed_catalogs_keep_absolute_authority_aware_rendering_under_budget_pressure(
         .with_display_path("skill://executor/demo/SKILL.md"),
     );
     let catalog = SkillCatalog {
+        is_partial: false,
         entries,
         warnings: Vec::new(),
     };
@@ -540,7 +634,7 @@ fn mixed_catalogs_keep_absolute_authority_aware_rendering_under_budget_pressure(
         SkillMetadataBudget::Characters(absolute_minimum),
     )
     .expect("catalog should render");
-    let body = fragment.body();
+    let body = fragment.body().expect_text();
 
     assert!(!body.contains("### Skill roots"));
     assert!(body.contains(&format!("(file: {root}/skill-0/SKILL.md)")));
@@ -552,6 +646,7 @@ fn mixed_catalogs_keep_absolute_authority_aware_rendering_under_budget_pressure(
 #[test]
 fn mixed_catalog_reserves_executor_omission_marker_by_omitting_host_first() {
     let host_catalog = SkillCatalog {
+        is_partial: false,
         entries: vec![entry_with_path(
             "h", "", /*short_description*/ None, "/h",
         )],
@@ -568,6 +663,7 @@ fn mixed_catalog_reserves_executor_omission_marker_by_omitting_host_first() {
         .with_display_path(resource)
     };
     let executor_catalog = SkillCatalog {
+        is_partial: false,
         entries: vec![
             executor_entry("e1", "skill://executor/one"),
             executor_entry(
@@ -629,6 +725,7 @@ fn mixed_catalogs_alias_all_skill_sources_under_budget_pressure() {
     let host_root = "/Users/test/.codex/plugins/cache/openai-curated/example/hash1234567890/skills";
     let catalog =
         |source: SkillSourceKind, authority: &str, root: &str, prefix: &str| SkillCatalog {
+            is_partial: false,
             entries: (0..3)
                 .map(|index| {
                     let name = format!("{prefix}-{index}");
@@ -715,6 +812,7 @@ fn mixed_catalogs_alias_all_skill_sources_under_budget_pressure() {
 fn mixed_catalog_prefers_executor_inclusion_over_total_aliased_inclusion() {
     let root = format!("/{}", "r".repeat(219));
     let host_catalog = SkillCatalog {
+        is_partial: false,
         entries: ["h1", "h2"]
             .into_iter()
             .map(|name| {
@@ -736,6 +834,7 @@ fn mixed_catalog_prefers_executor_inclusion_over_total_aliased_inclusion() {
         .with_display_path(resource)
     };
     let executor_catalog = SkillCatalog {
+        is_partial: false,
         entries: vec![
             executor_entry("e1", "skill://executor/one"),
             executor_entry("e2", &format!("skill://{}", "e".repeat(132))),
@@ -744,6 +843,7 @@ fn mixed_catalog_prefers_executor_inclusion_over_total_aliased_inclusion() {
     };
     let cloud_resource = "skill://cloud/one";
     let cloud_catalog = SkillCatalog {
+        is_partial: false,
         entries: vec![
             SkillCatalogEntry::new(
                 SkillPackageId("c1".to_string()),
@@ -841,6 +941,7 @@ async fn singleton_plugin_versions_share_the_marketplace_alias_root()
             include_cloud_skills: false,
             mcp_resources: None,
             executor_capability_discovery: None,
+            executor_capability_discovery_v2: None,
         })
         .await?;
     let entries = catalog.entries.iter().collect::<Vec<_>>();
@@ -859,11 +960,11 @@ async fn singleton_plugin_versions_share_the_marketplace_alias_root()
         vec![format!("- `r0` = `{marketplace_root}`")]
     );
     assert_eq!(
-        render_skill_locator_with_aliases(github, &plan),
+        render_skill_locator_with_aliases(github, &plan, &mut HashSet::new()),
         "r0/github/hash123/skills/github/SKILL.md"
     );
     assert_eq!(
-        render_skill_locator_with_aliases(slack, &plan),
+        render_skill_locator_with_aliases(slack, &plan, &mut HashSet::new()),
         "r0/slack/hash456/skills/slack/SKILL.md"
     );
 
@@ -874,6 +975,7 @@ async fn singleton_plugin_versions_share_the_marketplace_alias_root()
 #[test]
 fn omission_notice_follows_render_policy_and_is_charged_to_catalog_budget() {
     let catalog = SkillCatalog {
+        is_partial: false,
         entries: (0..20)
             .map(|index| {
                 entry(
@@ -901,13 +1003,24 @@ fn omission_notice_follows_render_policy_and_is_charged_to_catalog_budget() {
     .expect("catalog should render");
     let rendered_metadata_cost = fragment
         .body()
+        .expect_text()
         .lines()
         .filter(|line| line.starts_with("- "))
         .map(|line| approx_token_count(&format!("{line}\n")))
         .sum::<usize>();
 
-    assert!(!core_fragment.body().contains("additional skills omitted"));
-    assert!(fragment.body().contains("additional skills omitted"));
+    assert!(
+        !core_fragment
+            .body()
+            .expect_text()
+            .contains("additional skills omitted")
+    );
+    assert!(
+        fragment
+            .body()
+            .expect_text()
+            .contains("additional skills omitted")
+    );
     assert!(rendered_metadata_cost <= 100);
 }
 
@@ -915,6 +1028,7 @@ fn omission_notice_follows_render_policy_and_is_charged_to_catalog_budget() {
 fn character_fallback_counts_multibyte_metadata_by_characters() {
     let description = "💡".repeat(MAX_CATALOG_SKILL_DESCRIPTION_CHARS);
     let catalog = SkillCatalog {
+        is_partial: false,
         entries: vec![
             entry(
                 "multibyte-one",
@@ -938,14 +1052,20 @@ fn character_fallback_counts_multibyte_metadata_by_characters() {
     )
     .expect("catalog should render");
 
-    assert!(fragment.body().contains("multibyte-one"));
-    assert!(fragment.body().contains("multibyte-two"));
-    assert!(!fragment.body().contains("additional skills omitted"));
+    assert!(fragment.body().expect_text().contains("multibyte-one"));
+    assert!(fragment.body().expect_text().contains("multibyte-two"));
+    assert!(
+        !fragment
+            .body()
+            .expect_text()
+            .contains("additional skills omitted")
+    );
 }
 
 #[test]
 fn catalog_report_counts_partial_description_truncation() {
     let catalog = SkillCatalog {
+        is_partial: false,
         entries: vec![entry(
             "partial",
             "abcdefghij",
@@ -964,6 +1084,7 @@ fn catalog_report_counts_partial_description_truncation() {
         SkillCatalogRenderPolicy::ExtensionCompatible,
         budget,
         /*include_skills_usage_instructions*/ false,
+        /*alias_plan*/ None,
     )
     .expect("catalog should render");
     assert_eq!(
@@ -979,7 +1100,7 @@ fn catalog_report_counts_partial_description_truncation() {
     let fragment = render
         .into_fragment(/*include_skills_usage_instructions*/ false)
         .expect("partial description should render");
-    assert!(fragment.body().contains(expected_line));
+    assert!(fragment.body().expect_text().contains(expected_line));
 }
 
 #[test]
@@ -991,6 +1112,7 @@ fn catalog_emits_omission_marker_when_every_minimum_skill_line_exceeds_budget() 
     )
     .with_display_path(format!("skill://{}", "x".repeat(512)));
     let catalog = SkillCatalog {
+        is_partial: false,
         entries: vec![oversized],
         warnings: Vec::new(),
     };
@@ -1014,19 +1136,21 @@ fn catalog_emits_omission_marker_when_every_minimum_skill_line_exceeds_budget() 
         SkillCatalogRenderPolicy::CoreCompatible,
         SkillMetadataBudget::Tokens(100),
         /*include_skills_usage_instructions*/ false,
+        /*alias_plan*/ None,
     )
     .expect("core-compatible report should render");
     assert_eq!(core_render.report, expected_report);
     let core_fragment = core_render
         .into_fragment(/*include_skills_usage_instructions*/ false)
         .expect("core-compatible rendering should preserve an empty skills fragment");
-    assert!(core_fragment.body().contains("## Skills"));
-    assert!(!core_fragment.body().contains("- oversized:"));
+    assert!(core_fragment.body().expect_text().contains("## Skills"));
+    assert!(!core_fragment.body().expect_text().contains("- oversized:"));
     let render = render_available_skills(
         &catalog,
         SkillCatalogRenderPolicy::ExtensionCompatible,
         SkillMetadataBudget::Tokens(100),
         /*include_skills_usage_instructions*/ false,
+        /*alias_plan*/ None,
     )
     .expect("catalog should render");
     assert_eq!(render.report, expected_report);
@@ -1034,10 +1158,11 @@ fn catalog_emits_omission_marker_when_every_minimum_skill_line_exceeds_budget() 
         .into_fragment(/*include_skills_usage_instructions*/ false)
         .expect("omission marker should fit");
 
-    assert!(!fragment.body().contains("- oversized:"));
+    assert!(!fragment.body().expect_text().contains("- oversized:"));
     assert!(
         fragment
             .body()
+            .expect_text()
             .contains("- 1 additional skill omitted from this bounded skills list.")
     );
 }
@@ -1051,6 +1176,7 @@ fn catalog_preserves_report_when_no_fragment_fits_budget() {
     )
     .with_display_path(format!("skill://{}", "x".repeat(512)));
     let catalog = SkillCatalog {
+        is_partial: false,
         entries: vec![oversized],
         warnings: Vec::new(),
     };
@@ -1060,6 +1186,7 @@ fn catalog_preserves_report_when_no_fragment_fits_budget() {
         SkillCatalogRenderPolicy::ExtensionCompatible,
         SkillMetadataBudget::Tokens(1),
         /*include_skills_usage_instructions*/ false,
+        /*alias_plan*/ None,
     )
     .expect("catalog should produce a report");
     assert_eq!(

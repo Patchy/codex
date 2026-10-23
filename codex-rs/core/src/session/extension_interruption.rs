@@ -6,12 +6,14 @@ use crate::codex_thread::CodexThread;
 use codex_extension_api::ThreadIdleCause;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
+use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::TurnAbortReason;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
+use tracing::Instrument;
 
 #[cfg(test)]
 #[path = "extension_interruption_tests.rs"]
@@ -85,8 +87,12 @@ impl Session {
         // The caller may be inside the task that cancellation must join.
         let _ = reply.send(active_turn.is_some());
         if let Some(active_turn) = active_turn {
-            self.finish_turn_abort(active_turn, TurnAbortReason::Interrupted)
-                .await;
+            self.finish_turn_abort(
+                active_turn,
+                TurnAbortReason::Interrupted,
+                /*error*/ None,
+            )
+            .await;
         }
     }
 
@@ -94,6 +100,7 @@ impl Session {
         self: &Arc<Self>,
         turn_id: &str,
         warning: EventMsg,
+        error: Option<ErrorEvent>,
     ) {
         let Some(turn) = self.turn_context_for_sub_id(turn_id).await else {
             return;
@@ -102,16 +109,21 @@ impl Session {
         let runtime = self.services.runtime_handle.clone();
         let session = Arc::clone(self);
         let turn_id = turn_id.to_owned();
-        drop(runtime.spawn(async move {
-            if session
-                .abort_turn_if_active(&turn_id, TurnAbortReason::Interrupted)
-                .await
-            {
-                // Extension aborts bypass normal task completion; user interrupts do not.
-                session
-                    .emit_thread_idle_lifecycle_if_idle(ThreadIdleCause::Interrupted)
-                    .await;
-            }
-        }));
+        drop(
+            runtime.spawn(
+                async move {
+                    if session
+                        .abort_turn_if_active(&turn_id, TurnAbortReason::Interrupted, error)
+                        .await
+                    {
+                        // Extension aborts bypass normal task completion; user interrupts do not.
+                        session
+                            .emit_thread_idle_lifecycle_if_idle(ThreadIdleCause::Interrupted)
+                            .await;
+                    }
+                }
+                .in_current_span(),
+            ),
+        );
     }
 }

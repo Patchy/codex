@@ -1,12 +1,15 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_exec_server::MAX_SELECTED_CAPABILITY_ROOTS;
 use codex_exec_server::SelectedCapabilityRootsStatus;
 use codex_execpolicy::Policy;
+use codex_features::Feature;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
+use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::EnvironmentConfig;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::TurnEnvironmentSelection;
@@ -14,6 +17,7 @@ use codex_protocol::sandbox::SandboxType;
 
 use crate::config::ConstraintError;
 use crate::config::ConstraintResult;
+use crate::config::ManagedFeatures;
 use crate::config::NetworkProxySpec;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::session::session::Session;
@@ -21,6 +25,7 @@ use crate::session::session::SessionConfiguration;
 use crate::session::session::SessionSettingsUpdate;
 
 /// Defaults for environments that inherit their configuration from the running turn.
+#[derive(Clone)]
 pub(crate) struct ThreadEnvironmentDefaults {
     pub(crate) common: EnvironmentConfig,
     // Chosen once when the session starts; it does not apply to remote environments.
@@ -47,6 +52,7 @@ impl ThreadEnvironmentDefaults {
 
 pub(super) fn validate_environment_configs(
     selections: &[TurnEnvironmentSelection],
+    features: &ManagedFeatures,
 ) -> ConstraintResult<()> {
     for selection in selections {
         match &selection.config {
@@ -54,7 +60,7 @@ pub(super) fn validate_environment_configs(
             | EnvironmentConfigState::Pending
             | EnvironmentConfigState::Failed(_) => {}
             EnvironmentConfigState::Ready(config) => {
-                validate_environment_config(selection, config).map_err(|error| {
+                validate_environment_config(selection, config, features).map_err(|error| {
                     ConstraintError::InvalidValue {
                         field_name: "environments",
                         candidate: "environment configuration".to_string(),
@@ -92,7 +98,16 @@ pub(super) fn ensure_configs_stay_owner_provided(
 fn validate_environment_config(
     selection: &TurnEnvironmentSelection,
     config: &EnvironmentConfig,
+    features: &ManagedFeatures,
 ) -> CodexResult<()> {
+    if features.enabled(Feature::CodexHooks) {
+        codex_hooks::validate_environment_hooks(
+            &selection.environment_id,
+            &selection.cwd,
+            &config.environment_hooks,
+        )
+        .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
+    }
     if let Some(policy) = config.network_policy.as_ref() {
         if selection.environment_id == LOCAL_ENVIRONMENT_ID {
             return Err(CodexErr::InvalidRequest(
@@ -151,6 +166,11 @@ fn validate_environment_config(
     Ok(())
 }
 
+enum ConfigUpdateSource {
+    Direct,
+    Inherited,
+}
+
 impl Session {
     pub(super) fn apply_session_settings(
         &self,
@@ -183,11 +203,10 @@ impl Session {
                 let mut environments = configuration.environments.clone();
                 let latest_environments = &state.session_configuration.environments;
                 for environment in &mut environments {
-                    if let Some(latest) = latest_environments.iter().find(|latest| {
-                        latest.environment_id == environment.environment_id
-                            && latest.cwd == environment.cwd
-                            && latest.workspace_roots == environment.workspace_roots
-                    }) {
+                    if let Some(latest) = latest_environments
+                        .iter()
+                        .find(|latest| latest.has_same_workspace(environment))
+                    {
                         environment.config = latest.config.clone();
                     }
                 }
@@ -211,8 +230,7 @@ impl Session {
         selection: &TurnEnvironmentSelection,
         config: EnvironmentConfig,
     ) -> CodexResult<()> {
-        validate_environment_config(selection, &config)?;
-        self.update_environment_configuration(selection, EnvironmentConfigState::Ready(config))
+        self.update_environment_configuration(selection, Ok(config), ConfigUpdateSource::Direct)
             .await
     }
 
@@ -221,8 +239,49 @@ impl Session {
         selection: &TurnEnvironmentSelection,
         error: String,
     ) -> CodexResult<()> {
-        self.update_environment_configuration(selection, EnvironmentConfigState::Failed(error))
+        self.update_environment_configuration(selection, Err(error), ConfigUpdateSource::Direct)
             .await
+    }
+
+    /// Installs the original owner's first result through this session's usual configuration checks.
+    pub(super) fn follow_inherited_environment_configurations(
+        self: &Arc<Self>,
+        inherited: &TurnEnvironmentSnapshot,
+        selected: &[TurnEnvironmentSelection],
+    ) {
+        for starting in inherited.starting().filter(|starting| {
+            selected.iter().any(|selection| {
+                selection.has_same_workspace(&starting.selection)
+                    && matches!(selection.config, EnvironmentConfigState::Pending)
+            })
+        }) {
+            let Some(configuration) = starting.owner_configuration() else {
+                continue;
+            };
+            let selection = starting.selection.clone();
+            let session = Arc::downgrade(self);
+            let mut status = self.agent_status.subscribe();
+            drop(tokio::spawn(async move {
+                let result = tokio::select! {
+                    result = configuration => result,
+                    _ = status.wait_for(|status| matches!(status, AgentStatus::Shutdown)) => return,
+                };
+                let Some(session) = session.upgrade() else {
+                    return;
+                };
+                let apply = |result| {
+                    session.update_environment_configuration(
+                        &selection,
+                        result,
+                        ConfigUpdateSource::Inherited,
+                    )
+                };
+                if let Err(error) = apply(result).await {
+                    // Unlike the external owner, no one will retry this child's one-time update.
+                    let _ = apply(Err(error.to_string())).await;
+                }
+            }));
+        }
     }
 
     /// Records configuration, or a failure to obtain it, for this environment and workspace.
@@ -232,21 +291,31 @@ impl Session {
     async fn update_environment_configuration(
         &self,
         selection: &TurnEnvironmentSelection,
-        config: EnvironmentConfigState,
+        result: Result<EnvironmentConfig, String>,
+        source: ConfigUpdateSource,
     ) -> CodexResult<()> {
-        // Serialize owner callbacks with ordinary thread settings updates.
         let mut state = self.state.lock().await;
         let mut current = self.services.turn_environments.selections();
         let mut future = state.session_configuration.environments.clone();
+        let inherited = matches!(source, ConfigUpdateSource::Inherited);
         let matches = |environment: &TurnEnvironmentSelection| {
-            environment.environment_id == selection.environment_id
-                && environment.cwd == selection.cwd
-                && environment.workspace_roots == selection.workspace_roots
+            environment.has_same_workspace(selection)
+                && (!inherited || matches!(environment.config, EnvironmentConfigState::Pending))
         };
-        let (current_environment, future_environment) = match (
+        let environments = (
             current.iter_mut().find(|environment| matches(environment)),
             future.iter_mut().find(|environment| matches(environment)),
-        ) {
+        );
+        // Ignore the parent's result if neither the running turn nor future turns are still
+        // waiting for this environment's configuration.
+        if inherited && matches!(environments, (None, None)) {
+            return Ok(());
+        }
+        if let Ok(config) = &result {
+            // Return the specific readiness error before applying session-level constraints.
+            validate_environment_config(selection, config, &self.features)?;
+        }
+        let (current_environment, future_environment) = match environments {
             (None, None) => {
                 return Err(CodexErr::InvalidRequest(format!(
                     "environment `{}` is not selected on this thread with the requested workspace",
@@ -265,6 +334,11 @@ impl Session {
             (Some(current), future) => (Some(current), future),
             (None, Some(future)) => (None, Some(future)),
         };
+        let successful = result.is_ok();
+        let config = match result {
+            Ok(config) => EnvironmentConfigState::Ready(config),
+            Err(error) => EnvironmentConfigState::Failed(error),
+        };
         let update_current = current_environment.is_some();
         let update_future = future_environment.is_some();
 
@@ -272,9 +346,9 @@ impl Session {
             environment.config = config.clone();
         }
         if let Some(environment) = future_environment {
-            environment.config = config.clone();
+            environment.config = config;
         }
-        if matches!(config, EnvironmentConfigState::Ready(_)) {
+        if successful {
             let validate = |environments: &[TurnEnvironmentSelection]| {
                 state
                     .session_configuration
@@ -289,6 +363,11 @@ impl Session {
             }
         }
 
+        if update_future {
+            self.services
+                .turn_environments
+                .update_configured_selections(&future);
+        }
         state.session_configuration.environments = future;
         if update_current {
             // Invalidate MCP before installed configuration can wake a waiting turn.

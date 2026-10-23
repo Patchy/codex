@@ -432,6 +432,9 @@ pub struct NetworkRequirementsToml {
     pub dangerously_allow_non_loopback_proxy: Option<bool>,
     pub dangerously_allow_all_unix_sockets: Option<bool>,
     pub domains: Option<NetworkDomainPermissionsToml>,
+    /// Host patterns routed to the existing network approval flow before ordinary allow rules.
+    /// Explicit denials take precedence; approval caching, hooks, and reviewer routing still apply.
+    pub review_domains: Option<Vec<String>>,
     /// When true, only managed `allowed_domains` are respected while managed
     /// network enforcement is active. User allowlist entries are ignored.
     pub managed_allowed_domains_only: Option<bool>,
@@ -471,6 +474,7 @@ struct RawNetworkRequirementsToml {
     dangerously_allow_non_loopback_proxy: Option<bool>,
     dangerously_allow_all_unix_sockets: Option<bool>,
     domains: Option<NetworkDomainPermissionsToml>,
+    review_domains: Option<Vec<String>>,
     #[serde(default)]
     allowed_domains: Option<Vec<String>>,
     /// When true, only managed `allowed_domains` are respected while managed
@@ -499,6 +503,7 @@ impl<'de> Deserialize<'de> for NetworkRequirementsToml {
             dangerously_allow_non_loopback_proxy,
             dangerously_allow_all_unix_sockets,
             domains,
+            review_domains,
             allowed_domains,
             managed_allowed_domains_only,
             denied_domains,
@@ -529,6 +534,7 @@ impl<'de> Deserialize<'de> for NetworkRequirementsToml {
             dangerously_allow_all_unix_sockets,
             domains: domains
                 .or_else(|| legacy_domain_permissions_from_lists(allowed_domains, denied_domains)),
+            review_domains,
             managed_allowed_domains_only,
             unix_sockets: unix_sockets
                 .or_else(|| legacy_unix_socket_permissions_from_list(allow_unix_sockets)),
@@ -580,6 +586,7 @@ pub struct NetworkConstraints {
     pub dangerously_allow_non_loopback_proxy: Option<bool>,
     pub dangerously_allow_all_unix_sockets: Option<bool>,
     pub domains: Option<NetworkDomainPermissionsToml>,
+    pub review_domains: Option<Vec<String>>,
     /// When true, only managed `allowed_domains` are respected while managed
     /// network enforcement is active. User allowlist entries are ignored.
     pub managed_allowed_domains_only: Option<bool>,
@@ -608,6 +615,7 @@ impl From<NetworkRequirementsToml> for NetworkConstraints {
             dangerously_allow_non_loopback_proxy,
             dangerously_allow_all_unix_sockets,
             domains,
+            review_domains,
             managed_allowed_domains_only,
             unix_sockets,
             allow_local_binding,
@@ -621,6 +629,7 @@ impl From<NetworkRequirementsToml> for NetworkConstraints {
             dangerously_allow_non_loopback_proxy,
             dangerously_allow_all_unix_sockets,
             domains,
+            review_domains,
             managed_allowed_domains_only,
             unix_sockets,
             allow_local_binding,
@@ -870,6 +879,10 @@ impl fmt::Display for WebSearchModeRequirement {
 #[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct WindowsRequirementsToml {
     pub allowed_sandbox_implementations: Option<Vec<WindowsSandboxImplementationToml>>,
+    /// False blocks both explicit MXC configuration and automatic selection.
+    pub allow_mxc: Option<bool>,
+    /// Require MXC as the selected local Windows backend.
+    pub require_mxc: Option<bool>,
 }
 
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -882,6 +895,8 @@ pub enum WindowsSandboxImplementationToml {
 impl WindowsRequirementsToml {
     pub fn is_empty(&self) -> bool {
         self.allowed_sandbox_implementations.is_none()
+            && self.allow_mxc.is_none()
+            && self.require_mxc.is_none()
     }
 }
 
@@ -1027,6 +1042,8 @@ pub(crate) fn merge_app_requirements_descending(
 /// Base config deserialized from system `requirements.toml` or MDM.
 #[derive(Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct ConfigRequirementsToml {
+    /// Required customer-hosted configuration server. Only local managed requirements may configure it.
+    pub config_server: Option<crate::ConfigServer>,
     pub allowed_login_methods: Option<Vec<ForcedLoginMethod>>,
     pub allowed_chatgpt_workspaces: Option<Vec<String>>,
     pub cli_auth_credentials_store: Option<AuthCredentialsStoreMode>,
@@ -1138,6 +1155,7 @@ impl<T> std::ops::Deref for Sourced<T> {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConfigRequirementsWithSources {
+    pub config_server: Option<Sourced<crate::ConfigServer>>,
     pub allowed_login_methods: Option<Sourced<Vec<ForcedLoginMethod>>>,
     pub allowed_chatgpt_workspaces: Option<Sourced<Vec<String>>>,
     pub cli_auth_credentials_store: Option<Sourced<AuthCredentialsStoreMode>>,
@@ -1201,6 +1219,7 @@ impl ConfigRequirementsWithSources {
         // Destructure without `..` so adding fields to `ConfigRequirementsToml`
         // forces this merge logic to be updated.
         let ConfigRequirementsToml {
+            config_server: _,
             allowed_login_methods: _,
             allowed_chatgpt_workspaces: _,
             cli_auth_credentials_store: _,
@@ -1266,6 +1285,7 @@ impl ConfigRequirementsWithSources {
             other,
             source,
             {
+                config_server,
                 allowed_login_methods,
                 allowed_chatgpt_workspaces,
                 cli_auth_credentials_store,
@@ -1352,6 +1372,7 @@ impl ConfigRequirementsWithSources {
 
     pub fn into_toml(self) -> ConfigRequirementsToml {
         let ConfigRequirementsWithSources {
+            config_server,
             allowed_login_methods,
             allowed_chatgpt_workspaces,
             cli_auth_credentials_store,
@@ -1396,6 +1417,7 @@ impl ConfigRequirementsWithSources {
             guardian_extra_policy,
         } = self;
         ConfigRequirementsToml {
+            config_server: config_server.map(|sourced| sourced.value),
             allowed_login_methods: allowed_login_methods.map(|sourced| sourced.value),
             allowed_chatgpt_workspaces: allowed_chatgpt_workspaces.map(|sourced| sourced.value),
             cli_auth_credentials_store: cli_auth_credentials_store.map(|sourced| sourced.value),
@@ -1486,6 +1508,11 @@ impl From<SandboxMode> for SandboxModeRequirement {
 }
 
 impl ConfigRequirementsToml {
+    /// Whether local administration requires a remotely delivered managed bundle.
+    pub fn requires_remote_config(&self) -> bool {
+        self.config_server.is_some()
+    }
+
     pub fn apply_remote_sandbox_config(&mut self, hostname: Option<&str>) {
         let Some(remote_sandbox_config) = self.remote_sandbox_config.as_ref() else {
             return;
@@ -1503,7 +1530,8 @@ impl ConfigRequirementsToml {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.allowed_login_methods.is_none()
+        self.config_server.is_none()
+            && self.allowed_login_methods.is_none()
             && self.allowed_chatgpt_workspaces.is_none()
             && self.cli_auth_credentials_store.is_none()
             && self.chatgpt_base_url.is_none()
@@ -1569,10 +1597,13 @@ impl ConfigRequirementsToml {
             && self.rules.is_none()
             && self.enforce_residency.is_none()
             && self.network.is_none()
-            && self
-                .application
-                .as_ref()
-                .is_none_or(|application| application.network.is_none())
+            && self.application.as_ref().is_none_or(|application| {
+                application.network.is_none()
+                    && application
+                        .storage
+                        .as_deref()
+                        .is_none_or(crate::ApplicationStorageRequirementsToml::is_empty)
+            })
             && self.permissions.is_none()
             && self.auto_review.as_ref().is_none_or(|auto_review| {
                 auto_review.ignore_rules.as_ref().is_none_or(Vec::is_empty)
@@ -1612,6 +1643,13 @@ impl ConfigRequirementsToml {
         apply_exact!(chatgpt_base_url);
         apply_exact!(sqlite_home);
         apply_exact!(log_dir);
+        if let Some(storage) = self
+            .application
+            .as_ref()
+            .and_then(|application| application.storage.as_ref())
+        {
+            storage.apply_to_config(config);
+        }
         apply_exact!(model_catalog_json);
         apply_exact!(model_provider);
         if let Some(providers) = &self.model_providers {
@@ -1635,6 +1673,14 @@ impl ConfigRequirementsToml {
 
     /// Returns the exact managed field affected by editing `segments`.
     pub fn exact_requirement_for_config_path(&self, segments: &[String]) -> Option<&'static str> {
+        if let Some(field) = self
+            .application
+            .as_ref()
+            .and_then(|application| application.storage.as_ref())
+            .and_then(|storage| storage.exact_requirement_for_config_path(segments))
+        {
+            return Some(field);
+        }
         if self.model_providers.as_ref().is_some_and(|providers| {
             providers
                 .keys()
@@ -1728,6 +1774,7 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
         // defaults also remain there because they are initialization values;
         // model-specific auto-review requirements are runtime constraints.
         let ConfigRequirementsWithSources {
+            config_server: _,
             allowed_login_methods,
             allowed_chatgpt_workspaces,
             cli_auth_credentials_store,
@@ -1915,11 +1962,17 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
                 /*source*/ None,
             ),
         };
-        let windows_sandbox_mode = match windows {
+        let mxc_requirement_source = windows
+            .as_ref()
+            .filter(|windows| windows.value.allow_mxc == Some(false))
+            .map(|windows| windows.source.clone());
+        let mut windows_sandbox_mode = match windows {
             Some(Sourced {
                 value:
                     WindowsRequirementsToml {
                         allowed_sandbox_implementations: Some(implementations),
+                        allow_mxc: _,
+                        require_mxc: _,
                     },
                 source: requirement_source,
             }) => {
@@ -1965,6 +2018,8 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
                 value:
                     WindowsRequirementsToml {
                         allowed_sandbox_implementations: None,
+                        allow_mxc: _,
+                        require_mxc: _,
                     },
                 ..
             })
@@ -1973,6 +2028,18 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
                 /*source*/ None,
             ),
         };
+        if let Some(requirement_source) = mxc_requirement_source {
+            windows_sandbox_mode.add_validator(move |candidate| match candidate {
+                Some(WindowsSandboxModeToml::Mxc) => Err(ConstraintError::InvalidValue {
+                    field_name: "windows.sandbox",
+                    candidate: format!("{candidate:?}"),
+                    allowed: "windows.allow_mxc = false".to_string(),
+                    requirement_source: requirement_source.clone(),
+                }),
+                Some(WindowsSandboxModeToml::Elevated | WindowsSandboxModeToml::Unelevated)
+                | None => Ok(()),
+            })?;
+        }
         let exec_policy = match rules {
             Some(Sourced { value, source }) => {
                 let policy = value.to_requirements_policy().map_err(|err| {
@@ -2169,7 +2236,6 @@ mod tests {
     use crate::ComputerUseMacosRequirementsToml;
     use crate::ComputerUseWindowsExeRequirementToml;
     use crate::ComputerUseWindowsRequirementsToml;
-    use crate::HookEventsToml;
     use crate::McpServerCommandMatcher;
     use crate::McpServerIdentity;
     use crate::McpServerValueMatcher;
@@ -2262,6 +2328,7 @@ mod tests {
 
     fn with_unknown_source(toml: ConfigRequirementsToml) -> ConfigRequirementsWithSources {
         let ConfigRequirementsToml {
+            config_server,
             allowed_login_methods,
             allowed_chatgpt_workspaces,
             cli_auth_credentials_store,
@@ -2307,6 +2374,8 @@ mod tests {
             guardian_extra_policy,
         } = toml;
         ConfigRequirementsWithSources {
+            config_server: config_server
+                .map(|value| Sourced::new(value, RequirementSource::Unknown)),
             allowed_login_methods: allowed_login_methods
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
             allowed_chatgpt_workspaces: allowed_chatgpt_workspaces
@@ -2557,6 +2626,7 @@ mod tests {
         assert_eq!(
             requirements.browser_use,
             Some(BrowserUseRequirementsToml {
+                extension: None,
                 allow_webmcp: None,
                 allow_history_access: Some(false),
                 disable_auto_review: Some(true),
@@ -2790,6 +2860,7 @@ mod tests {
             entries: BTreeMap::from([("personality".to_string(), true)]),
         };
         let browser_use = BrowserUseRequirementsToml {
+            extension: None,
             allow_webmcp: None,
             allow_history_access: Some(false),
             disable_auto_review: Some(true),
@@ -2827,6 +2898,8 @@ mod tests {
         };
         let windows = WindowsRequirementsToml {
             allowed_sandbox_implementations: Some(vec![WindowsSandboxImplementationToml::Elevated]),
+            allow_mxc: None,
+            require_mxc: Some(true),
         };
         let enforce_residency = ResidencyRequirement::Us;
         let enforce_source = source.clone();
@@ -2837,6 +2910,7 @@ mod tests {
         // Intentionally constructed without `..Default::default()` so adding a new field to
         // `ConfigRequirementsToml` forces this test to be updated.
         let other = ConfigRequirementsToml {
+            config_server: None,
             allowed_login_methods: Some(vec![ForcedLoginMethod::Chatgpt]),
             allowed_chatgpt_workspaces: Some(vec!["managed-workspace".to_string()]),
             cli_auth_credentials_store: Some(AuthCredentialsStoreMode::Keyring),
@@ -2887,6 +2961,7 @@ mod tests {
         assert_eq!(
             target,
             ConfigRequirementsWithSources {
+                config_server: None,
                 allowed_login_methods: Some(Sourced::new(
                     vec![ForcedLoginMethod::Chatgpt],
                     source.clone(),
@@ -3781,6 +3856,9 @@ allowed_approvals_reviewers = ["user"]
 
     #[test]
     fn deserialize_allowed_windows_sandbox_implementations() -> Result<()> {
+        let requirements: ConfigRequirementsToml = from_str("[windows]\nrequire_mxc = true")?;
+        assert!(!requirements.is_empty());
+
         let toml_str = r#"
             [windows]
             allowed_sandbox_implementations = ["elevated"]
@@ -3811,6 +3889,22 @@ allowed_approvals_reviewers = ["user"]
                 .is_ok()
         );
         assert!(requirements.windows_sandbox_mode.can_set(&None).is_err());
+
+        for allow_mxc in [true, false] {
+            let config = from_str(&format!("{toml_str}\nallow_mxc = {allow_mxc}"))?;
+            let requirements: ConfigRequirements = with_unknown_source(config).try_into()?;
+            let constraint = &requirements.windows_sandbox_mode;
+            assert_eq!(
+                [
+                    Some(WindowsSandboxModeToml::Elevated),
+                    Some(WindowsSandboxModeToml::Unelevated),
+                    Some(WindowsSandboxModeToml::Mxc),
+                    None,
+                ]
+                .map(|mode| constraint.can_set(&mode).is_ok()),
+                [true, false, allow_mxc, false]
+            );
+        }
 
         Ok(())
     }
@@ -4357,7 +4451,7 @@ command = "python3 /enterprise/hooks/pre.py"
             .set(ManagedHooksRequirementsToml {
                 managed_dir: Some(std::path::PathBuf::from("/other/hooks")),
                 windows_managed_dir: None,
-                hooks: HookEventsToml::default(),
+                hooks: Default::default(),
             })
             .expect_err("managed hooks should reject drift");
 
@@ -4482,6 +4576,7 @@ command = "python3 /enterprise/hooks/pre.py"
             allow_upstream_proxy = false
             dangerously_allow_all_unix_sockets = true
             allowed_domains = ["api.example.com", "*.openai.com"]
+            review_domains = ["review.example.com", "*.review.example.com"]
             managed_allowed_domains_only = true
             denied_domains = ["blocked.example.com"]
             allow_unix_sockets = ["/tmp/example.sock"]
@@ -4537,6 +4632,14 @@ command = "python3 /enterprise/hooks/pre.py"
             })
         );
         assert_eq!(sourced_network.value.allow_local_binding, Some(false));
+
+        assert_eq!(
+            sourced_network.value.review_domains,
+            Some(vec![
+                "review.example.com".to_string(),
+                "*.review.example.com".to_string()
+            ])
+        );
 
         Ok(())
     }

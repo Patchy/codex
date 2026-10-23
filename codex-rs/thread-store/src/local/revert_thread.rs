@@ -79,7 +79,9 @@ pub(super) async fn revert(
 
     // Preserve old-reader compatibility when introducing the first reference to a standalone
     // source. Already-shared ancestors stay read-only; their offsets address decoded JSONL bytes.
-    let mut lineage = store.resolve_rollout_lineage(thread_id).await?;
+    let mut lineage = store
+        .resolve_rollout_lineage(thread_id, /*initial_path*/ None)
+        .await?;
     for segment in &mut lineage.segments {
         if segment.rollout_id() == current_rollout.rollout_id && source_meta.history_base.is_none()
         {
@@ -179,6 +181,7 @@ async fn create_replacement_recorder(
     )
     .with_creator(source_meta.creator_user_id, source_meta.creator_account_id)
     .with_session_id(source_meta.session_id)
+    .with_attached_thread(source_meta.attached_thread)
     .with_rollout_id(rollout_id)
     .with_selected_capability_roots(source_meta.selected_capability_roots)
     .with_runtime_workspace_roots(source_meta.runtime_workspace_roots)

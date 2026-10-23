@@ -86,6 +86,9 @@ pub struct CreateThreadParams {
     pub extra_config: Option<ExtraConfig>,
     /// Source thread id when this thread is created as a fork.
     pub forked_from_id: Option<ThreadId>,
+    /// Saved fork role, persisted independently of the thread index.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub attached_thread: bool,
     /// The ID of the parent thread. This will only be set if this thread is a subagent.
     pub parent_thread_id: Option<ThreadId>,
     /// Runtime source for the thread.
@@ -125,8 +128,12 @@ pub struct ResumeThreadParams {
     pub thread_id: ThreadId,
     /// Known local rollout path when the caller resumed from a specific file.
     pub rollout_path: Option<PathBuf>,
-    /// Known replay history for the resumed thread, if already loaded by the caller.
+    /// Previously loaded replay history. A canonical session header identifies a stored snapshot
+    /// that may need refreshing under writer ownership; other histories are explicit overrides.
     pub history: Option<Arc<Vec<RolloutItem>>>,
+    /// Opaque revision paired with `history`, validated by the store under writer ownership.
+    #[serde(skip)]
+    pub history_revision: Option<String>,
     /// Whether archived threads may be reopened.
     pub include_archived: bool,
     /// Metadata for future writes appended to the resumed live thread.
@@ -175,6 +182,9 @@ pub struct StoredThreadHistory {
     pub thread_id: ThreadId,
     /// Persisted rollout items in replay order.
     pub items: Vec<RolloutItem>,
+    /// Optional revision for reusing this exact snapshot within the current process.
+    #[serde(skip)]
+    pub revision: Option<String>,
 }
 
 /// Persisted rollout items needed to reconstruct the latest model-visible context.
@@ -188,6 +198,9 @@ pub struct StoredModelContext {
     pub thread_id: ThreadId,
     /// Persisted rollout items in replay order.
     pub items: Vec<RolloutItem>,
+    /// Optional revision for reusing this exact snapshot within the current process.
+    #[serde(skip)]
+    pub revision: Option<String>,
 }
 
 /// Requested boundary for inheriting a paginated thread's history.
@@ -298,13 +311,15 @@ pub enum SortDirection {
     Desc,
 }
 
-/// Spawn-graph relationship used to filter thread listings.
+/// Parent relationship used to filter thread listings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThreadRelationFilter {
     /// Return only threads whose immediate parent is the given thread.
     DirectChildrenOf(ThreadId),
     /// Return every thread transitively descended from the given thread.
     DescendantsOf(ThreadId),
+    /// Saved attached threads, independent of the spawned-agent graph.
+    AttachedThreadsOf(ThreadId),
 }
 
 /// Parameters for listing threads.
@@ -442,6 +457,8 @@ pub struct ListTurnsParams {
 pub struct StoredTurn {
     /// Turn id.
     pub turn_id: String,
+    /// Causal root recorded for this turn. Older projected turns may not have one.
+    pub root_turn_id: Option<String>,
     /// Projected app-server item snapshots associated with this turn, according to `items_view`.
     pub items: Vec<StoredThreadItem>,
     /// Amount of item detail included in `items`.
@@ -482,6 +499,8 @@ pub enum ListItemsPosition {
 /// Parameters for listing persisted items within a thread.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListItemsParams {
+    /// Exact item lookup scoped to `turn_id`; incompatible with cursors and update replay.
+    pub item_ids: Option<Vec<String>>,
     /// Thread id to read.
     pub thread_id: ThreadId,
     /// Optional turn id to filter by. When omitted, returns items across the thread.
@@ -914,6 +933,10 @@ impl ThreadMetadataPatch {
     }
 
     pub fn is_empty(&self) -> bool {
+        self.updated_at.is_none() && self.is_empty_except_updated_at()
+    }
+
+    pub(crate) fn is_empty_except_updated_at(&self) -> bool {
         self.name.is_none()
             && self.rollout_path.is_none()
             && self.preview.is_none()
@@ -922,7 +945,6 @@ impl ThreadMetadataPatch {
             && self.model.is_none()
             && self.reasoning_effort.is_none()
             && self.created_at.is_none()
-            && self.updated_at.is_none()
             && self.advance_recency_at.is_none()
             && self.source.is_none()
             && self.originator.is_none()
@@ -1126,12 +1148,12 @@ mod tests {
     }
 
     fn session_meta(history_mode: ThreadHistoryMode) -> RolloutItem {
-        RolloutItem::SessionMeta(codex_protocol::protocol::SessionMetaLine {
+        RolloutItem::SessionMeta(Box::new(codex_protocol::protocol::SessionMetaLine {
             meta: codex_protocol::protocol::SessionMeta {
                 history_mode,
                 ..Default::default()
             },
             git: None,
-        })
+        }))
     }
 }

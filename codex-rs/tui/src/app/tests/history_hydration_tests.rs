@@ -55,6 +55,7 @@ async fn history_fixture(
     for (index, count) in item_counts.iter().enumerate() {
         let turn_id = format!("turn-{index}");
         let mut events = vec![EventMsg::TurnStarted(TurnStartedEvent {
+            turn_attribution: None,
             turn_id: turn_id.clone(),
             root_turn_id: None,
             trace_id: None,
@@ -79,6 +80,7 @@ async fn history_fixture(
             }));
         }
         events.push(EventMsg::TurnComplete(TurnCompleteEvent {
+            root_turn_id: None,
             turn_id,
             last_agent_message: None,
             error: None,
@@ -101,6 +103,7 @@ async fn history_fixture(
         .join("\n");
     std::fs::write(&path, format!("{contents}\n"))?;
     let target = SessionTarget {
+        backend_id: crate::backend_id::BackendId::new(),
         path: Some(path),
         thread_id,
         cwd: None,
@@ -244,6 +247,7 @@ async fn history_hydration_archived_retry_uses_first_attempt_runtime_settings() 
     for action in [
         SessionStartAction::Resume(
             crate::app_server_session::ResumeModelSettings::RestoreFromThread,
+            crate::resume_permissions::ResumePermissions::default(),
         ),
         SessionStartAction::Fork(crate::app_server_session::ForkPermissionMode::InheritSaved),
     ] {
@@ -267,7 +271,7 @@ async fn history_hydration_archived_retry_uses_first_attempt_runtime_settings() 
             )
             .await?;
             let initial = match action {
-                SessionStartAction::Resume(settings) => {
+                SessionStartAction::Resume(settings, _) => {
                     server
                         .resume_thread(
                             &app.local_settings,
@@ -289,6 +293,7 @@ async fn history_hydration_archived_retry_uses_first_attempt_runtime_settings() 
                 }
             };
             assert!(initial.is_err());
+            target.backend_id = server.backend_id();
             let outcome = complete_session_start(
                 &mut server,
                 SessionStartConfig {

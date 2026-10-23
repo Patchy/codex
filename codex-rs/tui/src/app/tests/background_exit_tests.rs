@@ -225,7 +225,7 @@ async fn remote_disconnect_exit_summary_does_not_require_a_local_rollout_or_prin
     ));
     let exit_info = app.exit_info(ExitReason::Fatal("connection lost".to_string()));
     let lines = exit_info.format_exit_messages(/*color_enabled*/ false);
-    let command = shlex::split(lines[1].strip_prefix("Reconnect: ").unwrap()).unwrap();
+    let command = shlex::split(&lines[2]).unwrap();
     assert_eq!(
         crate::resolve_remote_addr(&command[2]).unwrap(),
         crate::RemoteAppServerEndpoint::WebSocket {
@@ -467,7 +467,8 @@ async fn exit_interrupts_before_requesting_shutdown() -> Result<()> {
                 .next_event()
                 .await
                 .expect("app-server event stream should remain open");
-            if let codex_app_server_client::AppServerEvent::ServerNotification(notification) = event
+            if let codex_app_server_client::AppServerEvent::ServerNotification(notification) =
+                event.event
             {
                 match notification.as_ref() {
                     ServerNotification::TurnStarted(notification)

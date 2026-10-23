@@ -38,6 +38,8 @@
 //! body rows, or even 3-char-wide columns cannot fit, body rows render as
 //! key/value records.
 //!
+//! Markdown prose uses foregrounds from the active syntax theme's markup scopes,
+//! retaining its usual modifiers and falling back when a scope has no foreground.
 //! Inline code and local file paths share the active syntax theme's raw-markup foreground.
 
 use crate::markdown_text_merge::DecodedTextMerge;
@@ -73,7 +75,7 @@ use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 
-mod file_citations;
+mod inline_directives;
 mod list_spacing;
 mod local_links;
 mod math;
@@ -81,16 +83,17 @@ mod mermaid;
 pub(crate) mod preferences;
 mod source_tables;
 mod streaming;
+pub(crate) use streaming::render_with_copy_sources;
 mod table_key_value;
 mod task_lists;
 mod web_links;
 
-use file_citations::FileCitations;
+use inline_directives::InlineDirectives;
+pub(crate) use inline_directives::followup_labels;
 pub(crate) use list_spacing::ListSpacing;
 use list_spacing::UniformList;
 use local_links::is_local_path_like_link;
 use local_links::render_local_link_target;
-use local_links::should_render_local_link_label;
 pub(crate) use streaming::StreamingMarkdownRender;
 pub(crate) use streaming::render_streaming_markdown_lines_with_width_and_cwd;
 #[cfg(test)]
@@ -132,13 +135,25 @@ impl Default for MarkdownStyles {
 
 impl MarkdownStyles {
     fn for_theme(theme: &syntect::highlighting::Theme) -> Self {
+        let foreground = |scopes: &[&str]| {
+            let mut style =
+                foreground_style_for_scopes_with_theme(theme, scopes).unwrap_or_default();
+            style.fg = style.fg.map(|foreground| {
+                crate::style::readable_color_on(foreground, /*background*/ None)
+            });
+            style
+        };
         Self {
-            h1: Style::new().bold().underlined(),
-            h2: Style::new().bold(),
-            h3: Style::new().bold().italic(),
-            h4: Style::new().italic(),
-            h5: Style::new().italic(),
-            h6: Style::new().italic(),
+            h1: foreground(&["markup.heading.1.markdown", "markup.heading.markdown"])
+                .bold()
+                .underlined(),
+            h2: foreground(&["markup.heading.2.markdown", "markup.heading.markdown"]).bold(),
+            h3: foreground(&["markup.heading.3.markdown", "markup.heading.markdown"])
+                .bold()
+                .italic(),
+            h4: foreground(&["markup.heading.4.markdown", "markup.heading.markdown"]).italic(),
+            h5: foreground(&["markup.heading.5.markdown", "markup.heading.markdown"]).italic(),
+            h6: foreground(&["markup.heading.6.markdown", "markup.heading.markdown"]).italic(),
             code: foreground_style_for_scopes_with_theme(
                 theme,
                 &[
@@ -147,13 +162,23 @@ impl MarkdownStyles {
                 ],
             )
             .unwrap_or_else(|| Style::new().fg(accent_color())),
-            emphasis: Style::new().italic(),
-            strong: Style::new().bold(),
+            emphasis: foreground(&["markup.italic.markdown"]).italic(),
+            strong: foreground(&["markup.bold.markdown"]).bold(),
             strikethrough: Style::new().crossed_out(),
-            ordered_list_marker: Style::new().fg(accent_color()),
-            unordered_list_marker: Style::new(),
-            link: Style::new().fg(accent_color()).underlined(),
-            blockquote: Style::new().green(),
+            ordered_list_marker: Style::new()
+                .light_blue()
+                .patch(foreground(&["markup.list.numbered.markdown"])),
+            unordered_list_marker: foreground(&[
+                "markup.list.unnumbered.markdown",
+                "markup.list.bullet.markdown",
+            ]),
+            link: Style::new()
+                .fg(accent_color())
+                .patch(foreground(&["markup.underline.link.markdown"]))
+                .underlined(),
+            blockquote: Style::new()
+                .green()
+                .patch(foreground(&["markup.quote.markdown"])),
         }
     }
 }
@@ -193,6 +218,7 @@ impl IndentContext {
 #[derive(Clone, Debug, Default)]
 struct TableCell {
     lines: Vec<HyperlinkLine>,
+    copies: Vec<crate::markdown_copy::CopyLine>,
 }
 
 // TableCell mutators inlined — called per-span during table event parsing.
@@ -201,11 +227,27 @@ impl TableCell {
     fn ensure_line(&mut self) {
         if self.lines.is_empty() {
             self.lines.push(HyperlinkLine::new(Line::default()));
+            self.copies.push(Default::default());
         }
     }
 
-    fn push_annotated(&mut self, mut appended: HyperlinkLine) {
+    fn push_annotated(
+        &mut self,
+        mut appended: HyperlinkLine,
+        inline: &[crate::markdown_copy::Inline],
+    ) {
         self.ensure_line();
+        if let Some(copy) = self.copies.last_mut() {
+            copy.push(
+                appended
+                    .line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.len())
+                    .sum(),
+                inline,
+            );
+        }
         if let Some(line) = self.lines.last_mut() {
             let shift = line.width();
             line.line.spans.append(&mut appended.line.spans);
@@ -220,6 +262,7 @@ impl TableCell {
     #[inline]
     fn hard_break(&mut self) {
         self.lines.push(HyperlinkLine::new(Line::default()));
+        self.copies.push(Default::default());
     }
 
     fn plain_text(&self) -> String {
@@ -428,6 +471,9 @@ struct Writer<'a, 'policy> {
     inline_styles: Vec<Style>,
     copy_inline: Vec<crate::markdown_copy::Inline>,
     copy_line: crate::markdown_copy::CopyLine,
+    quote_sources: Vec<std::sync::Arc<str>>,
+    code_sources: Vec<crate::markdown_copy::SourceBlock>,
+    transformed_code_source: Option<std::sync::Arc<str>>,
     indent_stack: Vec<IndentContext>,
     list_indices: Vec<Option<u64>>,
     list_needs_blank_before_next_item: Vec<bool>,
@@ -470,6 +516,9 @@ impl<'a, 'policy> Writer<'a, 'policy> {
             inline_styles: Vec::new(),
             copy_inline: Vec::new(),
             copy_line: Default::default(),
+            quote_sources: Vec::new(),
+            code_sources: Vec::new(),
+            transformed_code_source: None,
             indent_stack: Vec::new(),
             list_indices: Vec::new(),
             list_needs_blank_before_next_item: Vec::new(),
@@ -513,6 +562,20 @@ impl<'a, 'policy> Writer<'a, 'policy> {
     where
         I: Iterator<Item = (Event<'a>, Range<usize>)>,
     {
+        let source = self
+            .code_sources
+            .iter()
+            .find(|source| source.range.contains(&range.start))
+            .map(|source| std::sync::Arc::clone(&source.content));
+        let same_source = match (&source, &self.transformed_code_source) {
+            (Some(source), Some(current)) => std::sync::Arc::ptr_eq(source, current),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same_source {
+            self.flush_current_line();
+            self.transformed_code_source = source;
+        }
         self.prepare_for_event(&event);
         let copy_inline = crate::markdown_copy::Inline::from_event(&event);
         if let Some(inline) = &copy_inline {
@@ -589,7 +652,13 @@ impl<'a, 'policy> Writer<'a, 'policy> {
         match tag {
             Tag::Paragraph => self.start_paragraph(),
             Tag::Heading { level, .. } => self.start_heading(level),
-            Tag::BlockQuote => self.start_blockquote(),
+            Tag::BlockQuote => {
+                self.start_blockquote();
+                let source = self.quote_sources.first().cloned().unwrap_or_else(|| {
+                    crate::markdown_copy::quote_content(&self.input[range]).into()
+                });
+                self.quote_sources.push(source);
+            }
             Tag::CodeBlock(kind) => {
                 self.code_block_content_end = range.end;
                 let indent = match kind {
@@ -602,7 +671,17 @@ impl<'a, 'policy> Writer<'a, 'policy> {
                 };
                 self.start_codeblock(lang, indent)
             }
-            Tag::List(start) => self.start_list(start),
+            Tag::List(start) => {
+                if self.pending_marker_line
+                    && self.input[..range.start]
+                        .rsplit('\n')
+                        .next()
+                        .is_some_and(|line| line.trim_matches(['>', ' ', '\t']).is_empty())
+                {
+                    self.push_line(Line::default());
+                }
+                self.start_list(start);
+            }
             Tag::Item => {
                 self.start_item();
                 if let Some((next, next_range)) = iter.next() {
@@ -663,10 +742,17 @@ impl<'a, 'policy> Writer<'a, 'policy> {
                 self.end_paragraph();
             }
             TagEnd::Heading(_) => self.end_heading(),
-            TagEnd::BlockQuote => self.end_blockquote(),
+            TagEnd::BlockQuote => {
+                self.flush_current_line();
+                self.end_blockquote();
+                self.quote_sources.pop();
+            }
             TagEnd::CodeBlock => self.end_codeblock(range),
             TagEnd::List(_) => self.end_list(),
             TagEnd::Item => {
+                if self.pending_marker_line {
+                    self.push_line(Line::default());
+                }
                 self.flush_current_line();
                 let start_line_count = self.list_item_start_line_counts.pop().unwrap_or_default();
                 if let Some(list) = self.uniform_lists.last_mut() {
@@ -965,8 +1051,9 @@ impl<'a, 'policy> Writer<'a, 'policy> {
             let index = self.text.len();
             self.push_blank_line();
             if let Some(line) = self.text.get_mut(index) {
-                let mut source =
-                    crate::terminal_hyperlinks::LogicalLineSource::from_line(&line.line);
+                let mut source = line.source.clone().unwrap_or_else(|| {
+                    crate::terminal_hyperlinks::LogicalLineSource::from_line(&line.line)
+                });
                 let mut copy = crate::markdown_copy::CopyLine::default();
                 copy.omit = true;
                 source.copy = Some(std::sync::Arc::new(copy));
@@ -1083,8 +1170,10 @@ impl<'a, 'policy> Writer<'a, 'policy> {
                     Some(diagram) => diagram,
                     None => highlight_code_to_lines(&code, &lang),
                 };
+                let source: std::sync::Arc<str> = code.into();
                 for hl_line in highlighted {
                     self.push_line(Line::default());
+                    self.copy_line.code_source = Some(std::sync::Arc::clone(&source));
                     for span in hl_line.spans {
                         self.push_span(span);
                     }
@@ -1111,18 +1200,44 @@ impl<'a, 'policy> Writer<'a, 'policy> {
             return;
         };
 
+        let table: std::sync::Arc<[&str]> = table_state
+            .alignments
+            .iter()
+            .map(|alignment| match alignment {
+                Alignment::None => "---",
+                Alignment::Left => ":---",
+                Alignment::Center => ":---:",
+                Alignment::Right => "---:",
+            })
+            .collect();
         let RenderedTableLines {
             table_lines,
             table_lines_prewrapped,
             spillover_lines,
-        } = self.render_table_lines(table_state);
+        } = self.render_table_lines(table_state, &table);
         let mut pending_marker_line = self.pending_marker_line;
-        for line in table_lines {
+        for mut line in table_lines {
+            if line
+                .source
+                .as_ref()
+                .and_then(|source| source.copy.as_ref())
+                .is_none()
+            {
+                crate::markdown_copy::table::attach(
+                    &mut line,
+                    Some(crate::markdown_copy::table::TableLine::empty(&table)),
+                );
+            }
             if table_lines_prewrapped {
                 self.push_prewrapped_line(line, pending_marker_line);
             } else {
+                let table = line
+                    .source
+                    .as_ref()
+                    .and_then(|source| source.copy.as_ref())
+                    .and_then(|copy| copy.table.clone());
                 self.push_hyperlink_line(line);
-                self.copy_line.code = true;
+                self.copy_line.table = table;
                 self.flush_current_line();
             }
             pending_marker_line = false;
@@ -1237,7 +1352,7 @@ impl<'a, 'policy> Writer<'a, 'policy> {
         if let Some(table_state) = self.table_state.as_mut()
             && let Some(cell) = table_state.current_cell.as_mut()
         {
-            cell.push_annotated(annotated);
+            cell.push_annotated(annotated, &self.copy_inline);
         }
     }
 
@@ -1277,7 +1392,7 @@ impl<'a, 'policy> Writer<'a, 'policy> {
         if let Some(table_state) = self.table_state.as_mut()
             && let Some(cell) = table_state.current_cell.as_mut()
         {
-            cell.push_annotated(std::mem::take(&mut annotated));
+            cell.push_annotated(std::mem::take(&mut annotated), &self.copy_inline);
         }
     }
 
@@ -1292,7 +1407,11 @@ impl<'a, 'policy> Writer<'a, 'policy> {
     /// Falls back to key/value records when body rows cannot fit in the aligned
     /// grid; header-only tables retain raw pipe output because they contain no
     /// records to transpose.
-    fn render_table_lines(&self, mut table_state: TableState) -> RenderedTableLines {
+    fn render_table_lines(
+        &self,
+        mut table_state: TableState,
+        table: &std::sync::Arc<[&'static str]>,
+    ) -> RenderedTableLines {
         let column_count = table_state.alignments.len();
         if column_count == 0 {
             return RenderedTableLines {
@@ -1325,6 +1444,21 @@ impl<'a, 'policy> Writer<'a, 'policy> {
         Self::normalize_row(&mut header, column_count);
         for row in &mut rows {
             Self::normalize_row(row, column_count);
+        }
+        for (row_index, row) in std::iter::once(&mut header)
+            .chain(rows.iter_mut())
+            .enumerate()
+        {
+            for (column, cell) in row.iter_mut().enumerate() {
+                cell.ensure_line();
+                crate::markdown_copy::table::annotate_cell(
+                    &mut cell.lines,
+                    std::mem::take(&mut cell.copies),
+                    table,
+                    row_index,
+                    column,
+                );
+            }
         }
 
         let metrics = Self::collect_table_column_metrics(&header, &rows, column_count);
@@ -1691,16 +1825,25 @@ impl<'a, 'policy> Writer<'a, 'policy> {
                     .get(row_line)
                     .is_some_and(|line| Self::line_display_width(&line.line) > 0)
             }) else {
-                out.push(HyperlinkLine::new(Line::default().style(row_style)));
+                let mut line = wrapped_cells
+                    .iter()
+                    .find_map(|cell| cell.get(row_line))
+                    .cloned()
+                    .unwrap_or_default();
+                line.line.style = row_style;
+                out.push(line);
                 continue;
             };
             let mut spans = Vec::new();
+            let mut copy = None;
+            let mut byte_offset = 0;
             for (column, width) in column_widths
                 .iter()
                 .enumerate()
                 .take(last_visible_column + 1)
             {
                 spans.push(Span::raw(" ".repeat(TABLE_CELL_PADDING)));
+                byte_offset += TABLE_CELL_PADDING;
                 let mut line = wrapped_cells[column]
                     .get(row_line)
                     .cloned()
@@ -1715,19 +1858,33 @@ impl<'a, 'policy> Writer<'a, 'policy> {
                 if left_padding > 0 {
                     spans.push(Span::raw(" ".repeat(left_padding)));
                 }
+                byte_offset += left_padding;
+                if let Some(source) = &line.source {
+                    crate::markdown_copy::table::append(&mut copy, source, byte_offset);
+                }
+                byte_offset += line
+                    .line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.len())
+                    .sum::<usize>();
                 spans.append(&mut line.line.spans);
                 let is_last_column = column == last_visible_column;
                 if right_padding > 0 && !is_last_column {
                     spans.push(Span::raw(" ".repeat(right_padding)));
+                    byte_offset += right_padding;
                 }
                 if !is_last_column {
                     spans.push(Span::raw(" ".repeat(TABLE_CELL_PADDING)));
+                    byte_offset += TABLE_CELL_PADDING;
                 }
                 if !is_last_column {
                     spans.push(Span::raw(" ".repeat(TABLE_COLUMN_GAP)));
+                    byte_offset += TABLE_COLUMN_GAP;
                 }
             }
             let mut out_line = HyperlinkLine::new(Line::from(spans).style(row_style));
+            crate::markdown_copy::table::attach(&mut out_line, copy);
             let mut column_start = 0usize;
             for (column, width) in column_widths
                 .iter()
@@ -1779,12 +1936,16 @@ impl<'a, 'policy> Writer<'a, 'policy> {
 
     fn row_to_pipe_line(row: &[TableCell]) -> HyperlinkLine {
         let mut out = HyperlinkLine::new(Line::default());
+        let mut copy = None;
+        let mut byte_offset = 1;
         out.push_span("|".into(), /*destination*/ None);
         for cell in row {
             out.push_span(" ".into(), /*destination*/ None);
+            byte_offset += 1;
             for (index, line) in cell.lines.iter().enumerate() {
                 if index > 0 {
                     out.push_span(" ".into(), /*destination*/ None);
+                    byte_offset += 1;
                 }
                 let text = line
                     .line
@@ -1802,7 +1963,7 @@ impl<'a, 'policy> Writer<'a, 'policy> {
                         out.push_span(Span::raw(std::mem::take(current_text)), destination);
                     }
                 };
-                for ch in text.chars() {
+                for (byte, ch) in text.char_indices() {
                     let destination = line
                         .hyperlinks
                         .iter()
@@ -1814,15 +1975,23 @@ impl<'a, 'policy> Writer<'a, 'policy> {
                     }
                     if ch == '|' {
                         current_text.push_str("\\|");
+                        byte_offset += 1;
                     } else {
                         current_text.push(ch);
                     }
+                    if let Some(mut source) = line.source.clone() {
+                        source.range = byte..byte + ch.len_utf8();
+                        crate::markdown_copy::table::append(&mut copy, &source, byte_offset);
+                    }
+                    byte_offset += ch.len_utf8();
                     column += char_width(ch);
                 }
                 flush(&mut out, &mut current_text, current_destination);
             }
             out.push_span(" |".into(), /*destination*/ None);
+            byte_offset += 2;
         }
+        crate::markdown_copy::table::attach(&mut out, copy);
         out
     }
 
@@ -1860,7 +2029,7 @@ impl<'a, 'policy> Writer<'a, 'policy> {
                     .map(|line| line_to_static(&line))
                     .collect::<Vec<_>>();
             if rendered.is_empty() {
-                wrapped.push(HyperlinkLine::new(Line::default()));
+                wrapped.push(source_line.clone());
             } else {
                 wrapped.extend(remap_wrapped_line(source_line, rendered));
             };
@@ -2026,7 +2195,10 @@ impl<'a, 'policy> Writer<'a, 'policy> {
             style_label,
             has_visible_label: false,
             local_target_display: if is_local_path_like_link(&dest_url) {
-                render_local_link_target(&dest_url, self.cwd.as_deref())
+                Some(
+                    render_local_link_target(&dest_url, self.cwd.as_deref())
+                        .unwrap_or_else(|| dest_url.clone()),
+                )
             } else {
                 None
             },
@@ -2057,7 +2229,7 @@ impl<'a, 'policy> Writer<'a, 'policy> {
                     if let Some(table_state) = self.table_state.as_mut()
                         && let Some(cell) = table_state.current_cell.as_mut()
                     {
-                        cell.push_annotated(destination);
+                        cell.push_annotated(destination, &self.copy_inline);
                     }
                     self.push_span_to_table_cell(")".into());
                 } else {
@@ -2071,13 +2243,10 @@ impl<'a, 'policy> Writer<'a, 'policy> {
                     self.push_span(")".into());
                 }
             } else if let Some(local_target_display) = link.local_target_display {
-                let local_label_text = link
+                let show_label = link
                     .local_label_spans
                     .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>();
-                let show_label =
-                    should_render_local_link_label(&local_label_text, &link.destination);
+                    .any(|span| !span.content.trim().is_empty());
                 let style = self
                     .inline_styles
                     .last()
@@ -2087,12 +2256,20 @@ impl<'a, 'policy> Writer<'a, 'policy> {
                 let span = Span::styled(local_target_display, style);
                 if self.in_table_cell() {
                     if show_label {
-                        for label_span in link.local_label_spans {
+                        for (label_span, inline) in link
+                            .local_label_spans
+                            .into_iter()
+                            .zip(link.local_label_inline)
+                        {
+                            let previous = std::mem::replace(&mut self.copy_inline, inline);
                             self.push_span_to_table_cell(label_span);
+                            self.copy_inline = previous;
                         }
                         self.push_span_to_table_cell(" (".into());
                     }
+                    self.copy_inline.push(crate::markdown_copy::Inline::Literal);
                     self.push_span_to_table_cell(span);
+                    self.copy_inline.pop();
                     if show_label {
                         self.push_span_to_table_cell(")".into());
                     }
@@ -2112,7 +2289,9 @@ impl<'a, 'policy> Writer<'a, 'policy> {
                         }
                         self.push_span(" (".into());
                     }
+                    self.copy_inline.push(crate::markdown_copy::Inline::Literal);
                     self.push_span(span);
+                    self.copy_inline.pop();
                     if show_label {
                         self.push_span(")".into());
                     }
@@ -2218,11 +2397,17 @@ impl<'a, 'policy> Writer<'a, 'policy> {
 
         let mut spans = self.prefix_spans(pending_marker_line);
         let mut source = crate::terminal_hyperlinks::LogicalLineSource::from_line(&line.line);
-        let mut copy = crate::markdown_copy::CopyLine::default();
+        let mut copy = line
+            .source
+            .as_ref()
+            .and_then(|source| source.copy.as_deref())
+            .cloned()
+            .unwrap_or_default();
+        copy.code_source = self.transformed_code_source.clone();
+        copy.quote_source = self.quote_sources.first().cloned();
         copy.prefix = self.copy_prefix(pending_marker_line);
         copy.continuation = self.copy_prefix(/*pending_marker_line*/ false);
         copy.item_prefix = self.copy_prefix(/*pending_marker_line*/ true);
-        copy.code = true;
         source.copy = Some(std::sync::Arc::new(copy));
         source.prefix_bytes = spans.iter().map(|span| span.content.len()).sum();
         source.continuation_indent = self.prefix_spans(/*pending_marker_line*/ false).into();
@@ -2254,6 +2439,8 @@ impl<'a, 'policy> Writer<'a, 'policy> {
         self.copy_line.continuation = self.copy_prefix(/*pending_marker_line*/ false);
         self.copy_line.item_prefix = self.copy_prefix(/*pending_marker_line*/ true);
         self.copy_line.code = self.in_code_block;
+        self.copy_line.code_source = self.transformed_code_source.clone();
+        self.copy_line.quote_source = self.quote_sources.first().cloned();
         // Heading markers are already visible; retain them as Markdown syntax.
         self.copy_line
             .push(line.spans.iter().map(|span| span.content.len()).sum(), &[]);
@@ -2412,7 +2599,6 @@ mod markdown_render_tests {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
-    use ratatui::style::Stylize;
     use ratatui::text::Text;
 
     fn lines_to_strings(text: &Text<'_>) -> Vec<String> {
@@ -2494,12 +2680,13 @@ mod tests {
         let rendered =
             render_markdown_lines_with_width_and_cwd(markdown, Some(22), /*cwd*/ None);
         let source = rendered[0].source.as_ref().expect("blockquote source");
+        let styles = MarkdownStyles::default();
         assert_eq!(
             source.styled_range(0..source.text.len()),
             Line::from(vec![
-                "block quote with ".green(),
-                "content".green().bold(),
-                " that should wrap nicely".green(),
+                Span::styled("block quote with ", styles.blockquote),
+                Span::styled("content", styles.blockquote.patch(styles.strong)),
+                Span::styled(" that should wrap nicely", styles.blockquote),
             ])
         );
         let lines: Vec<_> = rendered.iter().map(|line| line.line.to_string()).collect();
@@ -2612,9 +2799,9 @@ mod tests {
     #[test]
     fn wrap_cell_preserves_hard_break_lines() {
         let mut cell = TableCell::default();
-        cell.push_annotated(Line::from("first line").into());
+        cell.push_annotated(Line::from("first line").into(), &[]);
         cell.hard_break();
-        cell.push_annotated(Line::from("second line").into());
+        cell.push_annotated(Line::from("second line").into(), &[]);
 
         let writer = W::new(
             "",
@@ -2640,6 +2827,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn blank_table_continuations_do_not_repeat_the_first_cell() {
+        let mut cell = make_cell("first");
+        cell.hard_break();
+        cell.hard_break();
+        cell.push_annotated(Line::from("last").into(), &[]);
+        cell.hard_break();
+        let writer = W::new(
+            "",
+            /*wrap_width*/ Some(80),
+            /*cwd*/ None,
+            &never_hide_link_destination,
+        );
+        let lines = writer.render_table_row(
+            &[make_cell("short"), cell],
+            &[5, 5],
+            &[Alignment::None, Alignment::None],
+            Style::default(),
+        );
+        let rendered: Vec<_> = lines.iter().map(|line| line.line.to_string()).collect();
+        insta::assert_debug_snapshot!(rendered);
+    }
+
     // ---------------------------------------------------------------
     // Type alias for calling private associated functions on Writer.
     // ---------------------------------------------------------------
@@ -2648,7 +2858,7 @@ mod tests {
     /// Build a single-line `TableCell` from plain text.
     fn make_cell(text: &str) -> TableCell {
         let mut cell = TableCell::default();
-        cell.push_annotated(Line::from(text.to_string()).into());
+        cell.push_annotated(Line::from(text.to_string()).into(), &[]);
         cell
     }
 

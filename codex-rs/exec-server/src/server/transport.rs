@@ -30,7 +30,7 @@ use tokio::net::TcpListener;
 use tracing::info;
 use tracing::warn;
 
-use crate::ExecServerRuntimePaths;
+use crate::ExecServerRuntimeOptions;
 use crate::ExecServerTelemetry;
 use crate::connection::JsonRpcConnection;
 use crate::server::RequestDispatchMode;
@@ -91,7 +91,7 @@ pub(crate) fn parse_listen_url(
 
 pub(crate) async fn run_transport(
     listen_url: &str,
-    runtime_paths: ExecServerRuntimePaths,
+    runtime_paths: ExecServerRuntimeOptions,
     telemetry: ExecServerTelemetry,
     http_client_factory: HttpClientFactory,
     request_dispatch_mode: RequestDispatchMode,
@@ -129,7 +129,7 @@ pub(crate) async fn run_transport(
 }
 
 async fn run_stdio_connection(
-    runtime_paths: ExecServerRuntimePaths,
+    runtime_paths: ExecServerRuntimeOptions,
     telemetry: ExecServerTelemetry,
     http_client_factory: HttpClientFactory,
     request_dispatch_mode: RequestDispatchMode,
@@ -148,7 +148,7 @@ async fn run_stdio_connection(
 async fn run_stdio_connection_with_io<R, W>(
     reader: R,
     writer: W,
-    runtime_paths: ExecServerRuntimePaths,
+    runtime_paths: ExecServerRuntimeOptions,
     telemetry: ExecServerTelemetry,
     http_client_factory: HttpClientFactory,
     request_dispatch_mode: RequestDispatchMode,
@@ -177,7 +177,7 @@ where
 
 async fn run_websocket_listener(
     bind_address: SocketAddr,
-    runtime_paths: ExecServerRuntimePaths,
+    runtime_paths: ExecServerRuntimeOptions,
     telemetry: ExecServerTelemetry,
     http_client_factory: HttpClientFactory,
     request_dispatch_mode: RequestDispatchMode,
@@ -247,7 +247,7 @@ async fn websocket_upgrade_handler(
         return (err.status_code(), err.message()).into_response();
     }
     info!(%peer_addr, "exec-server websocket client connected");
-    websocket
+    let mut response = websocket
         .on_upgrade(move |stream| async move {
             state
                 .processor
@@ -260,7 +260,13 @@ async fn websocket_upgrade_handler(
                 )
                 .await;
         })
-        .into_response()
+        .into_response();
+    if let Some(request_id) = headers.get("x-request-id") {
+        response
+            .headers_mut()
+            .insert("x-request-id", request_id.clone());
+    }
+    response
 }
 
 #[cfg(test)]

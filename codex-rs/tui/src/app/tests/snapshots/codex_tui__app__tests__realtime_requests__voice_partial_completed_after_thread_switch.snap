@@ -7,18 +7,15 @@ Other task:
 
   gpt-test default · /tmp/project
 Restored owner:
- voice ● listening                                  ctrl+x mute     /voice stop
+ voice ● listening                                      f9 mute     /voice stop
    mic ▁▁▁▁▁▁  codex ▁▁▁▁▁▁
 
 › Ask Codex to do anything
 
   gpt-test default · /tmp/project
-╭────────────────────────────────────────╮
-│ >_ OpenAI Codex (v0.0.0)               │
-│                                        │
-│ model:     gpt-test   /model to change │
-│ directory: /tmp/project                │
-╰────────────────────────────────────────╯
+
+  >_ OpenAI Codex (v0.0.0)
+     /tmp/project
 
   To get started, describe a task or try one of these commands:
 

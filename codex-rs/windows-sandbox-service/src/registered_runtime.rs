@@ -39,6 +39,7 @@ use crate::package_lifecycle::with_owner_impersonation;
 
 mod known_folder;
 mod metadata;
+mod registration_result;
 mod removal;
 
 pub(crate) use metadata::remove as remove_metadata;
@@ -71,13 +72,13 @@ impl Drop for AccountProfile {
 
 impl AccountProfile {
     fn unload_profile(&mut self) -> Result<()> {
-        if self.profile != 0 {
+        if !self.profile.is_null() {
             let unloaded =
                 unsafe { UnloadUserProfile(self.token.as_raw_handle() as _, self.profile) };
             BOOL(unloaded)
                 .ok()
                 .context("unload managed runtime account profile")?;
-            self.profile = 0;
+            self.profile = std::ptr::null_mut();
         }
         Ok(())
     }
@@ -99,7 +100,7 @@ pub(crate) fn provision(
         SandboxRuntimeAccount::Offline,
         SandboxRuntimeAccount::Online,
     ] {
-        let token = with_owner_impersonation(identity.token.0, || {
+        let token = with_owner_impersonation(identity.token.as_raw_handle(), || {
             let mut pins = Vec::new();
             crate::ipc::pin_existing_ancestors(
                 &sandbox_secrets_dir(&identity.codex_home),
@@ -163,11 +164,12 @@ pub(crate) fn provision(
                     None,
                     DeploymentOptions::None,
                 )?)
-            })?;
+            })
+            .context("start managed runtime package registration")?;
             // As with provisioning, retain the request's resources until Windows finishes.
             // A client timeout or an unreadable status cannot safely release the profile.
             let mut status_error_logged = false;
-            loop {
+            let status = loop {
                 if shutdown.load(Ordering::Acquire) {
                     // The typed error bypasses all response conversion and cleanup. Keep the
                     // in-flight operation and its profile alive until this own-process service exits.
@@ -176,8 +178,12 @@ pub(crate) fn provision(
                 }
                 match operation.Status() {
                     Ok(AsyncStatus::Started) => {}
-                    Ok(AsyncStatus::Completed | AsyncStatus::Canceled | AsyncStatus::Error) => {
-                        break;
+                    Ok(
+                        status @ (AsyncStatus::Completed
+                        | AsyncStatus::Canceled
+                        | AsyncStatus::Error),
+                    ) => {
+                        break status;
                     }
                     status => {
                         if !status_error_logged {
@@ -192,19 +198,23 @@ pub(crate) fn provision(
                     }
                 }
                 std::thread::sleep(Duration::from_millis(50));
-            }
-            operation.GetResults()?.ExtendedErrorCode()?.ok()?;
+            };
+            registration_result::RegistrationResult::read(&operation, status).check()?;
             ensure!(
-                registered_packages(&profile.user_sid, &family)?.contains(full_name),
+                registered_packages(&profile.user_sid, &family)
+                    .context("verify managed runtime package registration")?
+                    .contains(full_name),
                 "runtime registration completed without the expected package"
             );
         }
-        metadata::grant(identity.token.0, &profile.user_sid, record)?;
+        metadata::grant(identity.token.as_raw_handle(), &profile.user_sid, record)
+            .context("grant managed runtime metadata permissions")?;
         profile.unload_profile()?;
     }
     if !receipt_current {
         record.runtime_mut()?.ready_package = Some(full_name.to_string());
-        crate::installation_record::save_runtime(record)?;
+        crate::installation_record::save_runtime(record)
+            .context("persist completed managed runtime registration")?;
     }
     Ok(())
 }
@@ -241,7 +251,7 @@ fn validate_account_sid(account: &RuntimeAccountRegistration) -> Result<()> {
     Ok(())
 }
 
-fn validate_record(record: &InstallationRecord) -> Result<()> {
+pub(crate) fn validate_record(record: &InstallationRecord) -> Result<()> {
     let runtime = record.runtime()?;
     ensure!(
         runtime.accounts.len() <= 2,
@@ -256,7 +266,7 @@ fn validate_record(record: &InstallationRecord) -> Result<()> {
     Ok(())
 }
 
-fn registered_packages(user_sid: &str, family: &str) -> Result<Vec<HSTRING>> {
+pub(crate) fn registered_packages(user_sid: &str, family: &str) -> Result<Vec<HSTRING>> {
     let packages = PackageManager::new()?.FindPackagesByUserSecurityIdPackageFamilyName(
         &HSTRING::from(user_sid),
         &HSTRING::from(family),
@@ -304,7 +314,7 @@ fn load_profile(
     })
 }
 
-fn validate_target(
+pub(crate) fn validate_target(
     token: HANDLE,
     account: SandboxRuntimeAccount,
     expected_sid: Option<&str>,

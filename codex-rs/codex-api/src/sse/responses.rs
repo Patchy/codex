@@ -4,13 +4,14 @@ use crate::common::ResponseStream;
 use crate::common::SafetyBuffering;
 use crate::common::SafetyBufferingTreatment;
 use crate::error::ApiError;
-use crate::error::parse_flex_unavailable;
+use crate::error::parse_terminal_provider_error;
 use crate::rate_limits::parse_all_rate_limits;
 use crate::safety_buffering::treatment_from_headers;
 use crate::telemetry::SseTelemetry;
 use codex_client::ByteStream;
 use codex_client::StreamResponse;
 use codex_protocol::ResponseUsageMetadata;
+use codex_protocol::error::ResponseIncompleteError;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::ModelVerification;
 use codex_protocol::protocol::TokenUsage;
@@ -99,6 +100,7 @@ pub fn spawn_response_stream(
     ResponseStream {
         rx_event,
         upstream_request_id,
+        interrupt: None,
     }
 }
 
@@ -345,7 +347,9 @@ pub fn process_responses_event(
 ) -> std::result::Result<Option<ResponseEvent>, ResponsesEventError> {
     match event.kind.as_str() {
         "error" => {
-            if let Some(error) = event.error.as_ref().and_then(parse_flex_unavailable) {
+            if let Some(error) =
+                parse_terminal_provider_error(event.error.as_ref(), /*status*/ None)
+            {
                 return Err(ResponsesEventError::Api(error));
             }
         }
@@ -414,18 +418,40 @@ pub fn process_responses_event(
                 event.response,
             )));
         }
-        "response.incomplete" => {
-            let reason = event.response.as_ref().and_then(|response| {
-                response
-                    .get("incomplete_details")
-                    .and_then(|details| details.get("reason"))
-                    .and_then(Value::as_str)
-            });
-            let reason = reason.unwrap_or("unknown");
-            let message = format!("Incomplete response returned, reason: {reason}");
-            return Err(ResponsesEventError::Api(ApiError::Stream(message)));
-        }
-        "response.completed" => {
+        "response.completed" | "response.incomplete" => {
+            let interrupted = event.kind == "response.incomplete";
+            if interrupted {
+                let reason = event.response.as_ref().and_then(|response| {
+                    response
+                        .get("incomplete_details")
+                        .and_then(|details| details.get("reason"))
+                        .and_then(Value::as_str)
+                });
+                let reason = reason.unwrap_or("unknown");
+                if reason == "content_filter" {
+                    return Err(ResponsesEventError::Api(ApiError::ContentFilter));
+                }
+                if reason != "interrupted" {
+                    let response = event.response.as_ref();
+                    let response_id = response
+                        .and_then(|response| response.get("id"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let token_usage = response
+                        .and_then(|response| response.get("usage"))
+                        .and_then(|usage| {
+                            serde_json::from_value::<ResponseCompletedUsage>(usage.clone()).ok()
+                        })
+                        .map(Into::into);
+                    return Err(ResponsesEventError::Api(ApiError::ResponseIncomplete(
+                        Box::new(ResponseIncompleteError {
+                            reason: reason.to_string(),
+                            response_id,
+                            token_usage,
+                        }),
+                    )));
+                }
+            }
             if let Some(resp_val) = event.response {
                 let metadata = resp_val
                     .get("usage")
@@ -440,7 +466,11 @@ pub fn process_responses_event(
                             response_id: resp.id,
                             token_usage: resp.usage.map(Into::into),
                             usage_metadata: resp.usage_metadata,
-                            end_turn: resp.end_turn,
+                            end_turn: if interrupted {
+                                Some(false)
+                            } else {
+                                resp.end_turn
+                            },
                         }));
                     }
                     Err(err) => {
@@ -628,7 +658,10 @@ async fn process_sse_with_treatment(
             Ok(None) => {}
             Err(error) => {
                 let error = error.into_api_error();
-                if matches!(error, ApiError::FlexUnavailable) {
+                if matches!(
+                    error,
+                    ApiError::FlexUnavailable | ApiError::ResponseIncomplete(_)
+                ) {
                     let _ = tx_event.send(Err(error)).await;
                     return;
                 }
@@ -637,6 +670,10 @@ async fn process_sse_with_treatment(
         };
     }
 }
+
+#[cfg(test)]
+#[path = "responses_error_tests.rs"]
+mod error_tests;
 
 #[cfg(test)]
 mod tests {
@@ -717,6 +754,48 @@ mod tests {
 
     fn idle_timeout() -> Duration {
         Duration::from_millis(1000)
+    }
+
+    #[tokio::test]
+    async fn partial_answer_phase_survives_item_start_and_completion() {
+        let item = json!({
+            "id": "msg_partial",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "phase": "partial_answer"
+        });
+        let added = json!({"type": "response.output_item.added", "item": item});
+        let delta = json!({"type": "response.output_text.delta", "delta": "First result."});
+        let mut done_item = item;
+        done_item["content"] = json!([{"type": "output_text", "text": "First result."}]);
+        let done = json!({"type": "response.output_item.done", "item": done_item});
+        let completed = json!({
+            "type": "response.completed",
+            "response": {"id": "resp1", "end_turn": false}
+        });
+        let stream = [added, delta, done, completed]
+            .into_iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+
+        let events = collect_events(&[stream.as_bytes()]).await;
+        assert_matches!(events.as_slice(), [
+            Ok(ResponseEvent::OutputItemAdded(ResponseItem::Message {
+                phase: Some(MessagePhase::PartialAnswer), content: start_content, ..
+            })),
+            Ok(ResponseEvent::OutputTextDelta(text)),
+            Ok(ResponseEvent::OutputItemDone(ResponseItem::Message {
+                phase: Some(MessagePhase::PartialAnswer), content: done_content, ..
+            })),
+            Ok(ResponseEvent::Completed { end_turn: Some(false), .. }),
+        ] if start_content.is_empty()
+            && text == "First result."
+            && done_content == &vec![codex_protocol::models::ContentItem::OutputText {
+                annotations: None,
+                logprobs: None,
+                text: "First result.".to_string()
+            }]);
     }
 
     #[tokio::test]
@@ -1236,6 +1315,7 @@ mod tests {
                     misalignment,
                     &Some(MisalignmentErrorDetails {
                         error_type: Some("future_safety_category".to_string()),
+                        review_target: None,
                         detailed_explanation: Some(
                             "The agent attempted an external transfer.".to_string()
                         ),

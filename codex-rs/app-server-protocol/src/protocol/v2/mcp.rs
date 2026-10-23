@@ -60,6 +60,9 @@ pub struct ListMcpServerStatusParams {
     pub detail: Option<McpServerStatusDetail>,
     #[ts(optional = nullable)]
     pub thread_id: Option<String>,
+    /// Limit discovery to one server. With a thread ID, reuse that thread's MCP connection.
+    #[ts(optional = nullable)]
+    pub server_name: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
@@ -84,6 +87,8 @@ pub struct McpServerStatus {
     pub server_info: Option<McpServerInfo>,
     /// Capabilities advertised by the initialized MCP server; null when unavailable.
     pub server_capabilities: Option<serde_json::Value>,
+    /// Opaque `_meta` from the first page of the corresponding MCP tool catalog. Null when unavailable.
+    pub tool_list_meta: Option<serde_json::Value>,
     pub tools: std::collections::HashMap<String, McpTool>,
     /// Tool discovery failed and no catalog was returned.
     /// Null when a catalog is returned, including cached or empty catalogs.
@@ -318,6 +323,11 @@ pub enum McpServerOauthClientRegistration {
 #[ts(export_to = "v2/")]
 pub struct McpServerOauthLoginResponse {
     pub authorization_url: String,
+    /// Identifies this login attempt across the response and completion notification.
+    /// Older servers omit this field; current servers always return it.
+    #[serde(default)]
+    #[ts(optional)]
+    pub login_id: Option<String>,
 }
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -335,6 +345,9 @@ pub struct McpToolCallProgressNotification {
 pub struct McpServerOauthLoginCompletedNotification {
     pub name: String,
     pub thread_id: Option<String>,
+    /// Identifies the explicit login attempt. Older servers omit this field.
+    #[ts(optional, as = "Option<Option<String>>")]
+    pub login_id: Option<String>,
     pub success: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]

@@ -7,19 +7,22 @@ use crate::exec_policy::prompt_is_rejected_by_policy;
 use crate::function_tool::FunctionCallError;
 use crate::maybe_emit_implicit_skill_invocation;
 use crate::tools::context::ExecCommandToolOutput;
+use crate::tools::context::ToolEnvironments;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
+use crate::tools::handlers::ToolEnvironmentArgs;
 use crate::tools::handlers::apply_granted_turn_permissions;
 use crate::tools::handlers::apply_patch::intercept_apply_patch;
 use crate::tools::handlers::file_system_sandbox_policy_context_for_cwd;
+use crate::tools::handlers::function_tool_environment;
 use crate::tools::handlers::implicit_granted_permissions;
 use crate::tools::handlers::normalize_and_validate_additional_permissions;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::parse_arguments_with_base_path;
 use crate::tools::handlers::resolve_sandbox_permissions;
-use crate::tools::handlers::resolve_tool_environment;
 use crate::tools::handlers::rewrite_function_string_argument;
+use crate::tools::handlers::selected_executor;
 use crate::tools::handlers::updated_hook_command;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::registry::CoreToolRuntime;
@@ -48,21 +51,18 @@ use codex_utils_string::truncate_middle_chars;
 use super::super::shell_spec::CommandToolOptions;
 use super::super::shell_spec::create_exec_command_tool_with_environment_id;
 use super::ExecCommandArgs;
-use super::ExecCommandEnvironmentArgs;
+use super::ExecCommandWorkdirArgs;
 use super::get_command;
 use super::post_unified_exec_tool_use_payload;
-use super::shell_mode_for_environment;
 
 // A byte limit is a conservative hard token bound even for byte-fallback tokenizers.
 const EXEC_COMMAND_REJECTION_MAX_BYTES: usize = 900;
 
 #[derive(Clone, Copy)]
 pub(crate) struct ExecCommandHandlerOptions {
-    pub(crate) allow_login_shell: bool,
     pub(crate) allow_tty: bool,
     pub(crate) exec_permission_approvals_enabled: bool,
     pub(crate) include_environment_id: bool,
-    pub(crate) include_shell_parameter: bool,
     pub(crate) include_windows_shell_guidance: bool,
 }
 
@@ -82,11 +82,9 @@ impl Default for ExecCommandHandler {
         Self {
             lifetime: ExecCommandLifetime::Interactive,
             options: ExecCommandHandlerOptions {
-                allow_login_shell: false,
                 allow_tty: true,
                 exec_permission_approvals_enabled: false,
                 include_environment_id: false,
-                include_shell_parameter: true,
                 include_windows_shell_guidance: cfg!(windows),
             },
         }
@@ -117,11 +115,9 @@ impl ToolExecutor<ToolInvocation> for ExecCommandHandler {
     fn spec(&self) -> ToolSpec {
         let spec = create_exec_command_tool_with_environment_id(
             CommandToolOptions {
-                allow_login_shell: self.options.allow_login_shell,
                 exec_permission_approvals_enabled: self.options.exec_permission_approvals_enabled,
             },
             self.options.include_environment_id,
-            self.options.include_shell_parameter,
             self.options.include_windows_shell_guidance,
         );
         let mut spec = match self.lifetime {
@@ -157,6 +153,7 @@ impl ExecCommandHandler {
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
+            environments,
             session,
             turn,
             step_context,
@@ -183,18 +180,10 @@ impl ExecCommandHandler {
             cancellation_token,
             call_id.clone(),
         );
-        let environment_args: ExecCommandEnvironmentArgs = parse_arguments(&arguments)?;
-        let Some(turn_environment) = resolve_tool_environment(
-            &step_context.environments,
-            environment_args.environment_id.as_deref(),
-        )?
-        else {
-            return Err(FunctionCallError::RespondToModel(
-                "unified exec is unavailable in this session".to_string(),
-            ));
-        };
+        let workdir_args: ExecCommandWorkdirArgs = parse_arguments(&arguments)?;
+        let turn_environment = selected_executor(&environments, &step_context.environments)?;
         let native_environment_cwd = turn_environment.cwd().clone();
-        let cwd = environment_args
+        let cwd = workdir_args
             .workdir
             .as_deref()
             .filter(|workdir| !workdir.is_empty())
@@ -254,15 +243,13 @@ impl ExecCommandHandler {
         let hook_command = args.cmd.clone();
         maybe_emit_implicit_skill_invocation(
             session.as_ref(),
-            context.step_context.turn.as_ref(),
+            context.step_context.as_ref(),
             &hook_command,
             &cwd,
             native_cwd.as_ref(),
             &turn_environment.selection.environment_id,
         )
         .await;
-        let shell_mode =
-            shell_mode_for_environment(&turn.unified_exec_shell_mode, environment.as_ref());
         // Remote environments may use a different OS and must build commands with their native
         // shell; fall back to the session shell when the environment did not report one.
         let shell = turn_environment
@@ -289,15 +276,10 @@ impl ExecCommandHandler {
                 )));
             }
         }
-        let resolved_command = get_command(
-            &args,
-            shell,
-            &shell_mode,
-            turn_environment.config().allow_login_shell,
-        )
-        .map_err(FunctionCallError::RespondToModel)?;
+        let resolved_command =
+            get_command(&args, shell, turn_environment.config().allow_login_shell)
+                .map_err(FunctionCallError::RespondToModel)?;
         let command = resolved_command.command;
-        let shell_type = resolved_command.shell_type;
         let ExecCommandArgs {
             mut tty,
             yield_time_ms,
@@ -326,13 +308,12 @@ impl ExecCommandHandler {
             turn_environment.sandbox_context(/*additional_permissions*/ None);
         let permission_context = file_system_sandbox_policy_context_for_cwd(&sandbox_context, &cwd);
         let effective_additional_permissions = apply_granted_turn_permissions(
-            context.session.as_ref(),
+            &context.step_context,
             turn_environment,
             &cwd,
             sandbox_permissions,
             additional_permissions,
-        )
-        .await;
+        );
         let additional_permissions_allowed = exec_permission_approvals_enabled
             || (session.features().enabled(Feature::RequestPermissionsTool)
                 && effective_additional_permissions.permissions_preapproved);
@@ -418,7 +399,7 @@ impl ExecCommandHandler {
         let process_id = manager.allocate_process_id().await;
         let request = ExecCommandRequest {
             command,
-            shell_type,
+            shell: resolved_command.shell,
             hook_command: hook_command.clone(),
             process_id,
             yield_time_ms,
@@ -426,7 +407,6 @@ impl ExecCommandHandler {
             cwd,
             sandbox_cwd: native_environment_cwd,
             turn_environment: turn_environment.clone(),
-            shell_mode,
             network: context.step_context.turn.network.clone(),
             tty,
             sandbox_permissions: effective_additional_permissions.sandbox_permissions,
@@ -513,6 +493,13 @@ fn one_shot_exec_command_spec(spec: ToolSpec) -> ToolSpec {
 }
 
 impl CoreToolRuntime for ExecCommandHandler {
+    fn environments_for_input(
+        &self,
+        invocation: &ToolInvocation,
+    ) -> Result<ToolEnvironments, FunctionCallError> {
+        function_tool_environment(invocation, |args: ToolEnvironmentArgs| args.environment_id)
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }

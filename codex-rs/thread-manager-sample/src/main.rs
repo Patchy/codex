@@ -27,7 +27,7 @@ use codex_core_api::ConfigRequirementsToml;
 use codex_core_api::Constrained;
 use codex_core_api::EnvironmentManager;
 use codex_core_api::EventMsg;
-use codex_core_api::ExecServerRuntimePaths;
+use codex_core_api::ExecServerRuntimeOptions;
 use codex_core_api::ExtensionRegistryBuilder;
 use codex_core_api::Feature;
 use codex_core_api::Features;
@@ -125,7 +125,7 @@ async fn run_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
 
     let auth_manager =
         AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await?;
-    let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
+    let local_runtime_paths = ExecServerRuntimeOptions::from_optional_paths(
         config.codex_self_exe.clone(),
         config.codex_linux_sandbox_exe.clone(),
     )?;
@@ -239,15 +239,18 @@ async fn new_config(
         application_network_policy: Default::default(),
         application_auth_route_config: Some(auth_config.auth_route_config.clone()),
         config_layer_stack,
+        plugins: Default::default(),
         startup_warnings: Vec::new(),
         bypass_hook_trust: false,
         model,
+        daybreak_enabled: false,
         service_tier: None,
         review_model: None,
         model_context_window: None,
         model_auto_compact_token_limit: None,
         model_auto_compact_token_limit_scope: AutoCompactTokenLimitScope::Total,
         model_post_turn_compact_threshold_percent: 0,
+        async_compaction_threshold_percent: 65,
         model_provider_id,
         model_provider,
         personality: None,
@@ -267,6 +270,11 @@ async fn new_config(
         guardian_policy_config: None,
         guardian_extra_policy: None,
         guardian_policy_template: None,
+        guardian_transcript_mode: Default::default(),
+        guardian_conversation_history_prompt: None,
+        guardian_conversation_history_max_output_tokens: None,
+        guardian_circuit_break_action: Default::default(),
+        guardian_review_timeout: Some(std::time::Duration::from_secs(90)),
         include_permissions_instructions: false,
         include_apps_instructions: false,
         include_collaboration_mode_instructions: false,
@@ -275,6 +283,7 @@ async fn new_config(
         cloud_skill_enabled: false,
         orchestrator_mcp_enabled: false,
         include_environment_context: false,
+        include_environment_context_time: true,
         compact_prompt: None,
         notify: None,
         tui_notifications: TuiNotificationSettings::default(),
@@ -284,10 +293,11 @@ async fn new_config(
         show_tooltips: true,
         tui_show_server_version_notice: true,
         tui_auto_recap: true,
-        tui_prompt_suggestions: false,
         model_availability_nux: ModelAvailabilityNuxConfig::default(),
         tui_fullscreen_transcript: false,
+        tui_mouse_scroll_speed: None,
         tui_copy_on_select: Default::default(),
+        tui_copy_on_select_clear_selection: false,
         tui_right_click_paste: Default::default(),
         tui_alternate_screen: AltScreenMode::Auto,
         tui_status_line: None,
@@ -299,7 +309,9 @@ async fn new_config(
         tui_pet_anchor: TuiPetAnchor::Composer,
         terminal_resize_reflow: TerminalResizeReflowConfig::default(),
         tui_keymap: TuiKeymap::default(),
+        tui_quick_dials: BTreeMap::new(),
         tui_session_picker_view: SessionPickerViewMode::Dense,
+        tui_agents_overview_grouping: Default::default(),
         tui_resume_cwd: None,
         tui_vim_mode_default: false,
         tui_question_esc_back: true,
@@ -335,7 +347,7 @@ async fn new_config(
         file_opener: UriBasedFileOpener::VsCode,
         codex_self_exe: arg0_paths.codex_self_exe,
         codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe,
-        main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe,
+        main_execve_wrapper_exe: None,
         zsh_path: None,
         model_reasoning_effort: None,
         plan_mode_reasoning_effort: None,
@@ -367,7 +379,7 @@ async fn new_config(
         tool_registry: Default::default(),
         code_mode: Default::default(),
         background_terminal_max_timeout: 300_000,
-        thread_unload_delay: std::time::Duration::from_secs(60),
+        thread_unload_delay: std::time::Duration::from_secs(/*secs*/ 1800),
         ghost_snapshot: GhostSnapshotConfig::default(),
         multi_agent_v2: MultiAgentV2Config::default(),
         max_goal_token_budget: None,
@@ -378,6 +390,8 @@ async fn new_config(
         sleep_tool_mode: Default::default(),
         features: Default::default(),
         prefer_mxc: false,
+
+        runtime_feature_defaults: Default::default(),
         suppress_unstable_features_warning: false,
         active_project: ProjectConfig { trust_level: None },
         notices: Notice::default(),

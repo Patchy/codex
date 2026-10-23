@@ -24,7 +24,7 @@ use codex_exec_server::ExecParams;
 use codex_exec_server::ExecProcessEvent;
 use codex_exec_server::ExecResponse;
 use codex_exec_server::ExecServerClientConnectOptions;
-use codex_exec_server::ExecServerRuntimePaths;
+use codex_exec_server::ExecServerRuntimeOptions;
 use codex_exec_server::InitializeParams;
 use codex_exec_server::InitializeResponse;
 use codex_exec_server::ProcessId;
@@ -77,11 +77,12 @@ const SESSION_ALREADY_ATTACHED_ERROR_CODE: i64 = -32010;
 struct DirectExecutorAuth;
 
 impl AuthProvider for DirectExecutorAuth {
-    fn add_auth_headers(&self, headers: &mut HeaderMap) {
+    fn add_auth_headers(&self, headers: &mut HeaderMap) -> Result<(), codex_api::AuthError> {
         headers.insert(
             http::header::AUTHORIZATION,
             HeaderValue::from_static("AWS4-HMAC-SHA256 test-signature"),
         );
+        Ok(())
     }
 }
 
@@ -174,7 +175,7 @@ async fn accepted_websocket_interoperates_and_recovers_with_real_direct_executor
         http_client_factory.clone(),
     )?;
     let (codex_exe, codex_linux_sandbox_exe) = common::current_test_binary_helper_paths()?;
-    let runtime_paths = ExecServerRuntimePaths::new(codex_exe, codex_linux_sandbox_exe)?;
+    let runtime_paths = ExecServerRuntimeOptions::new(codex_exe, codex_linux_sandbox_exe)?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let executor_task = AbortOnDropHandle::new(tokio::spawn(
         codex_exec_server::run_remote_environment_until_shutdown(
@@ -319,7 +320,7 @@ async fn accepted_websocket_interoperates_and_recovers_with_real_direct_executor
         }
         timeout(
             TEST_TIMEOUT,
-            connection_state.wait_for(|state| *state == EnvironmentConnectionState::Disconnected),
+            connection_state.wait_for(|state| *state == EnvironmentConnectionState::Recovering),
         )
         .await??;
         tokio::fs::write(&gate_path, b"").await?;
